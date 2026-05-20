@@ -26,6 +26,7 @@ import { ChatHistoryCompressor } from './ChatHistoryCompressor.js';
 import { ChatToolOutputManager } from './ChatToolOutputManager.js';
 import { IThreadStateAccess } from './ChatAcpHandler.js';
 import { IMCPService } from '../common/mcpService.js';
+import { formatAgentSkillActivationContent } from '../common/skills/agentSkillsPrompt.js';
 
 export type IsRunningType =
 	| 'LLM' // the LLM is currently streaming
@@ -55,6 +56,13 @@ export class ChatExecutionEngine {
 
 	private _disabledToolError(toolName: string): string {
 		return `Tool "${toolName}" is disabled in Void settings.`;
+	}
+
+	private _isAgentSkillDisabled(name: string): boolean {
+		const settings = this._settingsService.state.globalSettings;
+		if (settings.enableAgentSkills === false) return true;
+		const disabled = Array.isArray(settings.disabledAgentSkillNames) ? settings.disabledAgentSkillNames : [];
+		return disabled.map(v => String(v ?? '').trim()).includes(String(name ?? '').trim());
 	}
 
 	public readonly skippedToolCallIds = new Set<string>();
@@ -505,6 +513,42 @@ export class ChatExecutionEngine {
 			return {};
 		}
 
+		if (toolName === 'activate_skill') {
+			const requestedName = String(((opts.validatedParams ?? opts.unvalidatedToolParams) as any)?.name ?? '').trim();
+			const active = requestedName ? access.getThreadState(threadId)?.activeSkills?.[requestedName] : undefined;
+			if (requestedName && active && !this._isAgentSkillDisabled(requestedName)) {
+				const contentForModel = formatAgentSkillActivationContent({
+					name: requestedName,
+					body: '',
+					skillFileUri: active.skillFileUri,
+					skillDirUri: '',
+					resources: [],
+					alreadyActive: true,
+				});
+				access.updateLatestTool(threadId, {
+					role: 'tool',
+					type: 'success',
+					params: (opts.validatedParams ?? { name: requestedName }) as any,
+					result: {
+						name: requestedName,
+						body: '',
+						skillFileUri: active.skillFileUri,
+						skillDirUri: '',
+						resources: [],
+						diagnostics: [],
+						contentForModel,
+						alreadyActive: true,
+					} as any,
+					name: toolName,
+					content: contentForModel,
+					displayContent: contentForModel,
+					id: toolId,
+					rawParams: opts.unvalidatedToolParams,
+				});
+				return {};
+			}
+		}
+
 		// 1. Validation & Approval
 		if (!opts.preapproved) {
 			try {
@@ -744,6 +788,14 @@ export class ChatExecutionEngine {
 			id: toolId,
 			rawParams: opts.unvalidatedToolParams
 		});
+
+		if (toolName === 'activate_skill' && toolResult?.name && toolResult?.skillFileUri) {
+			access.markSkillActive(threadId, String(toolResult.name), {
+				activatedAt: new Date().toISOString(),
+				source: 'tool',
+				skillFileUri: String(toolResult.skillFileUri?.toString ? toolResult.skillFileUri.toString() : toolResult.skillFileUri),
+			});
+		}
 
 		return {};
 	}

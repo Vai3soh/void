@@ -85,6 +85,7 @@ If you get any errors, scroll down for common fixes.
 - If you get errors like `npm error libtool:   error: unrecognised option: '-static'`,  when running ./scripts/code.sh, make sure you have GNU libtool instead of BSD libtool (BSD is the default in macos)
 - If you get errors like `The SUID sandbox helper binary was found, but is not configured correctly` when running ./scripts/code.sh, run
 `sudo chown root:root .build/electron/chrome-sandbox && sudo chmod 4755 .build/electron/chrome-sandbox` and then run `./scripts/code.sh` again.
+- If the built-in ACP agent cannot start because the default port is already in use, launch Void with an alternate loopback address, for example `./scripts/code.sh --acp-agent-addr=127.0.0.1:8720`. The first version only accepts loopback hosts such as `127.0.0.1`, `localhost`, or `::1`, and it does not auto-select a free port. The `acpAgentUrl` settings still configure external ACP `websocket` mode; they do not configure built-in ACP mode.
 - If you have any other questions, feel free to [submit an issue](https://github.com/voideditor/void/issues/new). You can also refer to VSCode's complete [How to Contribute](https://github.com/microsoft/vscode/wiki/How-to-Contribute) page.
 
 
@@ -168,5 +169,4 @@ workspace/
 - Please submit a pull request once you've made a change.
 - No need to submit an Issue unless you're creating a new feature that might involve multiple PRs.
 - Please don't use AI to write your PR 🙂
-
 

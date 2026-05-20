@@ -135,6 +135,15 @@ export const voidTools
 				...uriParam('file'),
 			},
 		},
+		activate_skill: {
+			name: 'activate_skill',
+			description: 'Read-only. Activates an available Agent Skill by name and returns its instructions plus bundled resource paths without reading those resources.',
+			params: {
+				name: {
+					description: 'The exact Agent Skill name from the available skills catalog.',
+				},
+			},
+		},
 		rewrite_file: {
 			name: 'rewrite_file',
 			description: 'Replaces entire file contents with provided new contents.',

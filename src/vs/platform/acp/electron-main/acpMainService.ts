@@ -1,3 +1,7 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
 
 import { Emitter, Event } from '../../../base/common/event.js';
 import { generateUuid } from '../../../base/common/uuid.js';
@@ -5,7 +9,9 @@ import { IAcpMessageChunk, IAcpSendOptions, IAcpChatMessage } from '../common/iA
 import type { LLMTokenUsage } from '../../void/common/sendLLMMessageTypes.js';
 import { IAcpMainServiceForChannel, AcpHostCallbackRequest, AcpHostCallbackResponse } from '../common/acpIpc.js';
 import { ILogService } from '../../log/common/log.js';
-import { sanitizeAcpSendOptionsForLog } from '../common/acpLogSanitizer.js'
+import { sanitizeAcpSendOptionsForLog } from '../common/acpLogSanitizer.js';
+import { AcpAgentAddressError, resolveAcpAgentAddress } from '../common/acpAgentAddress.js';
+import { IEnvironmentMainService } from '../../environment/electron-main/environmentMainService.js';
 import { homedir } from 'os';
 import * as sdk from './vendor/acp-sdk.vendored.js';
 import { WebSocket } from './vendor/ws.vendored.js';
@@ -30,7 +36,8 @@ type Stream = ConstructorParameters<typeof sdk.ClientSideConnection>[1];
 export class AcpMainService implements IAcpMainServiceForChannel {
 
 	constructor(
-		@ILogService private readonly logService: ILogService
+		@ILogService private readonly logService: ILogService,
+		@IEnvironmentMainService private readonly environmentMainService: IEnvironmentMainService
 	) { }
 
 	private conn: sdk.ClientSideConnection | null = null;
@@ -414,13 +421,28 @@ export class AcpMainService implements IAcpMainServiceForChannel {
 	// -------------------------
 	isConnected(): boolean { return this.connected; }
 
+	private _resolveBuiltinAcpWsUrl(): string {
+		try {
+			return resolveAcpAgentAddress({
+				cliAddr: this.environmentMainService.args['acp-agent-addr'],
+				env: process.env
+			}).wsUrl;
+		} catch (e) {
+			if (e instanceof AcpAgentAddressError) {
+				this.logService.warn(`[ACP Main] invalid built-in ACP agent address: ${e.message}`);
+			}
+			throw e;
+		}
+	}
+
 	async connect(opts?: IAcpSendOptions): Promise<void> {
 		this.logService.debug('[ACP Main] connect(opts):', sanitizeAcpSendOptionsForLog(opts));
 		const mode = opts?.mode || 'builtin';
+		const builtinWsUrl = mode === 'builtin' ? this._resolveBuiltinAcpWsUrl() : undefined;
 
 		if (this.connected && this.conn && this.lastConnectParams && this.lastConnectParams.mode === mode) {
 			if (mode === 'websocket' || mode === 'builtin') {
-				const targetUrl = mode === 'builtin' ? 'ws://127.0.0.1:8719' : (opts?.agentUrl || '');
+				const targetUrl = mode === 'builtin' ? builtinWsUrl! : (opts?.agentUrl || '');
 				const url = targetUrl.trim().replace(/^http(s?):/, 'ws$1:');
 				if (this.lastConnectParams.url === url) return;
 			} else {
@@ -478,7 +500,7 @@ export class AcpMainService implements IAcpMainServiceForChannel {
 			this.lastConnectParams = { mode: 'process', command: cmd, args, env: opts?.env };
 		} else {
 			let urlFromOpts = '';
-			if (mode === 'builtin') urlFromOpts = 'ws://127.0.0.1:8719';
+			if (mode === 'builtin') urlFromOpts = builtinWsUrl!;
 			else {
 				urlFromOpts = (opts?.agentUrl || '').trim();
 				if (!urlFromOpts) throw new Error('ACP: agentUrl is required');
@@ -1364,80 +1386,80 @@ export class AcpMainService implements IAcpMainServiceForChannel {
 
 			if (key) this.toolNameBySessionToolCallId.set(key, canonicalName);
 
-				// --- NEW: emit tool_progress for in-flight tool_call_update ---
-				if (status !== 'completed' && status !== 'failed') {
-					const acpMode = this.lastConnectParams?.mode ?? 'builtin';
-					const shouldEmitProgress = !(canonicalName === 'run_command' && acpMode !== 'builtin');
-					const terminalIdForProgress =
-						(derivedTerminals.length ? String(derivedTerminals[0].terminalId) : '')
-						|| (typeof (rObj as any).terminalId === 'string' ? String((rObj as any).terminalId) : '')
-						|| (toolCallId ? (this._getTerminalIdForToolCall(sid, toolCallId) ?? '') : '');
+			// --- NEW: emit tool_progress for in-flight tool_call_update ---
+			if (status !== 'completed' && status !== 'failed') {
+				const acpMode = this.lastConnectParams?.mode ?? 'builtin';
+				const shouldEmitProgress = !(canonicalName === 'run_command' && acpMode !== 'builtin');
+				const terminalIdForProgress =
+					(derivedTerminals.length ? String(derivedTerminals[0].terminalId) : '')
+					|| (typeof (rObj as any).terminalId === 'string' ? String((rObj as any).terminalId) : '')
+					|| (toolCallId ? (this._getTerminalIdForToolCall(sid, toolCallId) ?? '') : '');
 
-					const rawOutStr =
-						(typeof (rObj as any).output === 'string' && (rObj as any).output.length > 0) ? String((rObj as any).output)
-							: (typeof (rObj as any).text === 'string' && (rObj as any).text.length > 0) ? String((rObj as any).text)
-								: (typeof (rObj as any).content === 'string' && (rObj as any).content.length > 0) ? String((rObj as any).content)
-									: '';
+				const rawOutStr =
+					(typeof (rObj as any).output === 'string' && (rObj as any).output.length > 0) ? String((rObj as any).output)
+						: (typeof (rObj as any).text === 'string' && (rObj as any).text.length > 0) ? String((rObj as any).text)
+							: (typeof (rObj as any).content === 'string' && (rObj as any).content.length > 0) ? String((rObj as any).content)
+								: '';
 
-					const textFromContent = derivedTexts.length ? derivedTexts.join('\n') : '';
-					const progressText = (rawOutStr || textFromContent || '').toString();
+				const textFromContent = derivedTexts.length ? derivedTexts.join('\n') : '';
+				const progressText = (rawOutStr || textFromContent || '').toString();
 
-					const truncated =
-						(typeof (rObj as any).truncated === 'boolean') ? (rObj as any).truncated : undefined;
+				const truncated =
+					(typeof (rObj as any).truncated === 'boolean') ? (rObj as any).truncated : undefined;
 
-					const exitStatus = (rObj as any)?.exitStatus;
+				const exitStatus = (rObj as any)?.exitStatus;
 
-					if (!shouldEmitProgress) {
-						this._logJson('SKIP tool_progress (run_command via terminal poll)', {
-							sessionId: sid,
-							toolCallId,
-							canonicalName,
-							status,
-							acpMode,
-							terminalId: terminalIdForProgress || null,
-							derivedTextLen: textFromContent.length,
-							rawOutLen: rawOutStr.length,
-							rObjKeys: Object.keys(rObj)
-						});
-					} else if (toolCallId && progressText) {
-						this._logJson('EMIT tool_progress (from tool_call_update)', {
-							sessionId: sid,
-							toolCallId,
-							canonicalName,
-							status,
-							terminalId: terminalIdForProgress || null,
-							progressLen: progressText.length,
-							hasDerivedTexts: derivedTexts.length,
-							rObjKeys: Object.keys(rObj),
-							hasExitStatus: !!exitStatus,
-							truncated: truncated ?? null,
-							preview: progressText.slice(0, 160)
-						});
+				if (!shouldEmitProgress) {
+					this._logJson('SKIP tool_progress (run_command via terminal poll)', {
+						sessionId: sid,
+						toolCallId,
+						canonicalName,
+						status,
+						acpMode,
+						terminalId: terminalIdForProgress || null,
+						derivedTextLen: textFromContent.length,
+						rawOutLen: rawOutStr.length,
+						rObjKeys: Object.keys(rObj)
+					});
+				} else if (toolCallId && progressText) {
+					this._logJson('EMIT tool_progress (from tool_call_update)', {
+						sessionId: sid,
+						toolCallId,
+						canonicalName,
+						status,
+						terminalId: terminalIdForProgress || null,
+						progressLen: progressText.length,
+						hasDerivedTexts: derivedTexts.length,
+						rObjKeys: Object.keys(rObj),
+						hasExitStatus: !!exitStatus,
+						truncated: truncated ?? null,
+						preview: progressText.slice(0, 160)
+					});
 
-						emitter.fire({
-							type: 'tool_progress',
-							toolProgress: {
-								id: toolCallId,
-								name: canonicalName,
-								...(terminalIdForProgress ? { terminalId: terminalIdForProgress } : {}),
-								output: progressText,
-								...(typeof truncated === 'boolean' ? { truncated } : {}),
-								...(exitStatus ? { exitStatus } : {})
-							} as any
-						});
-					} else {
-						this._logJson('SKIP tool_progress (empty)', {
-							sessionId: sid,
-							toolCallId,
-							canonicalName,
-							status,
-							terminalId: terminalIdForProgress || null,
-							derivedTextLen: textFromContent.length,
-							rawOutLen: rawOutStr.length,
-							rObjKeys: Object.keys(rObj)
-						});
-					}
+					emitter.fire({
+						type: 'tool_progress',
+						toolProgress: {
+							id: toolCallId,
+							name: canonicalName,
+							...(terminalIdForProgress ? { terminalId: terminalIdForProgress } : {}),
+							output: progressText,
+							...(typeof truncated === 'boolean' ? { truncated } : {}),
+							...(exitStatus ? { exitStatus } : {})
+						} as any
+					});
+				} else {
+					this._logJson('SKIP tool_progress (empty)', {
+						sessionId: sid,
+						toolCallId,
+						canonicalName,
+						status,
+						terminalId: terminalIdForProgress || null,
+						derivedTextLen: textFromContent.length,
+						rawOutLen: rawOutStr.length,
+						rObjKeys: Object.keys(rObj)
+					});
 				}
+			}
 
 			this._logJson('session/update tool_call_update', {
 				sessionId: sid,
@@ -1508,8 +1530,8 @@ export class AcpMainService implements IAcpMainServiceForChannel {
 					return;
 				}
 
-					// run_command
-					if (canonicalName === 'run_command') {
+				// run_command
+				if (canonicalName === 'run_command') {
 					const terminalId =
 						(derivedTerminals.length ? String(derivedTerminals[0].terminalId) : '')
 						|| (typeof (rObj as any).terminalId === 'string' ? String((rObj as any).terminalId) : '')
@@ -1574,7 +1596,7 @@ export class AcpMainService implements IAcpMainServiceForChannel {
 		if (u.sessionUpdate === 'available_commands_update' && Array.isArray((u as any).availableCommands)) {
 			const items = (u as any).availableCommands.map((cmd: AvailableCommand, i: number) => ({
 				id: String(i),
-				text: `${cmd?.name ?? ''}${cmd?.description ? ` — ${cmd.description}` : ''}`.trim(),
+				text: `${cmd?.name ?? ''}${cmd?.description ? ` - ${cmd.description}` : ''}`.trim(),
 				state: 'pending' as const
 			}));
 			if (items.length) emitter.fire({ type: 'plan', plan: { items } });

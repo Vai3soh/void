@@ -1,3 +1,8 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
 import assert from 'assert';
 import { AcpMainService } from '../acpMainService.js';
 import { ILogService } from '../../../log/common/log.js';
@@ -9,8 +14,15 @@ suite('AcpMainService', () => {
 
 	let service: AcpMainService;
 	let logService: ILogService;
+	let originalEnvHost: string | undefined;
+	let originalEnvPort: string | undefined;
 
 	setup(() => {
+		originalEnvHost = process.env.VOID_ACP_AGENT_HOST;
+		originalEnvPort = process.env.VOID_ACP_AGENT_PORT;
+		delete process.env.VOID_ACP_AGENT_HOST;
+		delete process.env.VOID_ACP_AGENT_PORT;
+
 		logService = {
 			debug: () => { },
 			info: () => { },
@@ -18,12 +30,39 @@ suite('AcpMainService', () => {
 			error: () => { },
 			trace: () => { },
 		} as any;
-		service = new AcpMainService(logService);
+		service = createService();
 	});
 
 	teardown(async () => {
 		await service.disconnect();
+		restoreEnv();
 	});
+
+	function createService(args: Record<string, string | undefined> = {}): AcpMainService {
+		return new AcpMainService(logService, { args } as any);
+	}
+
+	function restoreEnv(): void {
+		if (originalEnvHost === undefined) {
+			delete process.env.VOID_ACP_AGENT_HOST;
+		} else {
+			process.env.VOID_ACP_AGENT_HOST = originalEnvHost;
+		}
+		if (originalEnvPort === undefined) {
+			delete process.env.VOID_ACP_AGENT_PORT;
+		} else {
+			process.env.VOID_ACP_AGENT_PORT = originalEnvPort;
+		}
+	}
+
+	function captureWsUrls(svc: AcpMainService): string[] {
+		const urls: string[] = [];
+		(svc as any)._wsNdjsonStream = async (url: string) => {
+			urls.push(url);
+			throw new Error('stop after url capture');
+		};
+		return urls;
+	}
 
 	test('connect defaults to websocket mode', async () => {
 		try {
@@ -34,12 +73,61 @@ suite('AcpMainService', () => {
 	});
 
 	test('connect builtin defaults URL', async () => {
-		try {
-			await service.connect({ mode: 'builtin' });
-		} catch { }
+		const urls = captureWsUrls(service);
+		await assert.rejects(() => service.connect({ mode: 'builtin' }), /stop after url capture/);
+		assert.deepStrictEqual(urls, ['ws://127.0.0.1:8719']);
+	});
+
+	test('connect builtin uses custom CLI endpoint', async () => {
+		service = createService({ 'acp-agent-addr': '127.0.0.1:8720' });
+		const urls = captureWsUrls(service);
+
+		await assert.rejects(() => service.connect({ mode: 'builtin' }), /stop after url capture/);
+
+		assert.deepStrictEqual(urls, ['ws://127.0.0.1:8720']);
+	});
+
+	test('connect builtin uses env fallback endpoint', async () => {
+		process.env.VOID_ACP_AGENT_HOST = '127.0.0.1';
+		process.env.VOID_ACP_AGENT_PORT = '8730';
+		const urls = captureWsUrls(service);
+
+		await assert.rejects(() => service.connect({ mode: 'builtin' }), /stop after url capture/);
+
+		assert.deepStrictEqual(urls, ['ws://127.0.0.1:8730']);
+	});
+
+	test('connect builtin reconnect identity uses resolved endpoint', async () => {
+		service = createService({ 'acp-agent-addr': '127.0.0.1:8720' });
+		(service as any).connected = true;
+		(service as any).conn = {};
+		(service as any).lastConnectParams = { mode: 'builtin', url: 'ws://127.0.0.1:8720' };
+
+		let called = false;
+		(service as any)._wsNdjsonStream = async () => {
+			called = true;
+			throw new Error('should not reconnect');
+		};
+
+		await service.connect({ mode: 'builtin' });
+
+		assert.strictEqual(called, false);
+	});
+
+	test('connect websocket ignores custom CLI endpoint', async () => {
+		service = createService({ 'acp-agent-addr': '127.0.0.1:8720' });
+		const urls = captureWsUrls(service);
+
+		await assert.rejects(
+			() => service.connect({ mode: 'websocket', agentUrl: 'ws://127.0.0.1:9000' }),
+			/stop after url capture/
+		);
+
+		assert.deepStrictEqual(urls, ['ws://127.0.0.1:9000']);
 	});
 
 	test('connect in process mode requires command', async () => {
+		service = createService({ 'acp-agent-addr': '0.0.0.0:8720' });
 		await assert.rejects(async () => {
 			await service.connect({ mode: 'process', args: [] });
 		}, /command is required/);

@@ -76,6 +76,7 @@ const additionalDefaultNodeTests = [
 	'src/vs/platform/void/common/test/loopGuard.test.ts',
 	'src/vs/platform/acp/electron-main/test/acpMainService.test.ts',
 	'src/vs/platform/acp/test/common/acpLogSanitizer.test.ts',
+	'src/vs/platform/acp/electron-main/test/acpBuiltinAgent.address.test.ts',
 	'src/vs/platform/acp/electron-main/test/acpBuiltinAgent.loopError.test.ts',
 	'src/vs/platform/acp/test/node/acpBuiltinAgent.refreshConfig.test.ts',
 ];

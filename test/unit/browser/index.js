@@ -112,6 +112,8 @@ const rootDir = path.resolve(__dirname, '..', '..', '..');
 const out = path.join(rootDir, `${outdir}`);
 
 const voidQuickBrowserTests = [
+	'src/vs/platform/acp/test/common/acpAgentAddress.test.ts',
+	'src/vs/platform/void/common/test/requestConfigForModel.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/toolsServicePath.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/chatSystemMessage.specialToolFormat.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/acpProcessArgs.test.ts',
@@ -126,6 +128,14 @@ const voidQuickBrowserTests = [
 	'src/vs/workbench/contrib/acp/test/browser/acpInternalExtMethodService.getLLMConfigSwitch.test.ts',
 	'src/vs/workbench/contrib/void/browser/test/readFileChunkLinesPropagation.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/sendLLMMessageService.deltaReconstruct.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/agentSkillsParser.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/agentSkillsService.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/chatSystemMessage.agentSkills.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/toolsService.agentSkills.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/chatThreadService.agentSkills.test.ts',
+	'src/vs/workbench/contrib/acp/test/browser/acpInternalExtMethodService.agentSkills.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/chatAcpHandler.agentSkills.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/ChatHistoryCompressor.agentSkills.test.ts',
 ];
 
 function ensureIsArray(a) {

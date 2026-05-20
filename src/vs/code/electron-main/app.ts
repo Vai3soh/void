@@ -122,6 +122,7 @@ import { NativeMcpDiscoveryHelperService } from '../../platform/mcp/node/nativeM
 import { IWebContentExtractorService } from '../../platform/webContentExtractor/common/webContentExtractor.js';
 import { NativeWebContentExtractorService } from '../../platform/webContentExtractor/electron-main/webContentExtractorService.js';
 import ErrorTelemetry from '../../platform/telemetry/electron-main/errorTelemetry.js';
+import { AcpAgentAddressError, resolveAcpAgentAddress } from '../../platform/acp/common/acpAgentAddress.js';
 import { startBuiltinAcpAgent } from '../../platform/acp/electron-main/acpBuiltinAgent.js';
 import { AcpChannel, AcpChannelName } from '../../platform/acp/common/acpIpc.js';
 import { AcpMainService } from '../../platform/acp/electron-main/acpMainService.js';
@@ -613,9 +614,17 @@ export class CodeApplication extends Disposable {
 		// Open Windows
 		await appInstantiationService.invokeFunction(accessor => this.openFirstWindow(accessor, initialProtocolUrls));
 		try {
-			startBuiltinAcpAgent(this.logService, undefined, appInstantiationService);
+			const acpAddress = resolveAcpAgentAddress({
+				cliAddr: this.environmentMainService.args['acp-agent-addr'],
+				env: process.env
+			});
+			startBuiltinAcpAgent(this.logService, undefined, appInstantiationService, acpAddress);
 		} catch (e) {
-			this.logService.warn('Failed to start built-in ACP Agent', e);
+			if (e instanceof AcpAgentAddressError) {
+				this.logService.warn(`[ACP Agent] invalid built-in ACP agent address: ${e.message}`);
+			} else {
+				this.logService.warn('Failed to start built-in ACP Agent', e);
+			}
 		}
 		// Signal phase: after window open
 		this.lifecycleMainService.phase = LifecycleMainPhase.AfterWindowOpen;

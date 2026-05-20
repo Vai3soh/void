@@ -1,3 +1,8 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
 import { WebSocketServer } from 'ws';
 import {
 	AgentSideConnection,
@@ -25,13 +30,18 @@ import { getModelApiConfiguration } from '../../void/common/modelInference.js';
 import { LLMLoopDetector, LOOP_DETECTED_MESSAGE } from '../../void/common/loopGuard.js';
 import { computeTruncatedToolOutput } from '../../void/common/toolOutputTruncation.js';
 import { stableToolOutputsRelPath } from '../../void/common/toolOutputFileNames.js';
+import { resolveAcpAgentAddress, type AcpAgentAddress } from '../common/acpAgentAddress.js';
 
 type Stream = ConstructorParameters<typeof AgentSideConnection>[1];
+type WebSocketServerOptions = ConstructorParameters<typeof WebSocketServer>[0];
 
 // Allow tests to override sendChatRouter while keeping the default implementation for runtime.
 let sendChatRouterImpl = sendChatRouterOriginal;
+const defaultWebSocketServerFactory = (options: WebSocketServerOptions): WebSocketServer => new WebSocketServer(options);
+let webSocketServerFactory = defaultWebSocketServerFactory;
 
 let started = false;
+let activeServer: WebSocketServer | null = null;
 
 function wsNdjsonStream(ws: any): Stream {
 	const readable = new ReadableStream<Uint8Array>({
@@ -65,16 +75,15 @@ function wsNdjsonStream(ws: any): Stream {
 	return ndJsonStream(writable, readable);
 }
 
-export function startBuiltinAcpAgent(log?: ILogService, notificationService?: INotificationService, instantiationService?: IInstantiationService): void {
-	if (started) return;
+export function startBuiltinAcpAgent(log?: ILogService, notificationService?: INotificationService, instantiationService?: IInstantiationService, address: AcpAgentAddress = resolveAcpAgentAddress({ env: process.env })): WebSocketServer | undefined {
+	if (started) return activeServer ?? undefined;
 	started = true;
 
-	const PORT = Number(process.env.VOID_ACP_AGENT_PORT || 8719);
-	const HOST = process.env.VOID_ACP_AGENT_HOST || '127.0.0.1';
-
 	let wss: WebSocketServer | null = null;
+	let hasListened = false;
 	try {
-		wss = new WebSocketServer({ host: HOST, port: PORT });
+		wss = webSocketServerFactory({ host: address.host, port: address.port });
+		activeServer = wss;
 		const HEARTBEAT_MS = 30_000;
 		const heartbeatTimer = setInterval(() => {
 			if (!wss) return;
@@ -87,11 +96,18 @@ export function startBuiltinAcpAgent(log?: ILogService, notificationService?: IN
 				try { ws.ping(); } catch { /* noop */ }
 			}
 		}, HEARTBEAT_MS);
-		wss.on('close', () => clearInterval(heartbeatTimer));
+		wss.on('close', () => {
+			clearInterval(heartbeatTimer);
+			if (activeServer === wss) {
+				activeServer = null;
+				started = false;
+			}
+		});
 	} catch (e) {
-		log?.warn?.('[ACP Agent] failed to start ws server', e);
+		log?.warn?.(`[ACP Agent] failed to start ws server on ${address.wsUrl}`, e);
+		activeServer = null;
 		started = false;
-		return;
+		return undefined;
 	}
 
 	wss.on('connection', (ws) => {
@@ -102,8 +118,23 @@ export function startBuiltinAcpAgent(log?: ILogService, notificationService?: IN
 		log?.trace?.('[ACP Agent] client connected');
 	});
 
-	wss.on('listening', () => log?.info?.(`[ACP Agent] listening on ws://${HOST}:${PORT}`));
-	wss.on('error', (e) => log?.warn?.('[ACP Agent] error', e));
+	wss.on('listening', () => {
+		hasListened = true;
+		log?.info?.(`[ACP Agent] listening on ${address.wsUrl}`);
+	});
+	wss.on('error', (e) => {
+		log?.warn?.(`[ACP Agent] error on ${address.wsUrl}`, e);
+		const code = typeof (e as { code?: unknown })?.code === 'string' ? (e as { code: string }).code : undefined;
+		if (!hasListened || code === 'EADDRINUSE') {
+			if (activeServer === wss) {
+				activeServer = null;
+				started = false;
+			}
+			try { wss?.close(); } catch { /* noop */ }
+		}
+	});
+
+	return wss;
 }
 
 // ---- Local types to reduce any ----
@@ -226,7 +257,7 @@ type SessionState = {
 	pendingToolCall?: { id: string; name: string } | null;
 	messages: LLMMessage[];
 	// Last LLM token usage snapshot for the most recent sendChatRouter turn in this session.
-	// Used to aggregate per‑prompt usage and send it back to the host via PromptResponse._meta.
+	// Used to aggregate per-prompt usage and send it back to the host via PromptResponse._meta.
 	llmTokenUsageLast?: LLMTokenUsage | undefined;
 	threadId?: string;
 	llmCfg: {
@@ -382,32 +413,32 @@ class VoidPipelineAcpAgent implements Agent {
 			}
 		}
 
-			this.sessions.set(sessionId, {
-				cancelled: false,
-				pendingToolCall: null,
-				messages,
-				threadId: threadIdFromMeta,
-				llmCfg: {
-					providerName,
-					settingsOfProvider: cfg?.settingsOfProvider,
-					modelSelectionOptions: cfg?.modelSelectionOptions ?? undefined,
-					overridesOfModel: cfg?.overridesOfModel ?? undefined,
-					modelName,
-					separateSystemMessage: (typeof cfg?.separateSystemMessage === 'string' || cfg?.separateSystemMessage === null) ? cfg.separateSystemMessage : null,
-					chatMode: cfg?.chatMode ?? null,
-					requestParams: cfg?.requestParams ?? null,
-					dynamicRequestConfig: cfg?.dynamicRequestConfig ?? null,
-					providerRouting: cfg?.providerRouting ?? null,
-					loopGuard: cfg?.loopGuard ?? null,
-					additionalTools: cfg?.additionalTools ?? null,
-					disabledStaticTools: Array.isArray(cfg?.disabledStaticTools)
-						? cfg.disabledStaticTools.map(v => String(v ?? '').trim()).filter(Boolean)
-						: null,
-					disabledDynamicTools: Array.isArray(cfg?.disabledDynamicTools)
-						? cfg.disabledDynamicTools.map(v => String(v ?? '').trim()).filter(Boolean)
-						: null,
-				}
-			});
+		this.sessions.set(sessionId, {
+			cancelled: false,
+			pendingToolCall: null,
+			messages,
+			threadId: threadIdFromMeta,
+			llmCfg: {
+				providerName,
+				settingsOfProvider: cfg?.settingsOfProvider,
+				modelSelectionOptions: cfg?.modelSelectionOptions ?? undefined,
+				overridesOfModel: cfg?.overridesOfModel ?? undefined,
+				modelName,
+				separateSystemMessage: (typeof cfg?.separateSystemMessage === 'string' || cfg?.separateSystemMessage === null) ? cfg.separateSystemMessage : null,
+				chatMode: cfg?.chatMode ?? null,
+				requestParams: cfg?.requestParams ?? null,
+				dynamicRequestConfig: cfg?.dynamicRequestConfig ?? null,
+				providerRouting: cfg?.providerRouting ?? null,
+				loopGuard: cfg?.loopGuard ?? null,
+				additionalTools: cfg?.additionalTools ?? null,
+				disabledStaticTools: Array.isArray(cfg?.disabledStaticTools)
+					? cfg.disabledStaticTools.map(v => String(v ?? '').trim()).filter(Boolean)
+					: null,
+				disabledDynamicTools: Array.isArray(cfg?.disabledDynamicTools)
+					? cfg.disabledDynamicTools.map(v => String(v ?? '').trim()).filter(Boolean)
+					: null,
+			}
+		});
 
 		return { sessionId };
 	}
@@ -968,7 +999,7 @@ class VoidPipelineAcpAgent implements Agent {
 				const args = toolCall.args ?? {};
 				const isReadFileTool = String(toolCall.name) === 'read_file';
 
-				
+
 				const uriArg = (args as any).uri;
 				const filePathFromArgs =
 					typeof uriArg === 'string' ? uriArg.trim() :
@@ -986,7 +1017,7 @@ class VoidPipelineAcpAgent implements Agent {
 				let instructionsLines: string[];
 
 				if (isReadFileTool && filePathFromArgs) {
-					
+
 					const nextStartLine = requestedStartLine + startLineExclusive;
 					const fileTotalLines = parsePositiveInt(
 						(rawOut && typeof rawOut === 'object') ? (rawOut as any).totalNumLines : undefined
@@ -1092,15 +1123,15 @@ class VoidPipelineAcpAgent implements Agent {
 			});
 		}
 
-			// safeguard exhausted
-			this.log?.debug?.('[ACP Agent][prompt] SAFEGUARD EXHAUSTED - stopping', {
-				sessionId: sid,
-				totalTurns: turnCount,
-				messagesInHistory: state.messages.length,
-			});
-			const safeguardMsg = 'Reached ACP safeguard limit; stopping tool loop to avoid infinite run.';
-			this.emitError(safeguardMsg);
-		}
+		// safeguard exhausted
+		this.log?.debug?.('[ACP Agent][prompt] SAFEGUARD EXHAUSTED - stopping', {
+			sessionId: sid,
+			totalTurns: turnCount,
+			messagesInHistory: state.messages.length,
+		});
+		const safeguardMsg = 'Reached ACP safeguard limit; stopping tool loop to avoid infinite run.';
+		this.emitError(safeguardMsg);
+	}
 
 	private async executeTerminalCommandWithStreaming(toolCall: ToolCall): Promise<ToolCallUpdate> {
 		const argsObj = (toolCall.args ?? {}) as Record<string, any>;
@@ -1875,8 +1906,21 @@ export const __test = {
 		// Allow tests to stub the chat router while keeping runtime default intact.
 		sendChatRouterImpl = fn;
 	},
+	setWebSocketServerFactory(fn: (options: WebSocketServerOptions) => WebSocketServer) {
+		webSocketServerFactory = fn;
+	},
+	isBuiltinAgentStarted() {
+		return started;
+	},
 	reset() {
 		sendChatRouterImpl = sendChatRouterOriginal;
+		webSocketServerFactory = defaultWebSocketServerFactory;
+		const server = activeServer;
+		activeServer = null;
+		started = false;
+		if (server) {
+			try { server.close(); } catch { /* noop */ }
+		}
 	},
 	VoidPipelineAcpAgent,
 };

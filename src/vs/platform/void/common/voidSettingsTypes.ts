@@ -202,6 +202,9 @@ export type GlobalSettings = {
 	notifyOnTruncation: boolean;
 	/** Tool names (static and dynamic) disabled by user in settings UI. */
 	disabledToolNames: string[];
+	enableAgentSkills: boolean;
+	disabledAgentSkillNames: string[];
+	enableAcpExternalAgentSkillsFallback: boolean;
 }
 
 export const defaultGlobalSettings: GlobalSettings = {
@@ -238,6 +241,9 @@ export const defaultGlobalSettings: GlobalSettings = {
 	readFileChunkLines: 200,
 	notifyOnTruncation: true,
 	disabledToolNames: [],
+	enableAgentSkills: true,
+	disabledAgentSkillNames: [],
+	enableAcpExternalAgentSkillsFallback: true,
 }
 
 export type GlobalSettingName = keyof GlobalSettings

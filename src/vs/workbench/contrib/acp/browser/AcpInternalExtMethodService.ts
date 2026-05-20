@@ -1,3 +1,8 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { createDecorator, IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
@@ -44,6 +49,9 @@ import { ITerminalService, ITerminalInstance, ICreateTerminalOptions } from '../
 import { TerminalCapability } from '../../../../platform/terminal/common/capabilities/capabilities.js';
 import { MAX_TERMINAL_CHARS } from '../../../../platform/void/common/prompt/constants.js';
 import { URI } from '../../../../base/common/uri.js';
+import { IAgentSkillsService } from '../../void/common/skills/agentSkillsService.js';
+import { formatAgentSkillsCatalogForToolActivation } from '../../void/common/skills/agentSkillsPrompt.js';
+import { IChatThreadService } from '../../void/browser/chatThreadService.js';
 
 const IMCPServiceId = createDecorator<any>('mcpConfigService');
 
@@ -131,7 +139,7 @@ export class AcpInternalExtMethodService {
 				const baseName = removeMCPToolNamePrefix(fullName) || fullName;
 
 				out.push({
-					
+
 					name: `${safePrefix}__${baseName}`,
 					description: String(t?.description ?? ''),
 					params: this._mcpInputSchemaToAdditionalToolParams(t?.inputSchema),
@@ -143,7 +151,7 @@ export class AcpInternalExtMethodService {
 	}
 
 	private _resolveMcpJsonToolByAcpName(acpToolName: string): { serverName: string; toolNamePrefixed: string } | null {
-		
+
 		const idx = acpToolName.indexOf('__');
 		if (idx <= 0) return null;
 
@@ -156,7 +164,7 @@ export class AcpInternalExtMethodService {
 
 		const servers = (mcp.state?.mcpServerOfName ?? {}) as Record<string, any>;
 
-		
+
 		let matchedServerName: string | null = null;
 		for (const serverName of Object.keys(servers)) {
 			if (this._mcpSafePrefixFromServerName(serverName).toLowerCase() === safePrefix.toLowerCase()) {
@@ -176,8 +184,8 @@ export class AcpInternalExtMethodService {
 
 			const bn = removeMCPToolNamePrefix(fullName) || fullName;
 			if (bn === baseName) {
-				
-				
+
+
 				return { serverName: matchedServerName, toolNamePrefixed: fullName };
 			}
 		}
@@ -188,6 +196,40 @@ export class AcpInternalExtMethodService {
 	private _getToolsService(): IToolsService | null {
 		try { return this.instantiationService.invokeFunction(accessor => accessor.get(IToolsService)); }
 		catch { return null; }
+	}
+
+	private _getAgentSkillsService(): IAgentSkillsService | null {
+		try { return this.instantiationService.invokeFunction(accessor => accessor.get(IAgentSkillsService)); }
+		catch { return null; }
+	}
+
+	private async _getSkillsSectionForChatMode(chatMode: ChatMode): Promise<string | undefined> {
+		if (chatMode !== 'agent' && chatMode !== 'gather') return undefined;
+		try {
+			const vss = this.instantiationService.invokeFunction(accessor => accessor.get(IVoidSettingsService));
+			if (vss.state.globalSettings.enableAgentSkills === false) return undefined;
+			const service = this._getAgentSkillsService();
+			if (!service) return undefined;
+			const catalog = await service.getCatalog();
+			return formatAgentSkillsCatalogForToolActivation(catalog) || undefined;
+		} catch (error) {
+			this.logService.warn('[ACP getLLMConfig] Failed to build Agent Skills prompt section:', error);
+			return undefined;
+		}
+	}
+
+	private async _shouldDisableActivateSkillForChatMode(chatMode: ChatMode): Promise<boolean> {
+		if (chatMode !== 'agent' && chatMode !== 'gather') return true;
+		try {
+			const vss = this.instantiationService.invokeFunction(accessor => accessor.get(IVoidSettingsService));
+			if (vss.state.globalSettings.enableAgentSkills === false) return true;
+			const service = this._getAgentSkillsService();
+			if (!service) return true;
+			const catalog = await service.getCatalog();
+			return catalog.skills.length === 0;
+		} catch {
+			return true;
+		}
 	}
 
 	private _getDisabledToolNamesSet(): Set<string> {
@@ -549,6 +591,14 @@ export class AcpInternalExtMethodService {
 		const method = reqParams?.method as string;
 		const p = reqParams?.params ?? {};
 		const disabledToolNames = this._getDisabledToolNamesSet();
+		try {
+			const vss = this.instantiationService.invokeFunction(a => a.get(IVoidSettingsService));
+			if (await this._shouldDisableActivateSkillForChatMode(vss.state.globalSettings.chatMode)) {
+				disabledToolNames.add('activate_skill');
+			}
+		} catch {
+			disabledToolNames.add('activate_skill');
+		}
 
 		const terminalHandled = await this._handleTerminalExtMethod(method, p);
 		if (terminalHandled !== undefined) {
@@ -561,7 +611,7 @@ export class AcpInternalExtMethodService {
 			const vss = this.instantiationService.invokeFunction(a => a.get(IVoidSettingsService));
 			const st = vss.state;
 			const disabledToolNamesList = Array.from(disabledToolNames);
-			const disabledStaticTools = disabledToolNamesList.filter(name => isAToolName(name));
+			let disabledStaticTools = disabledToolNamesList.filter(name => isAToolName(name));
 			const disabledDynamicTools = disabledToolNamesList.filter(name => !isAToolName(name));
 
 			type GetLLMCfgParams = { featureName: FeatureName };
@@ -576,6 +626,11 @@ export class AcpInternalExtMethodService {
 			}
 
 			const feature = rawFeature;
+			if (await this._shouldDisableActivateSkillForChatMode(st.globalSettings.chatMode)) {
+				if (!disabledStaticTools.includes('activate_skill')) {
+					disabledStaticTools = [...disabledStaticTools, 'activate_skill'];
+				}
+			}
 
 			const selected: ModelSelection | null = st.modelSelectionOfFeature[feature];
 
@@ -696,8 +751,8 @@ export class AcpInternalExtMethodService {
 			if (explicit) {
 				separateSystemMessage = explicit + `
 							ACP PLAN (builtin ACP agent; REQUIRED):
-							 - Do NOT output any execution plan in plain text (no "<plan>...</plan>").
-							 - If a plan is needed, call the tool "acp_plan" with entries and keep it updated.`;
+							- Do NOT output any execution plan in plain text (no "<plan>...</plan>").
+							- If a plan is needed, call the tool "acp_plan" with entries and keep it updated.`;
 			} else {
 				try {
 					const ws = this.instantiationService.invokeFunction(a => a.get(IWorkspaceContextService));
@@ -727,12 +782,14 @@ export class AcpInternalExtMethodService {
 						}
 					}
 
+					const skillsSection = await this._getSkillsSectionForChatMode(st.globalSettings.chatMode);
 					separateSystemMessage = await chat_systemMessageForAcp({
 						workspaceFolders: folders,
 						chatMode: st.globalSettings.chatMode,
 						toolFormat,
 						ptyHostService: dummyPty,
 						disabledStaticToolNames: disabledStaticTools,
+						skillsSection,
 					});
 				} catch {
 					separateSystemMessage = `You are an editor agent inside Void.
@@ -744,7 +801,7 @@ export class AcpInternalExtMethodService {
 			try {
 				const byName = new Map<string, AdditionalToolInfo>();
 
-				
+
 				try {
 					const lmToolsService = this.instantiationService.invokeFunction(a => a.get(ILanguageModelToolsService));
 					const registeredTools = lmToolsService.getTools();
@@ -795,11 +852,11 @@ export class AcpInternalExtMethodService {
 						});
 					}
 				} catch (e) {
-					
+
 					this.logService.debug('[ACP getLLMConfig] ILanguageModelToolsService MCP tools unavailable:', e);
 				}
 
-				
+
 				try {
 					for (const t of this._collectMcpJsonAdditionalTools()) {
 						if (disabledToolNames.has(t.name)) continue;
@@ -1037,10 +1094,23 @@ export class AcpInternalExtMethodService {
 					text = typeof resolved === 'string' ? resolved : JSON.stringify(resolved);
 				}
 
+				if (name === 'activate_skill' && (resolved as any)?.name && (resolved as any)?.skillFileUri && p?.threadId) {
+					try {
+						const chatThreadService = this.instantiationService.invokeFunction(accessor => accessor.get(IChatThreadService));
+						chatThreadService.markSkillActive(String(p.threadId), String((resolved as any).name), {
+							activatedAt: new Date().toISOString(),
+							source: 'tool',
+							skillFileUri: String((resolved as any).skillFileUri?.toString ? (resolved as any).skillFileUri.toString() : (resolved as any).skillFileUri),
+						});
+					} catch (error) {
+						this.logService.warn('[ACP execute_with_text] Failed to record Agent Skill activation:', error);
+					}
+				}
+
 				return { ok: true, result: resolved, text };
 			}
 
-			
+
 			try {
 				const lmToolsService = this.instantiationService.invokeFunction(accessor => accessor.get(ILanguageModelToolsService));
 				const tool = resolveMcpToolByName(nameStr);
@@ -1072,10 +1142,10 @@ export class AcpInternalExtMethodService {
 					return { ok: true, result: value, text };
 				}
 			} catch {
-				
+
 			}
 
-			
+
 			const mcp = this._getMcpService();
 			if (mcp) {
 				const resolved = this._resolveMcpJsonToolByAcpName(nameStr);

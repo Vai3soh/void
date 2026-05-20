@@ -123,6 +123,7 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 				endpoint: cfg.endpoint,
 				apiStyle: cfg.apiStyle,
 				supportsSystemMessage: cfg.supportsSystemMessage,
+				specialToolFormat: cfg.specialToolFormat,
 				auth: cfg.auth ?? { header: 'Authorization', format: 'Bearer' }
 			};
 			this.logService.debug(`[DEBUG registerProviderConfigResolver] Returning:`, result);
@@ -732,7 +733,6 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 	} {
 		const preferred = preferredProviderSlug?.trim().toLowerCase();
 		this.logService.debug(`[DEBUG getRequestConfigForModel] Called with modelId: "${modelId}", preferredProviderSlug: "${preferred || ''}"`);
-		const base = getModelApiConfiguration(modelId);
 		const slugFromModel = getProviderSlug(modelId).toLowerCase();
 
 		const cpPreferred = preferred ? this.getUserProviderSettings(preferred) : undefined;
@@ -746,6 +746,9 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 
 		const usedSlug = cpPreferred ? preferred : (cpByModel ? slugFromModel : (cpOpenRouter ? 'openrouter' : slugFromModel));
 		this.logService.debug(`[DEBUG getRequestConfigForModel] slugFromModel="${slugFromModel}", usedSlug="${usedSlug}", hasCp=${!!cp}`);
+
+		const modelIdForTransportDefaults = usedSlug && usedSlug !== slugFromModel ? `${usedSlug}/${modelId}` : modelId;
+		const base = getModelApiConfiguration(modelIdForTransportDefaults);
 
 		this.logService.debug(`[DEBUG getRequestConfigForModel] base:`, JSON.stringify(base, null, 2));
 		this.logService.debug(`[DEBUG getRequestConfigForModel] cp(usedSlug="${usedSlug}"):`, cp);

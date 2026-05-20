@@ -155,6 +155,7 @@ export type BuildContext = {
 	nowDate: string
 	mode: ChatMode
 	toolFormat: specialToolFormat
+	skillsSection?: string
 }
 
 type XmlSections = {
@@ -196,6 +197,7 @@ function buildXmlPromptFromSections(ctx: BuildContext, s: XmlSections): string {
 		.replace('{{EFFICIENT_TASK_APPROACH}}', s.EFFICIENT_TASK_APPROACH)
 		.replace('{{REMEMBER_SECTION}}', s.REMEMBER_SECTION)
 		.replace('{{NOW_DATE}}', ctx.nowDate)
+		.concat(ctx.skillsSection ? `\n\n${ctx.skillsSection}` : '')
 		.trim()
 }
 
@@ -541,6 +543,7 @@ function buildNativePromptFromSections(ctx: BuildContext, s: NativeSections): st
 		.replace('{{STRICT_EDIT_SPEC}}', s.STRICT_EDIT_SPEC)
 		.replace('{{SAFETY_SCOPE_SECTION}}', s.SAFETY_SCOPE)
 		.replace('{{TOOL_FORMAT_HELP}}', toolHelp)
+		.concat(ctx.skillsSection ? `\n\n${ctx.skillsSection}` : '')
 }
 
 function buildNativePromptBase(ctx: BuildContext, mode: ChatMode): string {
@@ -681,12 +684,14 @@ export async function chat_systemMessage({
 	toolFormat,
 	ptyHostService,
 	disabledStaticToolNames,
+	skillsSection,
 }: {
 	workspaceFolders: string[]
 	chatMode: ChatMode
 	toolFormat: specialToolFormat
 	ptyHostService: IPtyHostService
 	disabledStaticToolNames?: readonly string[]
+	skillsSection?: string
 }) {
 	if (typeof SYSTEM_PROMPT_OVERRIDE === 'string' && SYSTEM_PROMPT_OVERRIDE.trim() !== '') {
 		return SYSTEM_PROMPT_OVERRIDE
@@ -711,7 +716,8 @@ export async function chat_systemMessage({
 		xmlToolsList,
 		nowDate,
 		mode,
-		toolFormat
+		toolFormat,
+		skillsSection
 	}
 
 	// CHAT MODE: always use a dedicated chat prompt without tool-format help,
@@ -740,6 +746,7 @@ export async function chat_systemMessageForAcp(opts: {
 	toolFormat: specialToolFormat;
 	ptyHostService: IPtyHostService;
 	disabledStaticToolNames?: readonly string[];
+	skillsSection?: string;
 }) {
 	let base = await chat_systemMessage(opts);
 

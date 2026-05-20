@@ -762,7 +762,7 @@ suite('ChatThreadService - history compression', () => {
 		]);
 
 		assert.ok(summaryText, 'expected non-empty summaryText for long history');
-		assert.strictEqual(summaryText, 'compressed summary');
+		assert.strictEqual(summaryText, 'Conversation summary:\ncompressed summary');
 		assert.ok(compressionInfo, 'expected compressionInfo to be returned');
 		assert.ok(compressionInfo!.hasCompressed);
 		assert.ok(compressionInfo!.summarizedMessageCount > 0);

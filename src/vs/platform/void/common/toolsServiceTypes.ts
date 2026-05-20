@@ -26,6 +26,7 @@ export type ToolCallParams = {
 	'search_for_files': { query: string, isRegex: boolean, searchInFolder: URI | null, pageNumber: number },
 	'search_in_file': { uri: URI, query: string, isRegex: boolean },
 	'read_lint_errors': { uri: URI },
+	'activate_skill': { name: string },
 	// ---
 	'rewrite_file': { uri: URI, newContent: string },
 	'edit_file': { uri: URI, originalSnippet: string, updatedSnippet: string, occurrence: number | null, replaceAll: boolean, locationHint: any | null, encoding: string | null, newline: string | null },
@@ -54,6 +55,16 @@ export type ToolResultType = {
 	'search_for_files': { uris: URI[], hasNextPage: boolean },
 	'search_in_file': { lines: number[]; },
 	'read_lint_errors': { lintErrors: LintErrorItem[] | null },
+	'activate_skill': {
+		name: string;
+		body: string;
+		skillFileUri: URI;
+		skillDirUri: URI;
+		resources: Array<{ kind: string; relativePath: string; uri: URI; isDirectory: boolean }>;
+		diagnostics: Array<{ severity: string; code: string; message: string; uri?: URI; name?: string }>;
+		contentForModel: string;
+		alreadyActive?: boolean;
+	},
 	// ---
 	'rewrite_file': Promise<{ lintErrors: LintErrorItem[] | null }>,
 	'edit_file': Promise<{ applied: boolean; occurrences_found?: number; occurrence_applied?: number; updated_text?: string; preview?: { before: string; after: string } }>,

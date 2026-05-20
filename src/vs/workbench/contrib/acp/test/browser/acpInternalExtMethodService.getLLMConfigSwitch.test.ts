@@ -1,3 +1,8 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../../platform/log/common/log.js';
@@ -43,7 +48,7 @@ suite('ACP getLLMConfig - config switches with settings', () => {
 					acpProcessArgs: [],
 					acpProcessEnv: {},
 					acpModel: null,
-					
+
 					acpSystemPrompt: 'SYS',
 					showAcpPlanInChat: true,
 
@@ -107,7 +112,7 @@ suite('ACP getLLMConfig - config switches with settings', () => {
 					if (id === IVoidSettingsService) return settingsService;
 					if (id === IDynamicProviderRegistryService) return registry;
 					if (id === IWorkspaceContextService) return workspace;
-					
+
 					return { getTools: () => new Set() };
 				}
 			})
@@ -231,7 +236,7 @@ suite('ACP getLLMConfig - config switches with settings', () => {
 		const svc = new AcpInternalExtMethodService(instantiationService, logService);
 		const res = await svc.handle({ method: 'void/settings/getLLMConfig', params: { featureName: 'Chat' } });
 
-		assert.deepStrictEqual(res.disabledStaticTools, ['read_file']);
+		assert.deepStrictEqual(res.disabledStaticTools, ['read_file', 'activate_skill']);
 		assert.deepStrictEqual(res.disabledDynamicTools, ['myServer__toolA']);
 	});
 

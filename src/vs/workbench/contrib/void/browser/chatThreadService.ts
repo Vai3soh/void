@@ -45,6 +45,8 @@ import { ChatCodespanManager } from './ChatCodespanManager.js';
 import { ChatAcpHandler, IThreadStateAccess } from './ChatAcpHandler.js';
 import { ChatExecutionEngine } from './ChatExecutionEngine.js';
 import { getModelCapabilities } from '../../../../platform/void/common/modelInference.js';
+import { IAgentSkillsService } from '../common/skills/agentSkillsService.js';
+import { AgentSkillActiveMetadata } from '../common/skills/agentSkillsTypes.js';
 
 export type ThreadHistoryCompressionInfo = {
 	hasCompressed: boolean;
@@ -77,6 +79,7 @@ export type ThreadType = {
 		tokenUsageSession?: LLMTokenUsage;
 		tokenUsageLastRequest?: LLMTokenUsage;
 		tokenUsageLastRequestLimits?: any;
+		activeSkills?: { [name: string]: AgentSkillActiveMetadata };
 		historyCompression?: ThreadHistoryCompressionInfo;
 		mountedInfo?: {
 			whenMounted: Promise<any>
@@ -181,6 +184,7 @@ export interface IChatThreadService {
 	blurCurrentChat: () => Promise<void>;
 	enqueueToolRequestFromAcp(threadId: string, req: { id: string; name: AnyToolName | string; rawParams: Record<string, any>; params?: Record<string, any> }): void;
 	onExternalToolDecision: Event<{ threadId: string; toolCallId: string; decision: 'approved' | 'rejected' | 'skipped' }>;
+	markSkillActive(threadId: string, name: string, metadata: AgentSkillActiveMetadata): void;
 }
 
 export function normalizeSelectionRelativePath(uri: URI, workspaceFolderUris: readonly URI[]): string | undefined {
@@ -205,6 +209,7 @@ const newThreadObject = () => {
 			stagingSelections: [],
 			focusedMessageIdx: undefined,
 			linksOfMessageIdx: {},
+			activeSkills: {},
 			tokenUsageSession: undefined,
 			historyCompression: undefined,
 		},
@@ -265,6 +270,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		@IFileService private readonly _fileService: IFileService,
 		@ILabelService private readonly _labelService: ILabelService,
 		@ILogService private readonly _logService: ILogService,
+		@IAgentSkillsService private readonly _agentSkillsService: IAgentSkillsService = undefined as unknown as IAgentSkillsService,
 	) {
 		super();
 
@@ -290,6 +296,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			updateLatestTool: (tid: string, tool: any) => this._updateLatestTool(tid, tool),
 
 			accumulateTokenUsage: (tid: string, usage: any) => this._accumulateTokenUsage(tid, usage),
+			markSkillActive: (tid: string, name: string, metadata: AgentSkillActiveMetadata) => this._markSkillActive(tid, name, metadata),
 			addUserCheckpoint: (tid: string) => this._checkpointManager.addUserCheckpoint(tid, this._threadAccess),
 			currentModelSelectionProps: () => this._currentModelSelectionProps(),
 			isStreaming: (tid: string) => !!this.streamState[tid]?.isRunning
@@ -317,7 +324,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._acpHandler = new ChatAcpHandler(
 			_acpService, _workspaceContextService, _settingsService, _fileService,
 			_directoryStringService, _voidModelService, _editCodeService, this._logService,
-			this._historyCompressor, this._toolOutputManager,
+			this._historyCompressor, this._toolOutputManager, this._agentSkillsService,
 		);
 
 		this._executionEngine = new ChatExecutionEngine(
@@ -354,6 +361,43 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	// --- Public API ---
 
+	private async _injectExplicitSkillActivations(opts: {
+		threadId: string;
+		displayText: string;
+		content: string;
+	}): Promise<string> {
+		const { threadId, displayText, content } = opts;
+		const settings = this._settingsService.state.globalSettings;
+		if (settings.enableAgentSkills === false || settings.chatMode === 'normal') return content;
+
+		try {
+			const catalog = await this._agentSkillsService.getCatalog();
+			if (!catalog.skills.length) return content;
+
+			const { resolved } = await this._agentSkillsService.resolveExplicitMentions(displayText, catalog);
+			if (!resolved.length) return content;
+
+			const active = this.state.allThreads[threadId]?.state.activeSkills ?? {};
+			const injected: string[] = [];
+			for (const mention of resolved) {
+				if (active[mention.name]) continue;
+				const activation = await this._agentSkillsService.activateSkill(mention.name);
+				injected.push(activation.contentForModel);
+				this._markSkillActive(threadId, mention.name, {
+					activatedAt: new Date().toISOString(),
+					source: 'explicit',
+					skillFileUri: activation.skillFileUri.toString(),
+				});
+			}
+
+			if (!injected.length) return content;
+			return `${injected.join('\n\n')}\n\n${content}`;
+		} catch (error) {
+			this._logService.warn('[ChatThreadService] Failed to inject explicit Agent Skill activation:', error);
+			return content;
+		}
+	}
+
 	async addUserMessageAndStreamResponse({ userMessage, _chatSelections, attachments, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], attachments?: ChatAttachment[], threadId: string }) {
 		const thread = this.state.allThreads[threadId];
 		if (!thread) return;
@@ -378,11 +422,16 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 
 		const currSelns = _chatSelections ?? thread.state.stagingSelections;
-		const userMessageContent = await chat_userMessageContent(userMessage, currSelns, {
+		const userMessageContentRaw = await chat_userMessageContent(userMessage, currSelns, {
 			directoryStrService: this._directoryStringService,
 			fileService: this._fileService,
 			voidModelService: this._voidModelService,
 			getRelativePath: (uri: URI) => this._labelService.getUriLabel(uri, { relative: true })
+		});
+		const userMessageContent = await this._injectExplicitSkillActivations({
+			threadId,
+			displayText: userMessage,
+			content: userMessageContentRaw,
 		});
 
 		this._addMessageToThread(threadId, {
@@ -740,6 +789,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._acpHandler.enqueueToolRequestFromAcp(threadId, req, this._threadAccess);
 	}
 
+	markSkillActive(threadId: string, name: string, metadata: AgentSkillActiveMetadata): void {
+		this._markSkillActive(threadId, name, metadata);
+	}
+
 	// --- Helpers ---
 
 	jumpToCheckpointBeforeMessageIdx(opts: { threadId: string, messageIdx: number, jumpToUserModified: boolean }) {
@@ -1024,6 +1077,34 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			cacheRead: prev.cacheRead + next.cacheRead, output: prev.output + next.output
 		} : { ...next };
 		this._setThreadState(threadId, { tokenUsageSession: result, tokenUsageLastRequest: next });
+	}
+
+	private _markSkillActive(threadId: string, name: string, metadata: AgentSkillActiveMetadata): void {
+		const t = this.state.allThreads[threadId];
+		const cleanName = String(name ?? '').trim();
+		if (!t || !cleanName) return;
+
+		const activeSkills = {
+			...(t.state.activeSkills ?? {}),
+			[cleanName]: {
+				activatedAt: metadata.activatedAt,
+				source: metadata.source,
+				skillFileUri: metadata.skillFileUri,
+			},
+		};
+		const newThreads = {
+			...this.state.allThreads,
+			[t.id]: {
+				...t,
+				lastModified: new Date().toISOString(),
+				state: {
+					...t.state,
+					activeSkills,
+				},
+			},
+		};
+		this._storeAllThreads(newThreads);
+		this._setState({ allThreads: newThreads }, true);
 	}
 
 	private _currentModelSelectionProps() {

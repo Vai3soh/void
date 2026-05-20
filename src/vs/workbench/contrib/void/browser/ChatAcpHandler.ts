@@ -20,6 +20,9 @@ import { IEditCodeService } from './editCodeServiceInterface.js';
 import { ChatHistoryCompressor } from './ChatHistoryCompressor.js';
 import { ChatToolOutputManager } from './ChatToolOutputManager.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
+import { IAgentSkillsService } from '../common/skills/agentSkillsService.js';
+import { formatAgentSkillsCatalogForExternalAcp } from '../common/skills/agentSkillsPrompt.js';
+import { AgentSkillActiveMetadata } from '../common/skills/agentSkillsTypes.js';
 
 const _snakeToCamel = (s: string) => s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 const _normalizeFsPath = (p: string) => String(p ?? '').replace(/\\/g, '/').replace(/\/+$/g, '');
@@ -227,6 +230,7 @@ export interface IThreadStateAccess {
 	addMessageToThread(threadId: string, message: ChatMessage): void;
 	updateLatestTool(threadId: string, tool: any): void;
 	setThreadState(threadId: string, state: any): void;
+	markSkillActive(threadId: string, name: string, metadata: AgentSkillActiveMetadata): void;
 	accumulateTokenUsage(threadId: string, usage: any): void;
 	addUserCheckpoint(threadId: string): void;
 	currentModelSelectionProps(): { modelSelection: any; modelSelectionOptions: any };
@@ -246,7 +250,8 @@ export class ChatAcpHandler extends Disposable {
 		@IEditCodeService private readonly _editCodeService: IEditCodeService,
 		@ILogService private readonly _logService: ILogService,
 		private readonly _historyCompressor: ChatHistoryCompressor,
-		private readonly _toolOutputManager: ChatToolOutputManager
+		private readonly _toolOutputManager: ChatToolOutputManager,
+		private readonly _agentSkillsService: IAgentSkillsService | undefined = undefined
 	) {
 		super();
 	}
@@ -430,7 +435,7 @@ export class ChatAcpHandler extends Disposable {
 		let history = this._buildAcpHistory(threadId, access);
 
 		const currSelns = _chatSelections ?? null;
-		const builtContent = await chat_userMessageContent(
+		let builtContent = await chat_userMessageContent(
 			userMessage,
 			currSelns,
 			{
@@ -439,6 +444,27 @@ export class ChatAcpHandler extends Disposable {
 				voidModelService: this._voidModelService,
 			}
 		);
+
+		const storedLastUser = [...access.getThreadMessages(threadId)].reverse().find((m: any) =>
+			m?.role === 'user' && String(m.displayContent ?? '') === String(userMessage ?? '')
+		) as any;
+		if (typeof storedLastUser?.content === 'string' && storedLastUser.content.trim()) {
+			builtContent = storedLastUser.content;
+		}
+
+		const gs = this._settingsService.state.globalSettings;
+		if ((gs.acpMode === 'websocket' || gs.acpMode === 'process') && gs.enableAcpExternalAgentSkillsFallback !== false && gs.enableAgentSkills !== false) {
+			try {
+				const catalog = await this._agentSkillsService?.getCatalog();
+				if (!catalog) throw new Error('Agent Skills service unavailable');
+				const fallback = formatAgentSkillsCatalogForExternalAcp(catalog);
+				if (fallback) {
+					builtContent = `${fallback}\n\n${builtContent}`;
+				}
+			} catch (error) {
+				this._logService.warn('[ChatAcpHandler] Failed to build external ACP Agent Skills fallback:', error);
+			}
+		}
 
 		const contentBlocks: any[] = [];
 		if (builtContent && builtContent.trim()) {
@@ -487,7 +513,6 @@ export class ChatAcpHandler extends Disposable {
 			}
 		} catch { /* fail open */ }
 
-		const gs = this._settingsService.state.globalSettings;
 		let stream: any;
 		let attempt = 0;
 		const chatRetries = gs.chatRetries;

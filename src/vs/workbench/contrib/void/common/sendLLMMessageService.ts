@@ -34,6 +34,7 @@ import { IDynamicProviderRegistryService } from '../../../../platform/void/commo
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IMCPService } from './mcpService.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
+import { IAgentSkillsService } from './skills/agentSkillsService.js';
 
 // calls channel to implement features
 export const ILLMMessageService = createDecorator<ILLMMessageService>('llmMessageService');
@@ -92,22 +93,22 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		// see llmMessageChannel.ts
 		this.channel = this.mainProcessService.getChannel('void-channel-llmMessage')
 
-			// .listen sets up an IPC channel and takes a few ms, so we set up listeners immediately and add hooks to them instead
-			// llm
-			this._register((this.channel.listen('onText_sendLLMMessage') satisfies Event<EventLLMMessageOnTextParams>)(e => {
-				const prev = this._streamingStateByRequest[e.requestId] ?? { fullText: '', fullReasoning: '' };
-				const incomingText = typeof e.fullText === 'string' ? e.fullText : '';
-				const incomingReasoning = typeof e.fullReasoning === 'string' ? e.fullReasoning : '';
+		// .listen sets up an IPC channel and takes a few ms, so we set up listeners immediately and add hooks to them instead
+		// llm
+		this._register((this.channel.listen('onText_sendLLMMessage') satisfies Event<EventLLMMessageOnTextParams>)(e => {
+			const prev = this._streamingStateByRequest[e.requestId] ?? { fullText: '', fullReasoning: '' };
+			const incomingText = typeof e.fullText === 'string' ? e.fullText : '';
+			const incomingReasoning = typeof e.fullReasoning === 'string' ? e.fullReasoning : '';
 
-				const fullText = e.isFullTextDelta ? (prev.fullText + incomingText) : incomingText;
-				const fullReasoning = e.isFullReasoningDelta ? (prev.fullReasoning + incomingReasoning) : incomingReasoning;
+			const fullText = e.isFullTextDelta ? (prev.fullText + incomingText) : incomingText;
+			const fullReasoning = e.isFullReasoningDelta ? (prev.fullReasoning + incomingReasoning) : incomingReasoning;
 
-				this._streamingStateByRequest[e.requestId] = { fullText, fullReasoning };
-				this.llmMessageHooks.onText[e.requestId]?.({ ...e, fullText, fullReasoning })
-			}))
-			this._register((this.channel.listen('onFinalMessage_sendLLMMessage') satisfies Event<EventLLMMessageOnFinalMessageParams>)(e => {
-				this.llmMessageHooks.onFinalMessage[e.requestId]?.(e);
-				this._clearChannelHooks(e.requestId)
+			this._streamingStateByRequest[e.requestId] = { fullText, fullReasoning };
+			this.llmMessageHooks.onText[e.requestId]?.({ ...e, fullText, fullReasoning })
+		}))
+		this._register((this.channel.listen('onFinalMessage_sendLLMMessage') satisfies Event<EventLLMMessageOnFinalMessageParams>)(e => {
+			this.llmMessageHooks.onFinalMessage[e.requestId]?.(e);
+			this._clearChannelHooks(e.requestId)
 		}))
 		this._register((this.channel.listen('onError_sendLLMMessage') satisfies Event<EventLLMMessageOnErrorParams>)(e => {
 			this.llmMessageHooks.onError[e.requestId]?.(e);
@@ -196,7 +197,7 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 			).map(v => String(v ?? '').trim()).filter(Boolean)
 		);
 		const staticToolNameSet = new Set<string>((toolNames as readonly string[]).map(v => String(v)));
-		const disabledStaticTools = Array.from(disabledByUser).filter(n => staticToolNameSet.has(n));
+		let disabledStaticTools = Array.from(disabledByUser).filter(n => staticToolNameSet.has(n));
 		const disabledDynamicTools = Array.from(disabledByUser).filter(n => !staticToolNameSet.has(n));
 		const disabledDynamicSet = new Set<string>(disabledDynamicTools);
 
@@ -347,6 +348,12 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 			}
 
 			try {
+				if (await this._shouldDisableActivateSkill(proxyParams.chatMode)) {
+					if (!disabledStaticTools.includes('activate_skill')) {
+						disabledStaticTools = [...disabledStaticTools, 'activate_skill'];
+					}
+				}
+
 				await this.channel.call('sendLLMMessage', {
 					...proxyParams,
 					requestId,
@@ -368,6 +375,20 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		})();
 
 		return requestId;
+	}
+
+	private async _shouldDisableActivateSkill(chatMode: unknown): Promise<boolean> {
+		if (chatMode !== 'agent' && chatMode !== 'gather') return true;
+		if (this.voidSettingsService.state.globalSettings.enableAgentSkills === false) return true;
+
+		try {
+			const agentSkillsService = this.instantiationService.invokeFunction((accessor) => accessor.get(IAgentSkillsService));
+			const catalog = await agentSkillsService.getCatalog();
+			return catalog.skills.length === 0;
+		} catch (error) {
+			this.logService.warn('[LLMMessageService] Failed to check Agent Skills availability:', error);
+			return true;
+		}
 	}
 
 	abort(requestId: string) {

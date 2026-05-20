@@ -337,6 +337,50 @@ suite('DynamicProviderRegistryService.getRequestConfigForModel', () => {
 		assert.strictEqual(cfg.specialToolFormat, 'disabled', 'specialToolFormat must stay disabled from capabilities');
 	});
 
+	test('selected openrouter provider keeps OpenAI-compatible transport for google-prefixed model ids', () => {
+		const modelId = 'google/gemma-4-26b-a4b-it:free';
+		const remoteModelsService = makeMockRemoteModelsService();
+		const settingsService = makeMockSettingsService({
+			openrouter: {
+				endpoint: 'https://openrouter.ai/api/v1',
+				apiKey: 'sk-openrouter',
+				apiStyle: 'openai-compatible',
+				models: [modelId],
+				modelsCapabilities: {
+					[modelId]: {
+						supportsSystemMessage: 'system-role',
+						specialToolFormat: 'openai-style',
+					},
+				},
+			},
+			google: {
+				endpoint: 'https://generativelanguage.googleapis.com/v1',
+				apiKey: 'sk-google',
+				apiStyle: 'gemini-style',
+				models: [modelId],
+				modelsCapabilities: {
+					[modelId]: {
+						supportsSystemMessage: 'separated',
+						specialToolFormat: 'gemini-style',
+					},
+				},
+			},
+		});
+		const dynamicModelService = makeMockDynamicModelService();
+		const logService = new NullLogService();
+
+		// @ts-ignore – partial mocks are sufficient for this test
+		const svc = new DynamicProviderRegistryService(remoteModelsService, settingsService, dynamicModelService, logService);
+
+		const cfg = svc.getRequestConfigForModel(modelId, 'openrouter');
+
+		assert.strictEqual(cfg.endpoint, 'https://openrouter.ai/api/v1');
+		assert.strictEqual(cfg.apiStyle, 'openai-compatible');
+		assert.strictEqual(cfg.headers['Authorization'], 'Bearer sk-openrouter');
+		assert.strictEqual(cfg.supportsSystemMessage, 'system-role');
+		assert.strictEqual(cfg.specialToolFormat, 'openai-style');
+	});
+
 	test('getEffectiveModelCapabilities returns reasoningCapabilities exactly as saved in modelsCapabilities', async () => {
 		const remoteModelsService = makeMockRemoteModelsService();
 		const settingsService = makeMockSettingsService(buildScenarioCustomProviders());

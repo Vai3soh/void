@@ -26,6 +26,7 @@ import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_INACTIVE_TIME
 import { IVoidSettingsService } from '../../../../platform/void/common/voidSettingsService.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
 import { IToolsService } from '../common/toolsService.js'
+import { IAgentSkillsService } from '../common/skills/agentSkillsService.js'
 import { inferSelectionFromCode } from './react/src/markdown/inferSelection.js'
 import { resolvePath } from '../../../../base/common/resources.js'
 
@@ -166,6 +167,7 @@ export class ToolsService implements IToolsService {
 		@IDirectoryStrService private readonly directoryStrService: IDirectoryStrService,
 		@IMarkerService private readonly markerService: IMarkerService,
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
+		@IAgentSkillsService private readonly agentSkillsService: IAgentSkillsService = undefined as unknown as IAgentSkillsService,
 	) {
 
 		const queryBuilder = instantiationService.createInstance(QueryBuilder);
@@ -352,6 +354,12 @@ export class ToolsService implements IToolsService {
 				} = params
 				const uri = validateURI(uriUnknown)
 				return { uri }
+			},
+			activate_skill: (params: RawToolParamsObj) => {
+				const { name: nameUnknown } = params
+				const name = validateStr('name', nameUnknown).trim()
+				if (!name) throw new Error('Invalid LLM output: name was empty.')
+				return { name }
 			},
 			create_file_or_folder: (params: RawToolParamsObj) => {
 				const { uri: uriUnknown } = params
@@ -585,6 +593,11 @@ export class ToolsService implements IToolsService {
 				await timeout(1000)
 				const { lintErrors } = this._getLintErrors(uri)
 				return { result: { lintErrors } }
+			},
+			activate_skill: async ({ name }) => {
+				if (!this.agentSkillsService) throw new Error('Agent Skills service is unavailable.')
+				const activation = await this.agentSkillsService.activateSkill(name)
+				return { result: activation }
 			},
 
 			// ---
@@ -916,6 +929,9 @@ export class ToolsService implements IToolsService {
 				return result.lintErrors ?
 					stringifyLintErrors(result.lintErrors)
 					: 'No lint errors found.'
+			},
+			activate_skill: (_params, result) => {
+				return result.contentForModel
 			},
 			// ---
 			create_file_or_folder: (params, result) => {

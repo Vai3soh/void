@@ -10,6 +10,7 @@ import { IVoidSettingsService } from '../../../../platform/void/common/voidSetti
 import { ModelSelection, ModelSelectionOptions } from '../../../../platform/void/common/voidSettingsTypes.js';
 import { getModelCapabilities, getReservedOutputTokenSpace, getIsReasoningEnabledState } from '../../../../platform/void/common/modelInference.js';
 import { CHAT_HISTORY_COMPRESSION_SYSTEM_PROMPT, buildChatHistoryCompressionUserMessage } from '../common/prompt/prompts.js';
+import { collectProtectedSkillContent, messageHasProtectedSkillContent } from '../common/skills/agentSkillProtectedContext.js';
 
 
 const CHARS_PER_TOKEN_ESTIMATE = 4;
@@ -49,7 +50,7 @@ export class ChatHistoryCompressor {
 
 	public async maybeSummarizeHistoryBeforeLLM(opts: {
 		threadId: string;
-		messages: ChatMessage[]; 
+		messages: ChatMessage[];
 		modelSelection: ModelSelection | null;
 		modelSelectionOptions: ModelSelectionOptions | undefined;
 	}): Promise<{ summaryText: string | null; compressionInfo?: ThreadHistoryCompressionInfo }> {
@@ -90,7 +91,7 @@ export class ChatHistoryCompressor {
 			return { summaryText: null };
 		}
 
-		
+
 		const tailCount = HISTORY_COMPRESSION_TAIL_MESSAGE_COUNT;
 		const splitIdx = Math.max(0, chatMessages.length - tailCount);
 		const prefixMessages = splitIdx > 0
@@ -105,8 +106,26 @@ export class ChatHistoryCompressor {
 		const rawTarget = Math.floor(maxInputTokens * 0.2);
 		const targetTokensApprox = Math.max(128, Math.min(rawTarget, 1024));
 
-		const historyText = this._buildHistoryTextForCompression(prefixMessages);
-		if (!historyText.trim()) return { summaryText: null };
+		const protectedSkillContent = collectProtectedSkillContent(chatMessages);
+		const messagesToSummarize = prefixMessages.filter(message => !messageHasProtectedSkillContent(message));
+		const historyText = this._buildHistoryTextForCompression(messagesToSummarize);
+		if (!historyText.trim() && !protectedSkillContent.length) return { summaryText: null };
+
+		if (!historyText.trim() && protectedSkillContent.length) {
+			const protectedText = [
+				'Protected active skill instructions:',
+				...protectedSkillContent.map(entry => entry.content.trim()),
+			].join('\n\n');
+			return {
+				summaryText: protectedText,
+				compressionInfo: {
+					hasCompressed: true,
+					summarizedMessageCount: prefixMessages.length,
+					approxTokensBefore,
+					approxTokensAfter: approxTailTokens + Math.ceil(protectedText.length / CHARS_PER_TOKEN_ESTIMATE),
+				},
+			};
+		}
 
 		const systemMessage = CHAT_HISTORY_COMPRESSION_SYSTEM_PROMPT;
 		const userMessageContent = buildChatHistoryCompressionUserMessage({
@@ -171,9 +190,19 @@ export class ChatHistoryCompressor {
 		});
 
 		const trimmedSummary = summaryText.trim();
-		if (!trimmedSummary) return { summaryText: null };
+		if (!trimmedSummary && !protectedSkillContent.length) return { summaryText: null };
 
-		const approxSummaryTokens = Math.ceil(trimmedSummary.length / CHARS_PER_TOKEN_ESTIMATE);
+		const protectedText = protectedSkillContent.length
+			? [
+				'Protected active skill instructions:',
+				...protectedSkillContent.map(entry => entry.content.trim()),
+			].join('\n\n')
+			: '';
+		const finalSummary = [protectedText, trimmedSummary ? `Conversation summary:\n${trimmedSummary}` : '']
+			.filter(Boolean)
+			.join('\n\n');
+
+		const approxSummaryTokens = Math.ceil(finalSummary.length / CHARS_PER_TOKEN_ESTIMATE);
 		const approxTokensAfter = approxTailTokens + approxSummaryTokens;
 
 		const compressionInfo: ThreadHistoryCompressionInfo = {
@@ -183,7 +212,7 @@ export class ChatHistoryCompressor {
 			approxTokensAfter,
 		};
 
-		return { summaryText: trimmedSummary, compressionInfo };
+		return { summaryText: finalSummary, compressionInfo };
 	}
 
 	private _buildHistoryTextForCompression(messages: ChatMessage[]): string {
@@ -199,6 +228,7 @@ export class ChatHistoryCompressor {
 				if (!content.trim()) continue;
 				lines.push(`Assistant: ${content}`);
 			} else if (m.role === 'tool') {
+				if (messageHasProtectedSkillContent(m)) continue;
 				const header = `Tool ${m.name} (${m.type})`;
 				const body = (m.content || '').trim();
 				if (!body) {
@@ -206,7 +236,7 @@ export class ChatHistoryCompressor {
 					continue;
 				}
 				let snippet = body;
-				
+
 				if (snippet.length > HISTORY_COMPRESSION_TOOL_SNIPPET_CHARS) {
 					snippet = `${snippet.slice(0, HISTORY_COMPRESSION_TOOL_SNIPPET_CHARS)}...`;
 				}

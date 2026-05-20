@@ -1803,6 +1803,11 @@ export const Settings = () => {
 		void voidSettingsService.setToolDisabled(toolName, disabled);
 	}, [voidSettingsService]);
 
+	const disabledAgentSkillNamesText = useMemo(
+		() => (settingsState.globalSettings.disabledAgentSkillNames ?? []).join(', '),
+		[settingsState.globalSettings.disabledAgentSkillNames]
+	);
+
 	const allTools = useMemo<AllToolEntry[]>(() => {
 		const byName = new Map<string, AllToolEntry>();
 
@@ -2135,6 +2140,43 @@ export const Settings = () => {
 														<span className='text-void-fg-3 text-xs pointer-events-none'>
 															{settingsState.globalSettings.includeToolLintErrors ? 'Fix lint errors' : `Fix lint errors`}
 														</span>
+													</div>
+												</ErrorBoundary>
+												<ErrorBoundary>
+													<div className='mt-4 p-2 rounded border border-void-border-1 bg-void-bg-1/50'>
+														<div className='flex items-center gap-x-2 my-2'>
+															<VoidSwitch
+																size='xs'
+																value={settingsState.globalSettings.enableAgentSkills ?? defaultGlobalSettings.enableAgentSkills}
+																onChange={(newVal) => voidSettingsService.setGlobalSetting('enableAgentSkills', newVal)}
+															/>
+															<span className='text-sm'>Agent Skills</span>
+														</div>
+														<div className='text-xs text-void-fg-3 mb-2'>
+															Load SKILL.md instructions from trusted project and user skill roots.
+														</div>
+														<div className='flex flex-col gap-1'>
+															<label className='text-xs text-void-fg-3'>Disabled skill names</label>
+															<VoidSimpleInputBox
+																compact
+																placeholder='code-review, pdf-processing'
+																value={disabledAgentSkillNamesText}
+																onChangeValue={(raw) => {
+																	const names = raw.split(',').map(v => v.trim()).filter(Boolean)
+																	voidSettingsService.setGlobalSetting('disabledAgentSkillNames', names)
+																}}
+															/>
+														</div>
+														<div className='flex items-center gap-x-2 mt-3'>
+															<VoidSwitch
+																size='xs'
+																value={settingsState.globalSettings.enableAcpExternalAgentSkillsFallback ?? defaultGlobalSettings.enableAcpExternalAgentSkillsFallback}
+																onChange={(newVal) => voidSettingsService.setGlobalSetting('enableAcpExternalAgentSkillsFallback', newVal)}
+															/>
+															<span className='text-void-fg-3 text-xs pointer-events-none'>
+																External ACP prompt fallback
+															</span>
+														</div>
 													</div>
 												</ErrorBoundary>
 												<ErrorBoundary>

@@ -48,6 +48,8 @@ import { IDynamicModelService } from '../../../../platform/void/common/dynamicMo
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { encodeBase64 } from '../../../../base/common/buffer.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
+import { IAgentSkillsService } from '../common/skills/agentSkillsService.js';
+import { formatAgentSkillsCatalogForToolActivation } from '../common/skills/agentSkillsPrompt.js';
 
 export const EMPTY_MESSAGE = ''
 
@@ -627,6 +629,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		@IDynamicModelService private readonly dynamicModelService: IDynamicModelService,
 		@IFileService private readonly fileService: IFileService,
 		@ILogService private readonly logService: ILogService,
+		@IAgentSkillsService private readonly agentSkillsService: IAgentSkillsService,
 	) {
 		super();
 		try {
@@ -731,14 +734,45 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		specialToolFormat: 'openai-style' | 'anthropic-style' | 'gemini-style' | 'disabled' | undefined,
 	) => {
 		const workspaceFolders = this.workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath);
+		const disabledStaticToolNames = this._disabledStaticToolNamesForRequest(chatMode);
+		const skillsSection = await this._skillsSectionForRequest(chatMode);
+		if (!skillsSection && chatMode !== 'normal' && !disabledStaticToolNames.includes('activate_skill')) {
+			disabledStaticToolNames.push('activate_skill');
+		}
 		const systemMessage = await chat_systemMessage({
 			workspaceFolders,
 			chatMode,
 			toolFormat: (specialToolFormat ?? 'openai-style') as specialToolFormat,
 			ptyHostService: this.ptyHostService,
+			disabledStaticToolNames,
+			skillsSection,
 		});
 		return systemMessage;
 	};
+
+	private _disabledStaticToolNamesForRequest(chatMode: ChatMode): string[] {
+		const disabled = new Set(
+			(Array.isArray(this.voidSettingsService.state.globalSettings.disabledToolNames)
+				? this.voidSettingsService.state.globalSettings.disabledToolNames
+				: []
+			).map(v => String(v ?? '').trim()).filter(Boolean)
+		);
+		if (chatMode === 'normal') disabled.add('activate_skill');
+		return Array.from(disabled);
+	}
+
+	private async _skillsSectionForRequest(chatMode: ChatMode): Promise<string | undefined> {
+		if (chatMode === 'normal') return undefined;
+		if (this.voidSettingsService.state.globalSettings.enableAgentSkills === false) return undefined;
+		try {
+			const catalog = await this.agentSkillsService.getCatalog();
+			const section = formatAgentSkillsCatalogForToolActivation(catalog);
+			return section || undefined;
+		} catch (error) {
+			this.logService.warn('[ConvertToLLMMessageService] Failed to build Agent Skills prompt section:', error);
+			return undefined;
+		}
+	}
 
 	// --- LLM Chat messages ---
 
@@ -950,4 +984,3 @@ ${messages.prefix}`
 }
 
 registerSingleton(IConvertToLLMMessageService, ConvertToLLMMessageService, InstantiationType.Eager);
-
