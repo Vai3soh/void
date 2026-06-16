@@ -285,10 +285,6 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		return finalTokens.join(' ');
 	}
 
-	private makeShortName(id: string): string {
-		return this.toShortName(id);
-	}
-
 	private splitProvider(idOrShort: string): { provider?: string; short: string } {
 		const i = idOrShort.indexOf('/');
 		if (i === -1) return { short: idOrShort };
@@ -424,6 +420,7 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 					reasoningCapabilities: match.caps.reasoningCapabilities,
 					fimTransport: match.caps.fimTransport,
 					inputModalities: match.caps.inputModalities,
+					supportsParallelToolCalls: match.caps.supportsParallelToolCalls,
 				};
 			}
 		}
@@ -542,6 +539,7 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 					reasoningCapabilities: info.reasoningCapabilities,
 					fimTransport: info.fimTransport,
 					inputModalities: info.inputModalities,
+					supportsParallelToolCalls: info.supportsParallelToolCalls,
 				};
 			}
 			const { models, caps } = this.sanitizeModelsAndCaps(fullIds, capsFull, { keepFullIds: true, dropFree: false });
@@ -583,6 +581,7 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 				reasoningCapabilities: info.reasoningCapabilities,
 				fimTransport: (info as any).fimTransport,
 				inputModalities: (info as any).inputModalities,
+				supportsParallelToolCalls: (info as any).supportsParallelToolCalls,
 			};
 		}
 		const norm = this.sanitizeModelsAndCaps(ids, caps, { keepFullIds: true, dropFree: false });
@@ -625,6 +624,7 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		const cp = this.settingsService.state.customProviders?.[slug];
 
 		const saved = cp?.modelsCapabilities?.[modelId] ?? cp?.modelsCapabilities?.[fullId];
+		const perModelCfg = cp?.perModel?.[modelId] ?? cp?.perModel?.[fullId];
 
 		const minimal: Partial<VoidStaticModelInfo> = base ?? saved ?? {
 			contextWindow: 4096,
@@ -637,7 +637,7 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		};
 
 		const ov = this.getModelCapabilityOverride(slug, modelId);
-		return { ...minimal, ...(ov || {}) };
+		return { ...minimal, ...(ov || {}), ...(perModelCfg || {}) };
 	}
 
 	async setProviderModels(
@@ -756,6 +756,8 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		const endpoint = (cp?.endpoint && cp.endpoint.trim()) || base.endpoint;
 		this.logService.debug(`[DEBUG getRequestConfigForModel] final endpoint: "${endpoint}"`);
 
+		const perModelCfg = cp?.perModel?.[modelId] ?? cp?.perModel?.[modelIdForTransportDefaults];
+
 		const headers: Record<string, string> = {
 			Accept: 'application/json'
 		};
@@ -776,13 +778,13 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		// semantic flags like supportsSystemMessage and specialToolFormat are
 		// taken from the same source as ConvertToLLMMessageService / ACP, and
 		// are NOT silently overwritten by WELL_KNOWN_PROVIDER_DEFAULTS.
-		let effSupportsSystemMessage = base.supportsSystemMessage;
-		let effSpecialToolFormat: specialToolFormat = base.specialToolFormat;
+		let effSupportsSystemMessage = cp?.supportsSystemMessage ?? base.supportsSystemMessage;
+		let effSpecialToolFormat: specialToolFormat = cp?.specialToolFormat ?? base.specialToolFormat;
 		try {
 			if (cp) {
 				const caps = cp.modelsCapabilities;
 				// modelsCapabilities are stored under the exact id used in chat
-				const savedCaps: Partial<VoidStaticModelInfo> | undefined = caps?.[modelId];
+				const savedCaps: Partial<VoidStaticModelInfo> | undefined = caps?.[modelId] ?? caps?.[modelIdForTransportDefaults];
 				const ov = usedSlug ? this.getModelCapabilityOverride(usedSlug, modelId) as (ModelCapabilityOverride | undefined) : undefined;
 				const merged: Partial<VoidStaticModelInfo> = { ...(savedCaps ?? {}), ...(ov ?? {}) };
 				if (merged.supportsSystemMessage !== undefined) {
@@ -790,6 +792,12 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 				}
 				if (merged.specialToolFormat !== undefined) {
 					effSpecialToolFormat = merged.specialToolFormat as specialToolFormat;
+				}
+				if (perModelCfg?.supportsSystemMessage !== undefined) {
+					effSupportsSystemMessage = perModelCfg.supportsSystemMessage as supportsSystemMessage;
+				}
+				if (perModelCfg?.specialToolFormat !== undefined) {
+					effSpecialToolFormat = perModelCfg.specialToolFormat as specialToolFormat;
 				}
 			}
 		} catch (e) {

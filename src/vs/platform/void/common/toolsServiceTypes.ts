@@ -4,8 +4,9 @@
  *--------------------------------------------------------------------------------------*/
 
 import { URI } from '../../../base/common/uri.js'
+import type { TerminalExitStatus } from './terminalToolOutput.js'
 
-export type TerminalResolveReason = { type: 'timeout' } | { type: 'done', exitCode: number }
+export type TerminalResolveReason = { type: 'timeout' } | { type: 'interrupted' } | { type: 'done', exitCode: number }
 
 export type LintErrorItem = { code: string, message: string, startLineNumber: number, endLineNumber: number }
 
@@ -34,9 +35,6 @@ export type ToolCallParams = {
 	'delete_file_or_folder': { uri: URI, isRecursive: boolean, isFolder: boolean },
 	// ---
 	'run_command': { command: string; cwd: string | null, terminalId: string },
-	'open_persistent_terminal': { cwd: string | null },
-	'run_persistent_command': { command: string; persistentTerminalId: string },
-	'kill_persistent_terminal': { persistentTerminalId: string },
 }
 
 // RESULT OF TOOL CALL
@@ -71,10 +69,16 @@ export type ToolResultType = {
 	'create_file_or_folder': {},
 	'delete_file_or_folder': {},
 	// ---
-	'run_command': { result: string; resolveReason: TerminalResolveReason; },
-	'run_persistent_command': { result: string; resolveReason: TerminalResolveReason; },
-	'open_persistent_terminal': { persistentTerminalId: string },
-	'kill_persistent_terminal': {},
+	'run_command': {
+		result: string;
+		resolveReason: TerminalResolveReason;
+		output?: string;
+		stdoutStderr?: string;
+		commandHeader?: string;
+		cwd?: string;
+		cwdLabel?: string;
+		exitStatus?: TerminalExitStatus;
+	},
 }
 
 export type ToolName = keyof ToolResultType
@@ -85,9 +89,6 @@ export const approvalTypeOfToolName: Partial<{ [T in ToolName]?: 'edits' | 'term
 	'rewrite_file': 'edits',
 	'edit_file': 'edits',
 	'run_command': 'terminal',
-	'run_persistent_command': 'terminal',
-	'open_persistent_terminal': 'terminal',
-	'kill_persistent_terminal': 'terminal',
 }
 
 // {{add: define new type for approval types}}

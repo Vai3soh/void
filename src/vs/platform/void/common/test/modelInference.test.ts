@@ -93,7 +93,7 @@ suite('ModelInference', () => {
 					max_completion_tokens: 4096,
 					is_moderated: true
 				},
-				supported_parameters: ['tools', 'tool_choice', 'temperature'],
+				supported_parameters: ['tools', 'tool_choice', 'parallel_tool_calls', 'temperature'],
 				architecture: {
 					modality: 'text->text',
 					input_modalities: ['text'],
@@ -112,7 +112,30 @@ suite('ModelInference', () => {
 			assert.strictEqual(cost.output, 0.06);
 			assert.strictEqual(capabilities.specialToolFormat, 'openai-style');
 			assert.strictEqual(capabilities.supportsSystemMessage, 'developer-role');
+			assert.strictEqual(capabilities.supportsParallelToolCalls, true);
 			assert.strictEqual(capabilities.supportsFIM ?? false, false);
+		});
+
+		test('should infer parallel tool call support from OpenRouter supported_parameters', () => {
+			const mockModel = {
+				id: 'openai/gpt-4.1',
+				canonical_slug: 'openai/gpt-4.1',
+				name: 'OpenAI: GPT-4.1',
+				created: Date.now(),
+				context_length: 8192,
+				pricing: { prompt: '0', completion: '0' },
+				top_provider: { max_completion_tokens: 4096, is_moderated: false },
+				supported_parameters: ['tools', 'tool_choice', 'parallel_tool_calls'],
+				architecture: {
+					modality: 'text->text',
+					input_modalities: ['text'],
+					output_modalities: ['text'],
+					tokenizer: 'GPT'
+				}
+			};
+
+			const capabilities = inferCapabilitiesFromOpenRouterModel(mockModel as any);
+			assert.strictEqual(capabilities.supportsParallelToolCalls, true);
 		});
 
 		test('should infer FIM support from description', () => {

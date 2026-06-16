@@ -199,6 +199,7 @@ export type GlobalSettings = {
 	retryDelay: number;
 	maxToolOutputLength: number;
 	readFileChunkLines: number;
+	terminalCommandTimeoutMinutes: number;
 	notifyOnTruncation: boolean;
 	/** Tool names (static and dynamic) disabled by user in settings UI. */
 	disabledToolNames: string[];
@@ -239,6 +240,7 @@ export const defaultGlobalSettings: GlobalSettings = {
 	retryDelay: 2500,
 	maxToolOutputLength: 40000,
 	readFileChunkLines: 200,
+	terminalCommandTimeoutMinutes: 40,
 	notifyOnTruncation: true,
 	disabledToolNames: [],
 	enableAgentSkills: true,

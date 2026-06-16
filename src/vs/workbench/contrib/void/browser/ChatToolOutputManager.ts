@@ -1,3 +1,8 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
 import { URI } from '../../../../base/common/uri.js';
 import { VSBuffer } from '../../../../base/common/buffer.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
@@ -223,25 +228,31 @@ export class ChatToolOutputManager {
 		const isStringInput = typeof result === 'string';
 		const resObj: JsonObject | null = (!isStringInput && isJsonObject(result)) ? result : null;
 
-		const TRUNC_META_RE = /TRUNCATION_META:\s*(\{[\s\S]*\})\s*$/;
+		const TRUNC_META_RE = /TRUNCATION_META:\s*(\{[^\r\n]*\})/;
 
-		const extractTruncationMeta = (text: string): JsonObject | null => {
+		const extractTruncationMetaMatch = (text: string): { meta: JsonObject; endIndex: number } | null => {
 			if (!text) return null;
-			const tail = text.slice(-4000);
-			const m = tail.match(TRUNC_META_RE);
-			if (!m) return null;
+			const tailStart = Math.max(0, text.length - 4000);
+			const tail = text.slice(tailStart);
+			const matches = [...tail.matchAll(new RegExp(TRUNC_META_RE.source, 'g'))];
+			const m = matches[matches.length - 1];
+			if (!m || m.index === undefined) return null;
 			try {
 				const parsed = JSON.parse(m[1]) as JsonValue;
-				return isJsonObject(parsed) ? parsed : null;
+				if (!isJsonObject(parsed)) return null;
+				return { meta: parsed, endIndex: tailStart + m.index + m[0].length };
 			} catch {
 				return null;
 			}
 		};
 
+		const extractTruncationMeta = (text: string): JsonObject | null => {
+			return extractTruncationMetaMatch(text)?.meta ?? null;
+		};
+
 		const hasTruncationFooter = (text: string): boolean => {
 			if (!text) return false;
-			const tail = text.slice(-4000);
-			return tail.includes('[VOID] TOOL OUTPUT TRUNCATED') && !!extractTruncationMeta(text);
+			return text.includes('[VOID] TOOL OUTPUT TRUNCATED') && !!extractTruncationMeta(text);
 		};
 
 		let uiText: string;
@@ -253,9 +264,17 @@ export class ChatToolOutputManager {
 					(resObj && typeof getStringField(resObj, 'output') === 'string' && hasTruncationFooter(getStringField(resObj, 'output')!)) ? getStringField(resObj, 'output')! :
 						undefined;
 
+		const runCommandText = resObj && isRunCommand && typeof getStringField(resObj, 'text') === 'string' && typeof getStringField(resObj, 'output') === 'string'
+			&& getStringField(resObj, 'text')!.startsWith(getStringField(resObj, 'output')!)
+			? getStringField(resObj, 'text')!
+			: undefined;
+
 		if (typeof footerText === 'string') {
 			uiText = footerText;
 			uiTextSource = 'footer_any';
+		} else if (typeof runCommandText === 'string') {
+			uiText = runCommandText;
+			uiTextSource = 'result.text';
 		} else if (resObj && typeof getStringField(resObj, 'output') === 'string') {
 			uiText = getStringField(resObj, 'output')!;
 			uiTextSource = 'result.output';
@@ -290,6 +309,9 @@ export class ChatToolOutputManager {
 				keyText;
 
 		const hasValidTruncationFooter = hasTruncationFooter(uiText);
+		const terminalTimeoutMessageMatch = isRunCommand ? fullText.match(/\n(Terminal command run, but was stopped by Void because it exceeded the configured terminal command timeout \([^\n]+\)\.)\s*$/) : null;
+		const terminalTimeoutMessage = terminalTimeoutMessageMatch?.[1];
+		const fullTextWithoutTerminalTimeoutMessage = terminalTimeoutMessage ? fullText.slice(0, terminalTimeoutMessageMatch.index).trimEnd() : fullText;
 
 		const makeLeanResult = (stripFileContents: boolean): ToolOutputInput => {
 			if (!resObj) return result;
@@ -315,7 +337,7 @@ export class ChatToolOutputManager {
 		// A: footer already present
 		// =========================
 		if (hasValidTruncationFooter) {
-			
+
 			if (isReadFile) {
 				const uiContent = uiText;
 				const displayContent = isRunCommand ? uiContent : this._cleanContentForDisplay(uiContent);
@@ -327,50 +349,46 @@ export class ChatToolOutputManager {
 			}
 
 
-			const metaMatch = uiText.match(TRUNC_META_RE);
+			const meta = extractTruncationMeta(uiText);
 
-			if (metaMatch) {
+			if (meta) {
 				try {
-					const parsed = JSON.parse(metaMatch[1]) as JsonValue;
-					if (isJsonObject(parsed)) {
-						const meta = parsed;
+					const metaLogFilePath = typeof meta.logFilePath === 'string' ? meta.logFilePath : undefined;
 
-						const metaLogFilePath = typeof meta.logFilePath === 'string' ? meta.logFilePath : undefined;
+					const footerNorm = metaLogFilePath ? normalizeMetaLogFilePath(metaLogFilePath) : undefined;
+					const footerLooksStable = looksLikeStableToolOutputsRelPath(footerNorm);
 
-						const footerNorm = metaLogFilePath ? normalizeMetaLogFilePath(metaLogFilePath) : undefined;
-						const footerLooksStable = looksLikeStableToolOutputsRelPath(footerNorm);
+					const desired = footerLooksStable ? (footerNorm as string | undefined) : stablePath;
 
-						const desired = footerLooksStable ? (footerNorm as string | undefined) : stablePath;
+					let canRewrite = false;
 
-						let canRewrite = false;
+					if (desired && await this._existsToolOutputsFile(desired)) {
+						canRewrite = true;
+					} else {
+						const fileContents = resObj ? getStringField(resObj, 'fileContents') : undefined;
+						const hasFullForSave = typeof fileContents === 'string' && fileContents.length > maxToolOutputLength;
 
-						if (desired && await this._existsToolOutputsFile(desired)) {
-							canRewrite = true;
-						} else {
-							const fileContents = resObj ? getStringField(resObj, 'fileContents') : undefined;
-							const hasFullForSave = typeof fileContents === 'string' && fileContents.length > maxToolOutputLength;
-
-							if (hasFullForSave && desired) {
-								canRewrite = await this._writeToolOutputsFileOverwrite(desired, fileContents);
-							} else if (footerNorm && desired && footerNorm !== desired) {
-								canRewrite = await this._copyToolOutputsFileBestEffort(footerNorm, desired);
-							}
+						if (hasFullForSave && desired) {
+							canRewrite = await this._writeToolOutputsFileOverwrite(desired, fileContents);
+						} else if (footerNorm && desired && footerNorm !== desired) {
+							canRewrite = await this._copyToolOutputsFileBestEffort(footerNorm, desired);
 						}
+					}
 
-						if (canRewrite && desired && meta.logFilePath !== desired) {
-							meta.logFilePath = desired;
-							uiText = uiText.replace(
-								/TRUNCATION_META:\s*\{[\s\S]*\}\s*$/m,
-								`TRUNCATION_META: ${JSON.stringify(meta)}`
-							);
-						}
+					if (canRewrite && desired && meta.logFilePath !== desired) {
+						meta.logFilePath = desired;
+						uiText = uiText.replace(
+							/TRUNCATION_META:\s*\{[^\r\n]*\}/,
+							`TRUNCATION_META: ${JSON.stringify(meta)}`
+						);
 					}
 				} catch (e) {
 					console.error('failed to parse meta', e);
 				}
 			}
 
-			let uiContent = uiText;
+			const metaMatch = extractTruncationMetaMatch(uiText);
+			let uiContent = metaMatch ? uiText.slice(0, metaMatch.endIndex) : uiText;
 
 			if (uiTextSource === 'result.text' && resObj && typeof getStringField(resObj, 'fileContents') === 'string' && getStringField(resObj, 'fileContents')!.length) {
 				const lines = uiText.split('\n');
@@ -392,7 +410,7 @@ export class ChatToolOutputManager {
 		}
 
 		// =========================
-		// B: no footer — truncate ourselves
+		// B: no footer - truncate ourselves
 		// =========================
 		if (!fullText || fullText.length <= maxToolOutputLength) {
 			const displayContent = isRunCommand ? uiText : this._cleanContentForDisplay(uiText);
@@ -400,7 +418,7 @@ export class ChatToolOutputManager {
 		}
 
 		const { truncatedBody, originalLength, needsTruncation, lineAfterTruncation } =
-			computeTruncatedToolOutput(fullText, maxToolOutputLength);
+			computeTruncatedToolOutput(fullTextWithoutTerminalTimeoutMessage, maxToolOutputLength);
 
 		if (!needsTruncation) {
 			const displayContent = isRunCommand ? uiText : this._cleanContentForDisplay(uiText);
@@ -509,6 +527,7 @@ export class ChatToolOutputManager {
 			`${truncatedBody}...\n\n` +
 			`${headerLines.join('\n')}\n` +
 			`${instructionsLines.join('\n')}\n` +
+			`${terminalTimeoutMessage ? `${terminalTimeoutMessage}\n` : ''}` +
 			`${metaLine}`;
 
 		const displayContent = isRunCommand ? finalText : this._cleanContentForDisplay(finalText);

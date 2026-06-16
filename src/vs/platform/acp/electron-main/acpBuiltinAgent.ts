@@ -26,10 +26,12 @@ import { IVoidSettingsService } from '../../void/common/voidSettingsService.js';
 import { sendChatRouter as sendChatRouterOriginal } from '../../void/electron-main/llmMessage/sendLLMMessage.impl.js';
 import { ProviderName, SettingsOfProvider, ModelSelectionOptions, OverridesOfModel, ChatMode, defaultGlobalSettings } from '../../void/common/voidSettingsTypes.js';
 import { LLMChatMessage, type DynamicRequestConfig, type RequestParamsConfig, type ProviderRouting, type AdditionalToolInfo, LLMPlan, LLMTokenUsage } from '../../void/common/sendLLMMessageTypes.js';
-import { getModelApiConfiguration } from '../../void/common/modelInference.js';
+import { getModelApiConfiguration, getModelCapabilities } from '../../void/common/modelInference.js';
+import { createParallelToolCallsConfig } from '../../void/common/parallelToolCalls.js';
 import { LLMLoopDetector, LOOP_DETECTED_MESSAGE } from '../../void/common/loopGuard.js';
 import { computeTruncatedToolOutput } from '../../void/common/toolOutputTruncation.js';
 import { stableToolOutputsRelPath } from '../../void/common/toolOutputFileNames.js';
+import { normalizeTerminalCommandOutput, normalizeTerminalCwdLabel } from '../../void/common/terminalToolOutput.js';
 import { resolveAcpAgentAddress, type AcpAgentAddress } from '../common/acpAgentAddress.js';
 
 type Stream = ConstructorParameters<typeof AgentSideConnection>[1];
@@ -124,7 +126,7 @@ export function startBuiltinAcpAgent(log?: ILogService, notificationService?: IN
 	});
 	wss.on('error', (e) => {
 		log?.warn?.(`[ACP Agent] error on ${address.wsUrl}`, e);
-		const code = typeof (e as { code?: unknown })?.code === 'string' ? (e as { code: string }).code : undefined;
+		const code = typeof (e as { code?: unknown })?.code === 'string' ? (e as unknown as { code: string }).code : undefined;
 		if (!hasListened || code === 'EADDRINUSE') {
 			if (activeServer === wss) {
 				activeServer = null;
@@ -151,6 +153,7 @@ type ToolCallUpdate = {
 	title: string;
 	kind?: string;
 	content?: string | Record<string, unknown>;
+	truncated?: boolean;
 };
 
 type ProviderNameStr = string;
@@ -219,6 +222,7 @@ interface ToolCallLike {
 interface OnTextChunk {
 	fullText?: string;
 	fullReasoning?: string;
+	toolCalls?: ToolCallLike[];
 	toolCall?: ToolCallLike;
 	plan?: LLMPlan;
 }
@@ -226,6 +230,7 @@ interface OnTextChunk {
 interface OnFinalMessagePayload {
 	fullText?: string;
 	fullReasoning?: string;
+	toolCalls?: ToolCallLike[];
 	toolCall?: ToolCallLike;
 	plan?: LLMPlan;
 	tokenUsage?: LLMTokenUsage;
@@ -255,6 +260,7 @@ type SessionState = {
 	// This lets us handle UI "skip" that arrives as a separate user message
 	// without scanning message history.
 	pendingToolCall?: { id: string; name: string } | null;
+	pendingToolCallsById?: Record<string, { id: string; name: string }>;
 	messages: LLMMessage[];
 	// Last LLM token usage snapshot for the most recent sendChatRouter turn in this session.
 	// Used to aggregate per-prompt usage and send it back to the host via PromptResponse._meta.
@@ -416,6 +422,7 @@ class VoidPipelineAcpAgent implements Agent {
 		this.sessions.set(sessionId, {
 			cancelled: false,
 			pendingToolCall: null,
+			pendingToolCallsById: {},
 			messages,
 			threadId: threadIdFromMeta,
 			llmCfg: {
@@ -629,9 +636,10 @@ class VoidPipelineAcpAgent implements Agent {
 		let consumedAsSkip = false;
 		const normalizedUserText = (userText ?? '').trim().toLowerCase();
 
-		if (normalizedUserText === 'skip' && state.pendingToolCall?.id) {
+		const firstPendingToolCall = state.pendingToolCall ?? Object.values(state.pendingToolCallsById ?? {})[0] ?? null;
+		if (normalizedUserText === 'skip' && firstPendingToolCall?.id) {
 			consumedAsSkip = true;
-			const { id: pendingId, name: pendingName } = state.pendingToolCall;
+			const { id: pendingId, name: pendingName } = firstPendingToolCall;
 
 			// Mark tool call as finished in ACP UI (best effort)
 			try {
@@ -657,6 +665,7 @@ class VoidPipelineAcpAgent implements Agent {
 				content: skipModelText(pendingName || 'tool')
 			});
 			state.pendingToolCall = null;
+			if (state.pendingToolCallsById) delete state.pendingToolCallsById[pendingId];
 		}
 
 		// Normal path: push user message into model history
@@ -691,6 +700,7 @@ class VoidPipelineAcpAgent implements Agent {
 				return { stopReason: 'cancelled' };
 			}
 
+			let toolCalls: OAIFunctionCall[] = [];
 			let toolCall: OAIFunctionCall | null = null;
 			let assistantText = '';
 
@@ -702,7 +712,8 @@ class VoidPipelineAcpAgent implements Agent {
 				});
 
 				const turn = await this.runOneTurnWithSendLLM(state, sid);
-				toolCall = turn.toolCall;
+				toolCalls = turn.toolCalls?.length ? turn.toolCalls : (turn.toolCall ? [turn.toolCall] : []);
+				toolCall = toolCalls[0] ?? null;
 				assistantText = turn.assistantText;
 
 				this.log?.debug?.('[ACP Agent][prompt] runOneTurnWithSendLLM completed', {
@@ -745,7 +756,7 @@ class VoidPipelineAcpAgent implements Agent {
 				throw new Error(msg);
 			}
 
-			if (!toolCall) {
+			if (!toolCalls.length) {
 				this.log?.debug?.('[ACP Agent][prompt] NO TOOL CALL - ending turn', {
 					sessionId: sid,
 					turn: turnCount,
@@ -756,371 +767,411 @@ class VoidPipelineAcpAgent implements Agent {
 				return resp as PromptResponse;
 			}
 
-			if (toolCall.name === 'acp_plan') {
-				const rawEntries = (toolCall.args as any)?.entries;
-				const entries =
-					Array.isArray(rawEntries)
-						? rawEntries.map((e: any) => {
-							const content = String(e?.content ?? '').trim();
-							const priority =
-								(e?.priority === 'high' || e?.priority === 'low' || e?.priority === 'medium')
-									? e.priority
-									: 'medium';
-							const status =
-								(e?.status === 'pending' || e?.status === 'in_progress' || e?.status === 'completed' || e?.status === 'failed')
-									? e.status
-									: 'pending';
-							return { content, priority, status };
-						}).filter((e: any) => e.content.length > 0)
-						: [];
+			const pendingReadOnlyToolExecutions: Promise<void>[] = [];
+			const isAcpReadOnlyToolCall = (toolCall: OAIFunctionCall): boolean => {
+				return toolCall.name === 'read_file'
+					|| toolCall.name === 'ls_dir'
+					|| toolCall.name === 'get_dir_tree'
+					|| toolCall.name === 'search_pathnames_only'
+					|| toolCall.name === 'search_for_files'
+					|| toolCall.name === 'search_in_file';
+			};
+			const drainPendingReadOnlyToolExecutions = async (): Promise<void> => {
+				if (!pendingReadOnlyToolExecutions.length) return;
+				const batch = pendingReadOnlyToolExecutions.splice(0, pendingReadOnlyToolExecutions.length);
+				await Promise.all(batch);
+			};
 
-				if (entries.length) {
-					await this.conn.sessionUpdate({
-						sessionId: sid,
-						update: { sessionUpdate: 'plan', entries } as any
-					} as any);
+			const processToolCall = async (toolCall: OAIFunctionCall): Promise<void> => {
+				if (toolCall.name === 'acp_plan') {
+					const rawEntries = (toolCall.args as any)?.entries;
+					const entries =
+						Array.isArray(rawEntries)
+							? rawEntries.map((e: any) => {
+								const content = String(e?.content ?? '').trim();
+								const priority =
+									(e?.priority === 'high' || e?.priority === 'low' || e?.priority === 'medium')
+										? e.priority
+										: 'medium';
+								const status =
+									(e?.status === 'pending' || e?.status === 'in_progress' || e?.status === 'completed' || e?.status === 'failed')
+										? e.status
+										: 'pending';
+								return { content, priority, status };
+							}).filter((e: any) => e.content.length > 0)
+							: [];
+
+					if (entries.length) {
+						await this.conn.sessionUpdate({
+							sessionId: sid,
+							update: { sessionUpdate: 'plan', entries } as any
+						} as any);
+					}
+
+					state.messages.push({
+						role: 'tool',
+						tool_call_id: String(toolCall.id || 'acp_plan'),
+						content: 'ok'
+					});
+					return;
 				}
 
-				state.messages.push({
-					role: 'tool',
-					tool_call_id: String(toolCall.id || 'acp_plan'),
-					content: 'ok'
-				});
-				continue;
-			}
+				const loopAfterTool = loopDetector.registerToolCall(toolCall.name, toolCall.args);
+				if (loopAfterTool.isLoop) {
+					if (toolCall?.id) {
+						rollbackDanglingToolCall(String(toolCall.id), assistantText);
+					}
 
-			const loopAfterTool = loopDetector.registerToolCall(toolCall.name, toolCall.args);
-			if (loopAfterTool.isLoop) {
-				if (toolCall?.id) {
-					rollbackDanglingToolCall(String(toolCall.id), assistantText);
+					this.emitError(LOOP_DETECTED_MESSAGE);
 				}
 
-				this.emitError(LOOP_DETECTED_MESSAGE);
-			}
-
-			this.log?.debug?.('[ACP Agent][prompt] tool_call detected', {
-				sessionId: sid,
-				turn: turnCount,
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
-				args: toolCall.args,
-			});
-
-			// Track pending tool call BEFORE awaiting any UI action
-			state.pendingToolCall = { id: String(toolCall.id), name: String(toolCall.name) };
-
-			// ACP tool_call
-			await this.conn.sessionUpdate({
-				sessionId: sid,
-				update: {
-					sessionUpdate: 'tool_call',
-					toolCallId: toolCall.id,
-					title: toolCall.name,
-					kind: 'other',
-					status: 'pending',
-					rawInput: { name: toolCall.name, args: toolCall.args }
-				}
-			} as any);
-
-			// Request permission
-			this.log?.debug?.('[ACP Agent][prompt] requesting permission', {
-				sessionId: sid,
-				turn: turnCount,
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
-			});
-
-			const perm = await this.conn.requestPermission({
-				sessionId: sid,
-				toolCall: {
-					toolCallId: toolCall.id,
-					rawInput: { name: toolCall.name, args: toolCall.args ?? {} },
-					title: toolCall.name
-				},
-				options: [
-					{ optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
-					{ optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }
-				]
-			} as any);
-
-			if (state.cancelled) {
-				this.log?.debug?.('[ACP Agent][prompt] CANCELLED after permission request', {
+				this.log?.debug?.('[ACP Agent][prompt] tool_call detected', {
 					sessionId: sid,
 					turn: turnCount,
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					args: toolCall.args,
 				});
-				return { stopReason: 'cancelled' };
-			}
 
-			const outcome = (perm as any)?.outcome;
-			const selected = outcome?.outcome === 'selected';
-			const optionId = selected ? String(outcome?.optionId ?? '') : '';
-			const isAllow = optionId === 'allow_once' || optionId === 'allow_always';
+				// Track pending tool call BEFORE awaiting any UI action
+				state.pendingToolCall = { id: String(toolCall.id), name: String(toolCall.name) };
+				state.pendingToolCallsById ??= {};
+				state.pendingToolCallsById[String(toolCall.id)] = { id: String(toolCall.id), name: String(toolCall.name) };
 
-			this.log?.debug?.('[ACP Agent][prompt] permission result', {
-				sessionId: sid,
-				turn: turnCount,
-				optionId,
-				isAllow,
-				outcome: outcome,
-			});
+				// ACP tool_call
+				await this.conn.sessionUpdate({
+					sessionId: sid,
+					update: {
+						sessionUpdate: 'tool_call',
+						toolCallId: toolCall.id,
+						title: toolCall.name,
+						kind: 'other',
+						status: 'pending',
+						rawInput: { name: toolCall.name, args: toolCall.args }
+					}
+				} as any);
 
-			if (!isAllow) {
-				// Treat non-allow as "skipped" (this is how ACP Skip is implemented via rejectLatestToolRequest)
-				const toolName = String(toolCall.name || 'tool');
+				// Request permission
+				this.log?.debug?.('[ACP Agent][prompt] requesting permission', {
+					sessionId: sid,
+					turn: turnCount,
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+				});
+
+				const perm = await this.conn.requestPermission({
+					sessionId: sid,
+					toolCall: {
+						toolCallId: toolCall.id,
+						rawInput: { name: toolCall.name, args: toolCall.args ?? {} },
+						title: toolCall.name
+					},
+					options: [
+						{ optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+						{ optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }
+					]
+				} as any);
+
+				if (state.cancelled) {
+					this.log?.debug?.('[ACP Agent][prompt] CANCELLED after permission request', {
+						sessionId: sid,
+						turn: turnCount,
+					});
+					return;
+				}
+
+				const outcome = (perm as any)?.outcome;
+				const selected = outcome?.outcome === 'selected';
+				const optionId = selected ? String(outcome?.optionId ?? '') : '';
+				const isAllow = optionId === 'allow_once' || optionId === 'allow_always';
+
+				this.log?.debug?.('[ACP Agent][prompt] permission result', {
+					sessionId: sid,
+					turn: turnCount,
+					optionId,
+					isAllow,
+					outcome: outcome,
+				});
+
+				if (!isAllow) {
+					// Treat non-allow as "skipped" (this is how ACP Skip is implemented via rejectLatestToolRequest)
+					const toolName = String(toolCall.name || 'tool');
+					await this.conn.sessionUpdate({
+						sessionId: sid,
+						update: {
+							sessionUpdate: 'tool_call_update',
+							toolCallId: toolCall.id,
+							status: 'completed',
+							title: toolName,
+							content: [{ type: 'content', content: { type: 'text', text: '' } }],
+							rawOutput: { _skipped: true }
+						}
+					} as any);
+
+					state.messages.push({
+						role: 'tool',
+						tool_call_id: String(toolCall.id),
+						content: skipModelText(toolName)
+					});
+					state.pendingToolCall = null;
+					if (state.pendingToolCallsById) delete state.pendingToolCallsById[String(toolCall.id)];
+					return;
+				}
+
+				// in_progress
 				await this.conn.sessionUpdate({
 					sessionId: sid,
 					update: {
 						sessionUpdate: 'tool_call_update',
 						toolCallId: toolCall.id,
-						status: 'completed',
-						title: toolName,
-						content: [{ type: 'content', content: { type: 'text', text: '' } }],
-						rawOutput: { _skipped: true }
+						status: 'in_progress',
+						title: toolCall.name,
+						content: [{ type: 'content', content: { type: 'text', text: 'Running...' } }]
 					}
 				} as any);
 
-				state.messages.push({
-					role: 'tool',
-					tool_call_id: String(toolCall.id),
-					content: skipModelText(toolName)
-				});
-				state.pendingToolCall = null;
-				continue;
-			}
-
-			// in_progress
-			await this.conn.sessionUpdate({
-				sessionId: sid,
-				update: {
-					sessionUpdate: 'tool_call_update',
-					toolCallId: toolCall.id,
-					status: 'in_progress',
-					title: toolCall.name,
-					content: [{ type: 'content', content: { type: 'text', text: 'Running...' } }]
-				}
-			} as any);
-
-			this.log?.debug?.('[ACP Agent][prompt] executing tool', {
-				sessionId: sid,
-				turn: turnCount,
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
-			});
-
-			// Execute tool on host
-			let textOut = '';
-			let rawOut: any = undefined;
-			let status: 'completed' | 'failed' | 'pending' | 'in_progress' = 'completed';
-
-			try {
-				// Special handling for terminal commands with streaming
-				if (toolCall.name === 'run_command') {
-					this.log?.debug?.('[ACP Agent][prompt] executing terminal command', {
-						sessionId: sid,
-						turn: turnCount,
-						toolCallId: toolCall.id,
-					});
-					const terminalResult = await this.executeTerminalCommandWithStreaming(toolCall);
-
-					textOut = typeof terminalResult.content === 'string'
-						? terminalResult.content
-						: JSON.stringify(terminalResult.content || '');
-
-					status = terminalResult.status || 'completed';
-
-					const terminalId =
-						typeof (terminalResult as any)?.terminalId === 'string'
-							? (terminalResult as any).terminalId
-							: undefined;
-
-					// IMPORTANT:
-					// Put final text into rawOut.output (not _output), so your truncation code
-					// can overwrite rawOut.output with the *truncated-from-start* textOut.
-					rawOut = {
-						_type: 'terminal',
-						_status: status,
-						...(terminalId ? { terminalId } : {}),
-						output: textOut,
-					};
-				} else {
-					const rawExec = await this.conn.extMethod('void/tools/execute_with_text', {
-						name: toolCall.name,
-						params: toolCall.args ?? {},
-						// IMPORTANT: routing hints so extMethod is handled by the correct window (workspace)
-						sessionId: sid,
-						...(state.threadId ? { threadId: state.threadId } : {})
-					}) as unknown;
-
-					const out = rawExec as ExecuteWithTextResponse;
-					const originalResult = (out as any)?.result;
-
-					// normalize
-					rawOut = (() => {
-						if (originalResult === undefined || originalResult === null) return {};
-						if (typeof originalResult === 'object') return originalResult;
-						if (typeof originalResult === 'string') {
-							try { return JSON.parse(originalResult); } catch {
-								return { _type: 'text', content: originalResult, _originalLength: originalResult.length };
-							}
-						}
-						return { _type: typeof originalResult, value: originalResult };
-					})();
-
-					textOut = typeof out?.text === 'string'
-						? out.text
-						: (typeof originalResult === 'string' ? originalResult : JSON.stringify(rawOut));
-				}
-			} catch (e: any) {
-				textOut = `Tool error: ${String(e?.message ?? e)}`;
-				status = 'failed';
-				rawOut = { _error: true, _message: e?.message ?? String(e), _stack: e?.stack ? e.stack.substring(0, 500) : undefined };
-				this.log?.debug?.('[ACP Agent][prompt] tool execution error', {
+				this.log?.debug?.('[ACP Agent][prompt] executing tool', {
 					sessionId: sid,
 					turn: turnCount,
 					toolCallId: toolCall.id,
 					toolName: toolCall.name,
-					error: e?.message ?? String(e),
 				});
-			}
 
-			// Truncate tool output
-			const originalTextOut = textOut;
-			if (typeof textOut === 'string' && textOut.length > maxToolOutputLength) {
-				const originalLength = textOut.length;
-				const { truncatedBody, lineAfterTruncation } = computeTruncatedToolOutput(textOut, maxToolOutputLength);
-				const startLineExclusive = lineAfterTruncation > 0 ? lineAfterTruncation : 0;
+				// Execute tool on host
+				let textOut = '';
+				let rawOut: any = undefined;
+				let status: 'completed' | 'failed' | 'pending' | 'in_progress' = 'completed';
+				let textOutAlreadyTruncated = false;
 
-				const headerLines = [
-					`[VOID] TOOL OUTPUT TRUNCATED, SEE TRUNCATION_META BELOW.`,
-					`Only the first ${maxToolOutputLength} characters are included in this message.`,
-					`Display limit: maxToolOutputLength = ${maxToolOutputLength} characters.`,
-				];
+				try {
+					// Special handling for terminal commands with streaming
+					if (toolCall.name === 'run_command') {
+						this.log?.debug?.('[ACP Agent][prompt] executing terminal command', {
+							sessionId: sid,
+							turn: turnCount,
+							toolCallId: toolCall.id,
+						});
+						const terminalResult = await this.executeTerminalCommandWithStreaming(toolCall);
 
-				const args = toolCall.args ?? {};
-				const isReadFileTool = String(toolCall.name) === 'read_file';
+						textOut = typeof terminalResult.content === 'string'
+							? terminalResult.content
+							: JSON.stringify(terminalResult.content || '');
+						textOutAlreadyTruncated = (terminalResult as any)?.truncated === true;
 
+						status = terminalResult.status || 'completed';
 
-				const uriArg = (args as any).uri;
-				const filePathFromArgs =
-					typeof uriArg === 'string' ? uriArg.trim() :
-						(uriArg && typeof uriArg === 'object' && !Array.isArray(uriArg) && typeof (uriArg as any).fsPath === 'string')
-							? String((uriArg as any).fsPath).trim()
-							: '';
+						const terminalId =
+							typeof (terminalResult as any)?.terminalId === 'string'
+								? (terminalResult as any).terminalId
+								: undefined;
 
-				const requestedStartLine = (() => {
-					const v = (args as any).startLine;
-					const n = Number(v);
-					return Number.isFinite(n) && n > 0 ? n : 1;
-				})();
+						// IMPORTANT:
+						// Put final text into rawOut.output (not _output), so your truncation code
+						// can overwrite rawOut.output with the *truncated-from-start* textOut.
+						rawOut = {
+							_type: 'terminal',
+							_status: status,
+							...(terminalId ? { terminalId } : {}),
+							...(typeof (terminalResult as any)?.correlationTerminalId === 'string' ? { correlationTerminalId: (terminalResult as any).correlationTerminalId } : {}),
+							...(typeof (terminalResult as any)?.command === 'string' ? { command: (terminalResult as any).command } : {}),
+							...(typeof (terminalResult as any)?.cwd === 'string' ? { cwd: (terminalResult as any).cwd } : {}),
+							...(typeof (terminalResult as any)?.cwdLabel === 'string' ? { cwdLabel: (terminalResult as any).cwdLabel } : {}),
+							...((terminalResult as any)?.exitStatus ? { exitStatus: (terminalResult as any).exitStatus } : {}),
+							...(textOutAlreadyTruncated ? { truncated: true } : {}),
+							output: textOut,
+						};
+					} else {
+						const rawExec = await this.conn.extMethod('void/tools/execute_with_text', {
+							name: toolCall.name,
+							params: toolCall.args ?? {},
+							// IMPORTANT: routing hints so extMethod is handled by the correct window (workspace)
+							sessionId: sid,
+							...(state.threadId ? { threadId: state.threadId } : {})
+						}) as unknown;
 
-				let metaObj: any;
-				let instructionsLines: string[];
+						const out = rawExec as ExecuteWithTextResponse;
+						const originalResult = (out as any)?.result;
 
-				if (isReadFileTool && filePathFromArgs) {
+						// normalize
+						rawOut = (() => {
+							if (originalResult === undefined || originalResult === null) return {};
+							if (typeof originalResult === 'object') return originalResult;
+							if (typeof originalResult === 'string') {
+								try { return JSON.parse(originalResult); } catch {
+									return { _type: 'text', content: originalResult, _originalLength: originalResult.length };
+								}
+							}
+							return { _type: typeof originalResult, value: originalResult };
+						})();
 
-					const nextStartLine = requestedStartLine + startLineExclusive;
-					const fileTotalLines = parsePositiveInt(
-						(rawOut && typeof rawOut === 'object') ? (rawOut as any).totalNumLines : undefined
-					);
-
-					const CHUNK = readFileChunkLines;
-					const suggestedEndLine = nextStartLine + CHUNK - 1;
-
-					metaObj = {
-						tool: 'read_file',
-						uri: filePathFromArgs,
-						requestedStartLine,
-						nextStartLine,
-						suggested: {
-							startLine: nextStartLine,
-							endLine: suggestedEndLine,
-							chunkLines: CHUNK,
-							endLineIsFileEnd: false,
-						},
-						...(fileTotalLines !== undefined ? { fileTotalLines } : {}),
-						maxChars: maxToolOutputLength,
-						originalLength,
-					};
-
-					instructionsLines = [
-						`IMPORTANT FOR THE MODEL:`,
-						`  1. Do NOT guess based only on this truncated output.`,
-						`  2. Continue by calling read_file on the ORIGINAL uri (NOT on a tool-output log):`,
-						`     read_file({ uri: ${JSON.stringify(filePathFromArgs)}, startLine: ${nextStartLine}, endLine: ${suggestedEndLine} })`,
-						`  3. IMPORTANT: endLine above is a chunk boundary, NOT the end of file.`,
-						`  4. Recommended next chunk size: readFileChunkLines = ${CHUNK}.`,
-						...(fileTotalLines !== undefined
-							? [`     Known total file lines (from tool): ${fileTotalLines}.`]
-							: []),
-						`  5. If still truncated, increase startLine by about ${CHUNK} and repeat.`,
-					];
-				} else {
-					const logFilePathForLLM = stableToolOutputsRelPath({
-						toolName: toolCall.name,
+						textOut = typeof out?.text === 'string'
+							? out.text
+							: (typeof originalResult === 'string' ? originalResult : JSON.stringify(rawOut));
+					}
+				} catch (e: any) {
+					textOut = `Tool error: ${String(e?.message ?? e)}`;
+					status = 'failed';
+					rawOut = { _error: true, _message: e?.message ?? String(e), _stack: e?.stack ? e.stack.substring(0, 500) : undefined };
+					this.log?.debug?.('[ACP Agent][prompt] tool execution error', {
+						sessionId: sid,
+						turn: turnCount,
 						toolCallId: toolCall.id,
-						fullText: originalTextOut
+						toolName: toolCall.name,
+						error: e?.message ?? String(e),
 					});
+				}
 
-					metaObj = { logFilePath: logFilePathForLLM, startLineExclusive, maxChars: maxToolOutputLength, originalLength };
-					instructionsLines = [
-						`IMPORTANT FOR THE MODEL:`,
-						`  1. Do NOT guess based only on this truncated output.`,
-						`  2. To see the rest of this tool output, call your file-reading tool (e.g. read_file)`,
-						`     on logFilePath, starting from line startLineExclusive + 1.`,
+				// Truncate tool output
+				const originalTextOut = textOut;
+				if (typeof textOut === 'string' && !textOutAlreadyTruncated && textOut.length > maxToolOutputLength) {
+					const originalLength = textOut.length;
+					const { truncatedBody, lineAfterTruncation } = computeTruncatedToolOutput(textOut, maxToolOutputLength);
+					const startLineExclusive = lineAfterTruncation > 0 ? lineAfterTruncation : 0;
+
+					const headerLines = [
+						`[VOID] TOOL OUTPUT TRUNCATED, SEE TRUNCATION_META BELOW.`,
+						`Only the first ${maxToolOutputLength} characters are included in this message.`,
+						`Display limit: maxToolOutputLength = ${maxToolOutputLength} characters.`,
 					];
+
+					const args = toolCall.args ?? {};
+					const isReadFileTool = String(toolCall.name) === 'read_file';
+
+
+					const uriArg = (args as any).uri;
+					const filePathFromArgs =
+						typeof uriArg === 'string' ? uriArg.trim() :
+							(uriArg && typeof uriArg === 'object' && !Array.isArray(uriArg) && typeof (uriArg as any).fsPath === 'string')
+								? String((uriArg as any).fsPath).trim()
+								: '';
+
+					const requestedStartLine = (() => {
+						const v = (args as any).startLine;
+						const n = Number(v);
+						return Number.isFinite(n) && n > 0 ? n : 1;
+					})();
+
+					let metaObj: any;
+					let instructionsLines: string[];
+
+					if (isReadFileTool && filePathFromArgs) {
+
+						const nextStartLine = requestedStartLine + startLineExclusive;
+						const fileTotalLines = parsePositiveInt(
+							(rawOut && typeof rawOut === 'object') ? (rawOut as any).totalNumLines : undefined
+						);
+
+						const CHUNK = readFileChunkLines;
+						const suggestedEndLine = nextStartLine + CHUNK - 1;
+
+						metaObj = {
+							tool: 'read_file',
+							uri: filePathFromArgs,
+							requestedStartLine,
+							nextStartLine,
+							suggested: {
+								startLine: nextStartLine,
+								endLine: suggestedEndLine,
+								chunkLines: CHUNK,
+								endLineIsFileEnd: false,
+							},
+							...(fileTotalLines !== undefined ? { fileTotalLines } : {}),
+							maxChars: maxToolOutputLength,
+							originalLength,
+						};
+
+						instructionsLines = [
+							`IMPORTANT FOR THE MODEL:`,
+							`  1. Do NOT guess based only on this truncated output.`,
+							`  2. Continue by calling read_file on the ORIGINAL uri (NOT on a tool-output log):`,
+							`     read_file({ uri: ${JSON.stringify(filePathFromArgs)}, startLine: ${nextStartLine}, endLine: ${suggestedEndLine} })`,
+							`  3. IMPORTANT: endLine above is a chunk boundary, NOT the end of file.`,
+							`  4. Recommended next chunk size: readFileChunkLines = ${CHUNK}.`,
+							...(fileTotalLines !== undefined
+								? [`     Known total file lines (from tool): ${fileTotalLines}.`]
+								: []),
+							`  5. If still truncated, increase startLine by about ${CHUNK} and repeat.`,
+						];
+					} else {
+						const logFilePathForLLM = stableToolOutputsRelPath({
+							toolName: toolCall.name,
+							toolCallId: toolCall.id,
+							fullText: originalTextOut
+						});
+
+						metaObj = { logFilePath: logFilePathForLLM, startLineExclusive, maxChars: maxToolOutputLength, originalLength };
+						instructionsLines = [
+							`IMPORTANT FOR THE MODEL:`,
+							`  1. Do NOT guess based only on this truncated output.`,
+							`  2. To see the rest of this tool output, call your file-reading tool (e.g. read_file)`,
+							`     on logFilePath, starting from line startLineExclusive + 1.`,
+						];
+					}
+
+					const metaLine = `TRUNCATION_META: ${JSON.stringify(metaObj)}`;
+					textOut = `${truncatedBody}...\n\n${headerLines.join('\n')}\n${instructionsLines.join('\n')}\n${metaLine}`;
+
+					const base = (rawOut && typeof rawOut === 'object') ? rawOut : {};
+
+					rawOut = {
+						...base,
+						output: (typeof (base as any).output === 'string') ? textOut : (base as any).output,
+						content: (typeof (base as any).content === 'string') ? textOut : (base as any).content,
+						text: textOut,
+						...(isReadFileTool ? {} : { fileContents: originalTextOut }),
+						_voidTruncationMeta: metaObj,
+					};
 				}
 
-				const metaLine = `TRUNCATION_META: ${JSON.stringify(metaObj)}`;
-				textOut = `${truncatedBody}...\n\n${headerLines.join('\n')}\n${instructionsLines.join('\n')}\n${metaLine}`;
+				if (state.cancelled) return;
 
-				const base = (rawOut && typeof rawOut === 'object') ? rawOut : {};
+				await this.conn.sessionUpdate({
+					sessionId: sid,
+					update: {
+						sessionUpdate: 'tool_call_update',
+						toolCallId: toolCall.id,
+						status,
+						title: toolCall.name,
+						content: [{ type: 'content', content: { type: 'text', text: textOut } }],
+						rawOutput: rawOut
+					}
+				} as any);
 
-				rawOut = {
-					...base,
-					output: (typeof (base as any).output === 'string') ? textOut : (base as any).output,
-					content: (typeof (base as any).content === 'string') ? textOut : (base as any).content,
-					text: textOut,
-					...(isReadFileTool ? {} : { fileContents: originalTextOut }),
-					_voidTruncationMeta: metaObj,
-				};
-			}
-
-			if (state.cancelled) return { stopReason: 'cancelled' };
-
-			await this.conn.sessionUpdate({
-				sessionId: sid,
-				update: {
-					sessionUpdate: 'tool_call_update',
+				this.log?.debug?.('[ACP Agent][prompt] tool execution completed', {
+					sessionId: sid,
+					turn: turnCount,
 					toolCallId: toolCall.id,
+					toolName: toolCall.name,
 					status,
-					title: toolCall.name,
-					content: [{ type: 'content', content: { type: 'text', text: textOut } }],
-					rawOutput: rawOut
+					outputLength: textOut.length,
+				});
+
+				// Append tool result into LLM history
+				state.messages.push({
+					role: 'tool',
+					tool_call_id: String(toolCall.id),
+					content: textOut
+				});
+				state.pendingToolCall = null;
+				if (state.pendingToolCallsById) delete state.pendingToolCallsById[String(toolCall.id)];
+
+				this.log?.debug?.('[ACP Agent][prompt] continuing loop after tool result', {
+					sessionId: sid,
+					turn: turnCount,
+					totalMessages: state.messages.length,
+				});
+			};
+
+			for (const toolCall of toolCalls) {
+				if (isAcpReadOnlyToolCall(toolCall)) {
+					pendingReadOnlyToolExecutions.push(processToolCall(toolCall));
+					continue;
 				}
-			} as any);
 
-			this.log?.debug?.('[ACP Agent][prompt] tool execution completed', {
-				sessionId: sid,
-				turn: turnCount,
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
-				status,
-				outputLength: textOut.length,
-			});
-
-			// Append tool result into LLM history
-			state.messages.push({
-				role: 'tool',
-				tool_call_id: String(toolCall.id),
-				content: textOut
-			});
-			state.pendingToolCall = null;
-
-			this.log?.debug?.('[ACP Agent][prompt] continuing loop after tool result', {
-				sessionId: sid,
-				turn: turnCount,
-				totalMessages: state.messages.length,
-			});
+				await drainPendingReadOnlyToolExecutions();
+				await processToolCall(toolCall);
+			}
+			await drainPendingReadOnlyToolExecutions();
 		}
 
 		// safeguard exhausted
@@ -1165,16 +1216,23 @@ class VoidPipelineAcpAgent implements Agent {
 		// Resolve ACP sessionId (best effort)
 		let sessionId =
 			Array.from(this.sessions.entries())
-				.find(([, s]) => String(s?.pendingToolCall?.id ?? '') === String(toolCall.id))?.[0]
+				.find(([, s]) =>
+					String(s?.pendingToolCall?.id ?? '') === String(toolCall.id)
+					|| !!s?.pendingToolCallsById?.[String(toolCall.id)]
+				)?.[0]
 			?? Array.from(this.sessions.keys())[0];
 		if (!sessionId) sessionId = 'unknown_session';
 
-		const terminalId = 'void_agent_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+		const correlationTerminalId = 'void_agent_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+		let actualTerminalId = correlationTerminalId;
 
-		const commandLine =
-			`$ ${rawCommand}${rawArgs.length ? ' ' + rawArgs.join(' ') : ''}` +
-			(rawCwd ? `\n(cwd=${rawCwd})` : '') +
-			`\n`;
+		const quoteArg = (arg: string) => {
+			if (!/[ \t\r\n"]/.test(arg)) return arg;
+			return `"${arg.replace(/"/g, '\\"')}"`;
+		};
+		const displayCommand = `${rawCommand}${rawArgs.length ? ' ' + rawArgs.map(quoteArg).join(' ') : ''}`;
+		const cwdForMetadata = rawCwd || null;
+		const cwdLabel = normalizeTerminalCwdLabel(cwdForMetadata);
 
 		// Stream only tail while running (UI responsiveness).
 		const PROGRESS_TAIL_LIMIT = Math.max(4000, defaultGlobalSettings.maxToolOutputLength || 16000);
@@ -1188,7 +1246,8 @@ class VoidPipelineAcpAgent implements Agent {
 					JSON.stringify({
 						sessionId,
 						toolCallId: toolCall.id,
-						terminalId,
+						correlationTerminalId,
+						hostTerminalId: actualTerminalId,
 						...obj
 					})
 				);
@@ -1228,7 +1287,11 @@ class VoidPipelineAcpAgent implements Agent {
 						rawOutput: {
 							_type: 'terminal',
 							_phase: 'progress',
-							terminalId,
+							terminalId: actualTerminalId,
+							correlationTerminalId,
+							command: displayCommand,
+							...(cwdForMetadata ? { cwd: cwdForMetadata } : {}),
+							...(cwdLabel ? { cwdLabel } : {}),
 							output: tail,
 							text: tail,
 							...(typeof meta?.truncated === 'boolean' ? { truncated: meta.truncated } : {}),
@@ -1241,13 +1304,13 @@ class VoidPipelineAcpAgent implements Agent {
 		};
 
 		const makeProgressText = (snapshotOutput: string): string => {
-			const out = typeof snapshotOutput === 'string' ? snapshotOutput : '';
-			if (commandLine.length + out.length <= PROGRESS_TAIL_LIMIT) return commandLine + out;
-
-			const room = Math.max(0, PROGRESS_TAIL_LIMIT - commandLine.length);
-			if (room > 0) return commandLine + out.slice(Math.max(0, out.length - room));
-
-			return out.slice(Math.max(0, out.length - PROGRESS_TAIL_LIMIT));
+			return normalizeTerminalCommandOutput({
+				command: displayCommand,
+				rawOutput: typeof snapshotOutput === 'string' ? snapshotOutput : '',
+				cwd: cwdForMetadata,
+				includeCommandHeader: true,
+				includeExitStatus: false,
+			}).text;
 		};
 
 		const fetchOutput = async (opts?: {
@@ -1258,7 +1321,7 @@ class VoidPipelineAcpAgent implements Agent {
 			exitStatus?: { exitCode: number | null; signal: string | null };
 		}> => {
 			const wantFull = !!opts?.full;
-			const res = await this.conn.extMethod('terminal/output', { sessionId, terminalId, full: wantFull }) as any;
+			const res = await this.conn.extMethod('terminal/output', { sessionId, terminalId: actualTerminalId, full: wantFull }) as any;
 
 			const output =
 				typeof res === 'string'
@@ -1297,17 +1360,29 @@ class VoidPipelineAcpAgent implements Agent {
 				sessionId,
 				command: rawCommand,
 				type: 'ephemeral',
-				terminalId,
+				terminalId: correlationTerminalId,
 				outputByteLimit: OUTPUT_BYTE_LIMIT,
 			};
 			if (rawArgs.length) createParams.args = rawArgs;
 			if (env) createParams.env = env;
 			if (rawCwd) createParams.cwd = rawCwd;
 
-			await this.conn.extMethod('terminal/create', createParams);
+			const createResult = await this.conn.extMethod('terminal/create', createParams) as any;
+			const hostTerminalId =
+				createResult && typeof createResult.terminalId === 'string' && createResult.terminalId.trim()
+					? createResult.terminalId.trim()
+					: '';
+			if (hostTerminalId) {
+				actualTerminalId = hostTerminalId;
+			}
+			logProgress('created', {
+				correlationTerminalId,
+				hostTerminalId: actualTerminalId,
+				adoptedHostTerminalId: actualTerminalId !== correlationTerminalId
+			});
 
 			// Make spoiler non-empty immediately
-			await postProgressTail(commandLine);
+			await postProgressTail(makeProgressText(''));
 
 			// Poll terminal/output until it reports exitStatus
 			while (true) {
@@ -1316,7 +1391,8 @@ class VoidPipelineAcpAgent implements Agent {
 					this.log?.debug?.('[ACP Agent][terminal] cancelled', {
 						sessionId,
 						toolCallId: toolCall.id,
-						terminalId,
+						correlationTerminalId,
+						hostTerminalId: actualTerminalId,
 					});
 					logProgress('cancelled', {});
 
@@ -1332,16 +1408,27 @@ class VoidPipelineAcpAgent implements Agent {
 						} catch { /* noop */ }
 					}
 
-					try { await this.conn.extMethod('terminal/kill', { sessionId, terminalId }); } catch { /* noop */ }
-					try { await this.conn.extMethod('terminal/release', { sessionId, terminalId }); } catch { /* noop */ }
+					try { await this.conn.extMethod('terminal/kill', { sessionId, terminalId: actualTerminalId }); } catch { /* noop */ }
+					try { await this.conn.extMethod('terminal/release', { sessionId, terminalId: actualTerminalId }); } catch { /* noop */ }
+
+					const cancelledText = `${normalizeTerminalCommandOutput({
+						command: displayCommand,
+						rawOutput: outputSoFar,
+						cwd: cwdForMetadata,
+						includeCommandHeader: true,
+						includeExitStatus: false,
+					}).text}\n(Cancelled)\n`;
 
 					return {
 						toolCallId: toolCall.id,
 						status: 'completed',
 						title: getTitle(),
 						kind: 'execute',
-						content: `${commandLine}${outputSoFar}(Cancelled)\n`,
-						terminalId
+						content: cancelledText,
+						terminalId: actualTerminalId,
+						correlationTerminalId,
+						...(cwdForMetadata ? { cwd: cwdForMetadata } : {}),
+						...(cwdLabel ? { cwdLabel } : {})
 					} as any;
 				}
 
@@ -1361,7 +1448,8 @@ class VoidPipelineAcpAgent implements Agent {
 					this.log?.debug?.('[ACP Agent][terminal] exit detected', {
 						sessionId,
 						toolCallId: toolCall.id,
-						terminalId,
+						correlationTerminalId,
+						hostTerminalId: actualTerminalId,
 						exitStatus,
 					});
 					logProgress('exit_detected', { exitStatus });
@@ -1373,10 +1461,12 @@ class VoidPipelineAcpAgent implements Agent {
 
 			// Final FULL read (single source of truth for "full output from start")
 			let fullOutput = '';
+			let fullOutputAlreadyTruncated = false;
 			try {
 				await new Promise(r => setTimeout(r, 100));
 				const finFull = await fetchOutput({ full: true });
 				fullOutput = finFull.output ?? '';
+				fullOutputAlreadyTruncated = finFull.truncated;
 				if (finFull.exitStatus) exitStatus = finFull.exitStatus;
 				logProgress('final_full_read', { fullLen: fullOutput.length, exitStatus, fullTruncated: finFull.truncated });
 			} catch (e: any) {
@@ -1385,23 +1475,36 @@ class VoidPipelineAcpAgent implements Agent {
 				try {
 					const finTail = await fetchOutput({ full: false });
 					fullOutput = finTail.output ?? '';
+					fullOutputAlreadyTruncated = finTail.truncated;
 				} catch { /* noop */ }
 			}
 
-			try { await this.conn.extMethod('terminal/release', { sessionId, terminalId }); } catch { /* noop */ }
+			try { await this.conn.extMethod('terminal/release', { sessionId, terminalId: actualTerminalId }); } catch { /* noop */ }
 
-			const suffix = exitStatus
-				? `\n(exitCode=${exitStatus.exitCode ?? 0}${exitStatus.signal ? `, signal=${exitStatus.signal}` : ''})`
-				: '';
-
-			// IMPORTANT: finalText is FULL from start (commandLine + full output)
-			const finalText = `${commandLine}${fullOutput}${suffix}`;
+			const finalText = fullOutputAlreadyTruncated ? normalizeTerminalCommandOutput({
+				command: displayCommand,
+				rawOutput: fullOutput,
+				cwd: cwdForMetadata,
+				exitCode: exitStatus?.exitCode,
+				signal: exitStatus?.signal,
+				includeCommandHeader: true,
+				includeExitStatus: false,
+			}).text : normalizeTerminalCommandOutput({
+				command: displayCommand,
+				rawOutput: fullOutput,
+				cwd: cwdForMetadata,
+				exitCode: exitStatus?.exitCode,
+				signal: exitStatus?.signal,
+				includeCommandHeader: true,
+				includeExitStatus: !!exitStatus,
+			}).text;
 			logProgress('done', { finalLen: finalText.length });
 
 			this.log?.debug?.('[ACP Agent][terminal] completed', {
 				sessionId,
 				toolCallId: toolCall.id,
-				terminalId,
+				correlationTerminalId,
+				hostTerminalId: actualTerminalId,
 				exitStatus,
 				finalLength: finalText.length,
 			});
@@ -1412,17 +1515,23 @@ class VoidPipelineAcpAgent implements Agent {
 				title: getTitle(),
 				kind: 'execute',
 				content: finalText,
-				terminalId
+				terminalId: actualTerminalId,
+				correlationTerminalId,
+				command: displayCommand,
+				...(cwdForMetadata ? { cwd: cwdForMetadata } : {}),
+				...(cwdLabel ? { cwdLabel } : {}),
+				...(exitStatus ? { exitStatus } : {})
 			} as any;
 		} catch (e: any) {
-			try { await this.conn.extMethod('terminal/release', { sessionId, terminalId }); } catch { /* noop */ }
+			try { await this.conn.extMethod('terminal/release', { sessionId, terminalId: actualTerminalId }); } catch { /* noop */ }
 			const msg = typeof e?.message === 'string' ? e.message : String(e);
 			logProgress('failed', { message: msg });
 
 			this.log?.debug?.('[ACP Agent][terminal] failed', {
 				sessionId,
 				toolCallId: toolCall.id,
-				terminalId,
+				correlationTerminalId,
+				hostTerminalId: actualTerminalId,
 				error: msg,
 			});
 
@@ -1432,12 +1541,13 @@ class VoidPipelineAcpAgent implements Agent {
 				title: getTitle(),
 				kind: 'execute',
 				content: `Terminal tool infrastructure error: ${msg}`,
-				terminalId
+				terminalId: actualTerminalId,
+				correlationTerminalId
 			} as any;
 		}
 	}
 
-	private async runOneTurnWithSendLLM(state: SessionState, sid: string): Promise<{ toolCall: OAIFunctionCall | null; assistantText: string }> {
+	private async runOneTurnWithSendLLM(state: SessionState, sid: string): Promise<{ toolCalls: OAIFunctionCall[]; toolCall: OAIFunctionCall | null; assistantText: string }> {
 		const {
 			providerName,
 			settingsOfProvider,
@@ -1513,9 +1623,9 @@ class VoidPipelineAcpAgent implements Agent {
 		this._textStreamStateBySession.set(sid, emptyStreamDeltaState());
 		this._reasoningStreamStateBySession.set(sid, emptyStreamDeltaState());
 
-		return new Promise<{ toolCall: OAIFunctionCall | null; assistantText: string }>((resolve, reject) => {
+		return new Promise<{ toolCalls: OAIFunctionCall[]; toolCall: OAIFunctionCall | null; assistantText: string }>((resolve, reject) => {
 			state.aborter = null;
-			let finalTool: OAIFunctionCall | null = null;
+			let finalTools: OAIFunctionCall[] = [];
 			let lastAssistantText = '';
 
 			const originalOnText = (chunk: OnTextChunk) => {
@@ -1543,7 +1653,7 @@ class VoidPipelineAcpAgent implements Agent {
 			const originalOnFinalMessage = async (res: OnFinalMessagePayload) => {
 				const fullText = typeof res?.fullText === 'string' ? res.fullText : '';
 				const fullReasoning = typeof res?.fullReasoning === 'string' ? res.fullReasoning : '';
-				const tool = res?.toolCall;
+				const tools = (Array.isArray(res?.toolCalls) && res.toolCalls.length ? res.toolCalls : (res?.toolCall ? [res.toolCall] : []));
 				const plan: LLMPlan | undefined = res.plan;
 				const tokenUsage = res.tokenUsage;
 
@@ -1551,8 +1661,9 @@ class VoidPipelineAcpAgent implements Agent {
 					sessionId: sid,
 					fullTextLength: fullText.length,
 					fullReasoningLength: fullReasoning.length,
-					hasToolCall: !!tool,
-					toolName: tool?.name,
+					hasToolCall: tools.length > 0,
+					toolName: tools[0]?.name,
+					toolCallsCount: tools.length,
 					hasPlan: !!plan,
 					hasTokenUsage: !!tokenUsage,
 				});
@@ -1568,7 +1679,9 @@ class VoidPipelineAcpAgent implements Agent {
 					}
 				}
 
-				if (tool && typeof tool?.name === 'string' && tool.name.trim() !== '') {
+				const parsedTools: OAIFunctionCall[] = [];
+				for (const tool of tools) {
+					if (!tool || typeof tool?.name !== 'string' || !tool.name.trim()) continue;
 					try {
 						const id = String(tool.id || '');
 						const name = String(tool.name || '');
@@ -1577,27 +1690,30 @@ class VoidPipelineAcpAgent implements Agent {
 								? (tool.rawParams as Record<string, unknown>)
 								: {};
 
-						finalTool = { id, name, args };
-						state.messages.push({
-							role: 'assistant',
-							content: fullText || '',
-							tool_calls: [{
-								id,
-								type: 'function',
-								function: { name, arguments: JSON.stringify(args) }
-							}]
-						});
+						parsedTools.push({ id, name, args });
 					} catch {
-						finalTool = null;
-						if (fullText) state.messages.push({ role: 'assistant', content: fullText });
+						// ignore malformed tool entry; other calls in the same turn may still be valid
 					}
+				}
+
+				if (parsedTools.length) {
+					finalTools = parsedTools;
+					state.messages.push({
+						role: 'assistant',
+						content: fullText || '',
+						tool_calls: parsedTools.map(tool => ({
+							id: tool.id,
+							type: 'function',
+							function: { name: tool.name, arguments: JSON.stringify(tool.args) }
+						}))
+					});
 				} else if (fullText) {
 					state.messages.push({ role: 'assistant', content: fullText });
 				}
 				state.aborter = null;
 				lastAssistantText = fullText;
 				await this._drainSessionUpdates(sid);
-				resolve({ toolCall: finalTool, assistantText: lastAssistantText });
+				resolve({ toolCalls: finalTools, toolCall: finalTools[0] ?? null, assistantText: lastAssistantText });
 			};
 
 			const originalOnError = (err: unknown) => {
@@ -1703,6 +1819,21 @@ class VoidPipelineAcpAgent implements Agent {
 					specialToolFormat: 'openai-style',
 					supportsSystemMessage: 'system-role',
 				};
+			}
+
+			if (!dynamicRequestConfig.parallelToolCalls) {
+				try {
+					const caps = getModelCapabilities(providerNameForSend, modelName, overridesForSend);
+					dynamicRequestConfig = {
+						...dynamicRequestConfig,
+						parallelToolCalls: createParallelToolCallsConfig(caps),
+					};
+				} catch {
+					dynamicRequestConfig = {
+						...dynamicRequestConfig,
+						parallelToolCalls: createParallelToolCallsConfig(null),
+					};
+				}
 			}
 
 			const messagesForSend: LLMChatMessage[] = toLLMChatMessages(state.messages || [], dynamicRequestConfig.apiStyle);

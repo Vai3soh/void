@@ -124,7 +124,7 @@ suite('ACP builtin agent address', () => {
 			trace: () => { },
 			info: (...args: unknown[]) => infoMessages.push(args.map(stringify).join(' ')),
 			warn: (...args: unknown[]) => warnMessages.push(args.map(stringify).join(' ')),
-		} as ILogService & { infoMessages: string[]; warnMessages: string[] };
+		} as unknown as ILogService & { infoMessages: string[]; warnMessages: string[] };
 	}
 
 	function restoreEnv(): void {

@@ -339,6 +339,99 @@ suite('ACP getLLMConfig - config switches with settings', () => {
 		);
 	});
 
+	test('void/settings/getLLMConfig uses effective caps tool format for ACP prompt style', async () => {
+		const logService = new NullLogService();
+
+		const settingsService: any = {
+			state: {
+				settingsOfProvider: {
+					openAI: { apiKey: 'k', _didFillInProviderSettings: true },
+				},
+				customProviders: {},
+				overridesOfModel: {},
+				modelSelectionOfFeature: {
+					Chat: { providerName: 'openAI', modelName: 'gpt-4o-mini' },
+					'Ctrl+K': null, 'Autocomplete': null, 'Apply': null, 'SCM': null,
+				},
+				optionsOfModelSelection: {
+					Chat: {}, 'Ctrl+K': {}, 'Autocomplete': {}, 'Apply': {}, 'SCM': {},
+				},
+				globalSettings: {
+					chatMode: 'agent',
+					useAcp: true,
+					acpMode: 'builtin',
+					acpAgentUrl: '',
+					acpProcessCommand: '',
+					acpProcessArgs: [],
+					acpProcessEnv: {},
+					acpModel: null,
+					acpSystemPrompt: '',
+					showAcpPlanInChat: true,
+					autoRefreshModels: false,
+					aiInstructions: '',
+					enableAutocomplete: false,
+					syncApplyToChat: false,
+					syncSCMToChat: false,
+					enableFastApply: false,
+					autoApprove: {},
+					mcpAutoApprove: false,
+					showInlineSuggestions: false,
+					includeToolLintErrors: false,
+					loopGuardMaxTurnsPerPrompt: 25,
+					loopGuardMaxSameAssistantPrefix: 10,
+					loopGuardMaxSameToolCall: 10,
+					isOnboardingComplete: true,
+					disableTelemetry: true,
+					chatRetries: 0,
+					retryDelay: 0,
+					maxToolOutputLength: 40000,
+				},
+				mcpUserStateOfName: {},
+			}
+		};
+
+		const registry: any = {
+			initialize: async () => { },
+			getRequestConfigForModel: () => ({
+				apiStyle: 'openai-compatible',
+				endpoint: 'https://api.openai.com/v1',
+				headers: {},
+				specialToolFormat: 'disabled',
+				supportsSystemMessage: 'developer-role',
+			}),
+			getEffectiveModelCapabilities: async () => ({ specialToolFormat: 'openai-style', supportsParallelToolCalls: true }),
+		};
+
+		const workspace: any = {
+			getWorkspace: () => ({ folders: [{ uri: URI.file('/workspace/root') }] }),
+		};
+
+		const instantiationService: any = {
+			invokeFunction: (fn: any) => fn({
+				get: (id: any) => {
+					if (id === IVoidSettingsService) return settingsService;
+					if (id === IDynamicProviderRegistryService) return registry;
+					if (id === IWorkspaceContextService) return workspace;
+					return { getTools: () => new Set() };
+				}
+			})
+		};
+
+		const svc = new AcpInternalExtMethodService(instantiationService, logService);
+		const res = await svc.handle({ method: 'void/settings/getLLMConfig', params: { featureName: 'Chat' } });
+		const msg = String(res.separateSystemMessage ?? '');
+
+		assert.strictEqual(res.dynamicRequestConfig.specialToolFormat, 'openai-style');
+		assert.ok(
+			!msg.includes('!!!CRITICAL: YOU MUST USE XML TOOLS - NO EXCEPTIONS!!!'),
+			'ACP prompt must be native when effective caps specialToolFormat=openai-style'
+		);
+		assert.ok(
+			msg.includes('Core execution rules (MUST, Native tools):'),
+			'native ACP prompt marker must be present'
+		);
+	});
+
 	test('void/settings/getLLMConfig excludes disabled static tools from ACP XML prompt when specialToolFormat=disabled', async () => {
 		const logService = new NullLogService();
 

@@ -478,6 +478,45 @@ suite('DynamicProviderRegistryService.getRequestConfigForModel', () => {
 		assert.strictEqual(cfg.specialToolFormat, 'disabled');
 	});
 
+	test('per-model tool format overrides saved capabilities for request config and effective caps', async () => {
+		const modelId = 'acme/model-x';
+		const remoteModelsService = makeMockRemoteModelsService();
+		const settingsService = makeMockSettingsService({
+			acme: {
+				endpoint: 'https://api.acme.ai/v1',
+				apiKey: 'sk-acme',
+				apiStyle: 'openai-compatible',
+				specialToolFormat: 'openai-style',
+				models: [modelId],
+				modelsCapabilities: {
+					[modelId]: {
+						supportsSystemMessage: false,
+						specialToolFormat: 'disabled',
+						supportsParallelToolCalls: true,
+					},
+				},
+				perModel: {
+					[modelId]: {
+						specialToolFormat: 'openai-style',
+						parallelToolCallsMode: 'enabled',
+					},
+				},
+			},
+		});
+		const dynamicModelService = makeMockDynamicModelService();
+		const logService = new NullLogService();
+
+		// @ts-ignore – partial mocks are sufficient for this test
+		const svc = new DynamicProviderRegistryService(remoteModelsService, settingsService, dynamicModelService, logService);
+
+		const cfg = svc.getRequestConfigForModel(modelId, 'acme');
+		const caps = await svc.getEffectiveModelCapabilities('acme', modelId);
+
+		assert.strictEqual(cfg.specialToolFormat, 'openai-style');
+		assert.strictEqual(caps.specialToolFormat, 'openai-style');
+		assert.strictEqual(caps.supportsParallelToolCalls, true);
+	});
+
 	test('builds headers from apiKey, auth and additionalHeaders while keeping capabilities intact', () => {
 		const modelId = 'acme/claude-3-5';
 		const remoteModelsService = makeMockRemoteModelsService();

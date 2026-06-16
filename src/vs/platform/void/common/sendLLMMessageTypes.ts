@@ -5,6 +5,7 @@
 
 import { ToolName, ToolParamName } from './toolsServiceTypes.js'
 import { ChatMode, supportsSystemMessage, specialToolFormat, ModelSelection, ModelSelectionOptions, OverridesOfModel, ProviderName, RefreshableProviderName, SettingsOfProvider } from './voidSettingsTypes.js'
+import type { ParallelToolCallsConfig } from './parallelToolCalls.js';
 
 // Parameter injection controls (renderer → main)
 export type ParameterInjectionMode = 'default' | 'off' | 'override';
@@ -25,7 +26,6 @@ export type ProviderRouting = {
 	quantizations?: string[];
 	sort?: string;
 	max_price?: Record<string, number>;
-	// Allow forward‑compatible custom fields without breaking typing
 	[k: string]: any;
 };
 
@@ -39,6 +39,8 @@ export type DynamicRequestConfig = {
 	reasoningCapabilities?: any;
 	/** Whether this model should use provider-specific prompt caching (cache_control). */
 	supportCacheControl?: boolean;
+	/** Effective tool-runtime control for provider parallel tool calls. */
+	parallelToolCalls?: ParallelToolCallsConfig;
 	headers: Record<string, string>;
 };
 
@@ -167,6 +169,7 @@ export type LLMPlan = {
 export type OnText = (p: {
 	fullText: string;
 	fullReasoning: string;
+	toolCalls?: RawToolCallObj[];
 	toolCall?: RawToolCallObj;
 	plan?: LLMPlan;
 	/** Optional per-request token usage snapshot when the provider reports it. */
@@ -176,6 +179,7 @@ export type OnText = (p: {
 export type OnFinalMessage = (p: {
 	fullText: string;
 	fullReasoning: string;
+	toolCalls?: RawToolCallObj[];
 	toolCall?: RawToolCallObj;
 	anthropicReasoning: AnthropicReasoning[] | null;
 	plan?: LLMPlan;

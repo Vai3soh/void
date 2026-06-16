@@ -82,6 +82,7 @@ export const sendLLMMessage = async (
 			reasoningLength: p.fullReasoning?.length ?? 0,
 			durationMs,
 			toolCallName: p.toolCall?.name,
+			toolCallsCount: p.toolCalls?.length ?? (p.toolCall ? 1 : 0),
 		});
 		onFinalMessage_(p);
 	};

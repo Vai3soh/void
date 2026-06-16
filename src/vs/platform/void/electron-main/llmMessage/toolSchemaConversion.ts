@@ -68,6 +68,9 @@ export const ToolSchemas = {
 	read_lint_errors: z.object({
 		uri: z.string().describe('File URI'),
 	}),
+	activate_skill: z.object({
+		name: z.string().describe('The exact Agent Skill name from the available skills catalog'),
+	}),
 	rewrite_file: z.object({
 		uri: z.string().describe('File URI'),
 		new_content: z.string().describe('New content of the file'),
@@ -96,16 +99,6 @@ export const ToolSchemas = {
 	run_command: z.object({
 		command: z.string().describe('Command to execute'),
 		cwd: z.string().nullable().optional().describe('Working directory (optional)'),
-	}),
-	open_persistent_terminal: z.object({
-		cwd: z.string().nullable().optional().describe('Working directory (optional)'),
-	}),
-	run_persistent_command: z.object({
-		command: z.string().describe('Command to run'),
-		persistent_terminal_id: z.string().describe('Persistent terminal ID'),
-	}),
-	kill_persistent_terminal: z.object({
-		persistent_terminal_id: z.string().describe('Persistent terminal ID to kill'),
 	}),
 } satisfies { [K in keyof ToolCallParams]: AnyZodObject };
 

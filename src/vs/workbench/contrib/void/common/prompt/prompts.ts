@@ -10,6 +10,7 @@ import { StagingSelectionItem } from '../../../../../platform/void/common/chatTh
 import { os } from '../../../../../platform/void/common/helpers/systemInfo.js';
 import { toolFormatNativeHelp } from '../../../../../platform/void/common/prompt/prompt_helper.js';
 import { RawToolParamsObj } from '../../../../../platform/void/common/sendLLMMessageTypes.js';
+import { getParallelToolCallsPayloadValue, type ParallelToolCallsConfig } from '../../../../../platform/void/common/parallelToolCalls.js';
 import {
 	type ToolName,
 	type ToolParamName,
@@ -155,6 +156,7 @@ export type BuildContext = {
 	nowDate: string
 	mode: ChatMode
 	toolFormat: specialToolFormat
+	parallelToolCalls?: ParallelToolCallsConfig | null
 	skillsSection?: string
 }
 
@@ -528,11 +530,23 @@ type NativeSections = {
 	SAFETY_SCOPE: string
 }
 
+function buildNativeParallelToolCallsSection(ctx: BuildContext): string {
+	const parallelToolCallsValue = getParallelToolCallsPayloadValue(ctx.parallelToolCalls, { hasNativeTools: ctx.toolFormat !== 'disabled' })
+	if (parallelToolCallsValue !== true) return ''
+
+	return `
+
+Parallel tool calls:
+- When you need multiple independent read-only tool calls, prefer returning them together in a single assistant message as multiple tool calls.
+- Do not batch tool calls that may mutate files, run terminal commands, require user approval, depend on previous tool results, or call tools whose behavior is unknown from their description.
+- If calls depend on each other, execute them sequentially.`
+}
+
 function buildNativePromptFromSections(ctx: BuildContext, s: NativeSections): string {
 	const toolHelp = toolFormatNativeHelp(ctx.toolFormat)
 
 	return SYSTEM_PROMPT_NATIVE_TEMPLATE
-		.replace('{{CRITICAL_RULES}}', s.CRITICAL_RULES)
+		.replace('{{CRITICAL_RULES}}', s.CRITICAL_RULES + buildNativeParallelToolCallsSection(ctx))
 		.replace('{{WORKSPACES}}', ctx.workspaces)
 		.replace('{{NOW_DATE}}', ctx.nowDate)
 		.replace('{{OS}}', ctx.os || 'unknown')
@@ -684,6 +698,7 @@ export async function chat_systemMessage({
 	toolFormat,
 	ptyHostService,
 	disabledStaticToolNames,
+	parallelToolCalls,
 	skillsSection,
 }: {
 	workspaceFolders: string[]
@@ -691,6 +706,7 @@ export async function chat_systemMessage({
 	toolFormat: specialToolFormat
 	ptyHostService: IPtyHostService
 	disabledStaticToolNames?: readonly string[]
+	parallelToolCalls?: ParallelToolCallsConfig | null
 	skillsSection?: string
 }) {
 	if (typeof SYSTEM_PROMPT_OVERRIDE === 'string' && SYSTEM_PROMPT_OVERRIDE.trim() !== '') {
@@ -717,6 +733,7 @@ export async function chat_systemMessage({
 		nowDate,
 		mode,
 		toolFormat,
+		parallelToolCalls,
 		skillsSection
 	}
 
@@ -746,6 +763,7 @@ export async function chat_systemMessageForAcp(opts: {
 	toolFormat: specialToolFormat;
 	ptyHostService: IPtyHostService;
 	disabledStaticToolNames?: readonly string[];
+	parallelToolCalls?: ParallelToolCallsConfig | null;
 	skillsSection?: string;
 }) {
 	let base = await chat_systemMessage(opts);

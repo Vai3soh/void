@@ -6,6 +6,7 @@
 import { CancellationToken } from '../../../../base/common/cancellation.js'
 import { URI } from '../../../../base/common/uri.js'
 import { IFileService } from '../../../../platform/files/common/files.js'
+import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js'
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js'
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js'
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js'
@@ -22,7 +23,7 @@ import { IMarkerService, MarkerSeverity } from '../../../../platform/markers/com
 import { timeout } from '../../../../base/common/async.js'
 import { RawToolParamsObj } from '../../../../platform/void/common/sendLLMMessageTypes.js'
 import { ToolName } from '../common/prompt/prompts.js'
-import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_INACTIVE_TIME } from '../../../../platform/void/common/prompt/constants.js';
+import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE } from '../../../../platform/void/common/prompt/constants.js';
 import { IVoidSettingsService } from '../../../../platform/void/common/voidSettingsService.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
 import { IToolsService } from '../common/toolsService.js'
@@ -72,12 +73,6 @@ const validateNumber = (numStr: unknown, opts: { default: number | null }) => {
 	}
 
 	return opts.default
-}
-
-const validateProposedTerminalId = (terminalIdUnknown: unknown) => {
-	if (!terminalIdUnknown) throw new Error(`A value for terminalID must be specified, but the value was "${terminalIdUnknown}"`)
-	const terminalId = terminalIdUnknown + ''
-	return terminalId
 }
 
 const validateBoolean = (b: unknown, opts: { default: boolean }) => {
@@ -167,7 +162,7 @@ export class ToolsService implements IToolsService {
 		@IDirectoryStrService private readonly directoryStrService: IDirectoryStrService,
 		@IMarkerService private readonly markerService: IMarkerService,
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
-		@IAgentSkillsService private readonly agentSkillsService: IAgentSkillsService = undefined as unknown as IAgentSkillsService,
+		@IAgentSkillsService private readonly agentSkillsService: IAgentSkillsService,
 	) {
 
 		const queryBuilder = instantiationService.createInstance(QueryBuilder);
@@ -401,25 +396,8 @@ export class ToolsService implements IToolsService {
 				const terminalId = generateUuid()
 				return { command, cwd, terminalId }
 			},
-			run_persistent_command: (params: RawToolParamsObj) => {
-				const { command: commandUnknown, persistent_terminal_id: persistentTerminalIdUnknown } = params;
-				const command = validateStr('command', commandUnknown);
-				const persistentTerminalId = validateProposedTerminalId(persistentTerminalIdUnknown)
-				return { command, persistentTerminalId };
-			},
-			open_persistent_terminal: (params: RawToolParamsObj) => {
-				const { cwd: cwdUnknown } = params;
-				const cwd = validateOptionalStr('cwd', cwdUnknown)
-				// No parameters needed; will open a new background terminal
-				return { cwd };
-			},
-			kill_persistent_terminal: (params: RawToolParamsObj) => {
-				const { persistent_terminal_id: terminalIdUnknown } = params;
-				const persistentTerminalId = validateProposedTerminalId(terminalIdUnknown);
-				return { persistentTerminalId };
-			},
 
-		} as any
+		}
 
 		this.callTool = {
 			read_file: async ({ uri, startLine, endLine, linesCount, pageNumber }) => {
@@ -769,30 +747,10 @@ export class ToolsService implements IToolsService {
 
 				const { resPromise, interrupt } = await this.terminalToolService.runCommand(
 					command,
-					{ type: 'ephemeral', cwd, terminalId, onOutput }
+					{ cwd, terminalId, onOutput }
 				);
 
 				return { result: resPromise, interruptTool: interrupt };
-			},
-
-			run_persistent_command: async ({ command, persistentTerminalId }, ctx?: { onOutput?: (chunk: string) => void }) => {
-				const onOutput = ctx?.onOutput;
-
-				const { resPromise, interrupt } = await this.terminalToolService.runCommand(
-					command,
-					{ type: 'persistent', persistentTerminalId, onOutput }
-				);
-
-				return { result: resPromise, interruptTool: interrupt };
-			},
-			open_persistent_terminal: async ({ cwd }) => {
-				const persistentTerminalId = await this.terminalToolService.createPersistentTerminal({ cwd })
-				return { result: { persistentTerminalId } }
-			},
-			kill_persistent_terminal: async ({ persistentTerminalId }) => {
-				// Close the background terminal by sending exit
-				await this.terminalToolService.killPersistentTerminal(persistentTerminalId)
-				return { result: {} }
 			},
 
 		}
@@ -966,34 +924,17 @@ export class ToolsService implements IToolsService {
 				const { resolveReason, result: result_, } = result
 				// success
 				if (resolveReason.type === 'done') {
-					return `${result_}\n(exit code ${resolveReason.exitCode})`
+					return result_
 				}
-				// normal command
-				if (resolveReason.type === 'timeout') {
-					return `${result_}\nTerminal command ran, but was automatically killed by Void after ${MAX_TERMINAL_INACTIVE_TIME}s of inactivity and did not finish successfully. To try with more time, open a persistent terminal and run the command there.`
-				}
-				throw new Error(`Unexpected internal error: Terminal command did not resolve with a valid reason.`)
-			},
-			run_persistent_command: (params, result) => {
-				const { resolveReason, result: result_, } = result
-				// success
-				if (resolveReason.type === 'done') {
-					return `${result_}\n(exit code ${resolveReason.exitCode})`
-				}
-				// timeout here means the user explicitly interrupted the
-				// command (e.g. via Skip/Stop), not that we gave up after a
-				// fixed background time.
-				if (resolveReason.type === 'timeout') {
+				if (resolveReason.type === 'interrupted') {
 					return `${result_}\n(Command was interrupted before completion.)`
 				}
+				if (resolveReason.type === 'timeout') {
+					const timeoutMinutesRaw = this.voidSettingsService.state.globalSettings.terminalCommandTimeoutMinutes
+					const timeoutMinutes = typeof timeoutMinutesRaw === 'number' && Number.isFinite(timeoutMinutesRaw) && timeoutMinutesRaw > 0 ? timeoutMinutesRaw : 40
+					return `${result_}\nTerminal command run, but was stopped by Void because it exceeded the configured terminal command timeout (${timeoutMinutes} minutes).`
+				}
 				throw new Error(`Unexpected internal error: Terminal command did not resolve with a valid reason.`)
-			},
-			open_persistent_terminal: (_params, result) => {
-				const { persistentTerminalId } = result;
-				return `Successfully created persistent terminal. persistentTerminalId="${persistentTerminalId}"`;
-			},
-			kill_persistent_terminal: (params, _result) => {
-				return `Successfully closed terminal "${params.persistentTerminalId}".`;
 			},
 		}
 	}
@@ -1015,4 +956,4 @@ export class ToolsService implements IToolsService {
 	}
 }
 
-registerSingleton(IToolsService, ToolsService, InstantiationType.Delayed);
+registerSingleton(IToolsService, new SyncDescriptor(ToolsService, [], Boolean(InstantiationType.Delayed)));

@@ -22,6 +22,7 @@ product.overrides.json
 *.snap.actual
 .vscode-test
 .void
+.serena
 
 # Void added these:
 .tmp/

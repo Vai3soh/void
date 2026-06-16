@@ -1,7 +1,7 @@
-/*---------------------------------------------------------------------------------------------
- *  Copyright (c) Microsoft Corporation.
- *  Licensed under the MIT License. See License.txt in the project root for license information.
- *--------------------------------------------------------------------------------------------*/
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
 
 export function normalizeForHash(s: unknown): string {
 	return String(s ?? '').replace(/\r\n/g, '\n');
@@ -28,7 +28,7 @@ export function sanitizeForFileNamePart(s: unknown): string {
 export function toolPrefixForToolName(toolName: unknown): string {
 	const t = String(toolName ?? '').trim();
 
-	if (t === 'run_command' || t === 'run_persistent_command' || t === 'open_persistent_terminal') return 'terminal';
+	if (t === 'run_command') return 'terminal';
 
 	if (t === 'read_file' || t === 'readTextFile' || t === 'fs/read_text_file') return 'read';
 	if (t === 'rewrite_file' || t === 'writeTextFile' || t === 'fs/write_text_file') return 'write';

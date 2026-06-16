@@ -92,40 +92,109 @@ export const normalizeAcpToolName = (raw: string): ToolName | string => {
 		'fs/read_text_file': 'read_file',
 		'fs/write_text_file': 'rewrite_file',
 		'terminal/create': 'run_command',
-		'terminal/kill': 'kill_persistent_terminal',
-		'terminal/output': 'open_persistent_terminal',
-		'terminal/release': 'kill_persistent_terminal',
-		'terminal/wait_for_exit': 'run_persistent_command',
 	};
 	return (map[n] ?? n) as ToolName | string;
 };
 
-export const normalizeAcpArgsForUi = (
-	toolName: AnyToolName | string,
-	rawParams: Record<string, any> | undefined,
-	workspaceRoot: URI | undefined
-) => {
-	const src = rawParams && typeof rawParams === 'object' && 'args' in rawParams ? (rawParams as any).args : rawParams;
-	const p = _deepCamelize(src ?? {});
+interface NormalizedParams {
+	uri?: string | URI;
+	searchInFolder?: string | URI;
+	startLine?: number;
+	endLine?: number | null;
+	linesCount?: number;
+	isFolder?: boolean | string | null;
+	[key: string]: unknown;
+}
 
-	// --- NEW: parse "(from line..., limit ...)" embedded into uri for read_file ---
-	if (toolName === 'read_file' && p && typeof (p as any).uri === 'string') {
-		const uriStr = String((p as any).uri);
-		const range = _parseReadRangeFromText(uriStr);
 
-		// only fill if missing
-		if (typeof (p as any).startLine !== 'number' && typeof range.startLine === 'number') (p as any).startLine = range.startLine;
-		if (typeof (p as any).linesCount !== 'number' && typeof range.linesCount === 'number') (p as any).linesCount = range.linesCount;
+function parseReadFileRangeFromUri(p: NormalizedParams): void {
+	if (typeof p.uri !== 'string') return;
 
-		// clean uri string before resolving to URI
-		(p as any).uri = _stripReadRangeSuffixFromUri(uriStr);
+	const range = _parseReadRangeFromText(p.uri);
+
+	if (
+		typeof p.startLine !== 'number' &&
+		typeof range.startLine === 'number'
+	) {
+		p.startLine = range.startLine;
 	}
 
-	const resolvePath = (pathStr: string): URI => _resolvePathWithWorkspace(pathStr, workspaceRoot);
+	if (
+		typeof p.linesCount !== 'number' &&
+		typeof range.linesCount === 'number'
+	) {
+		p.linesCount = range.linesCount;
+	}
 
-	if (p && typeof (p as any).uri === 'string') (p as any).uri = resolvePath((p as any).uri);
-	if (p && typeof (p as any).searchInFolder === 'string') (p as any).searchInFolder = resolvePath((p as any).searchInFolder);
-	if ((p as any)?.isFolder !== null && typeof (p as any).isFolder !== 'boolean') (p as any).isFolder = String((p as any).isFolder).toLowerCase() === 'true';
+	p.uri = _stripReadRangeSuffixFromUri(p.uri);
+}
+
+function normalizeReadFileLineRange(p: NormalizedParams): void {
+	if (typeof p.startLine === 'number' && p.startLine < 1) {
+		p.startLine = 1;
+	}
+
+	if (typeof p.endLine === 'number' && p.endLine < 1) {
+		p.endLine = null;
+	}
+
+	if (
+		typeof p.startLine === 'number' &&
+		typeof p.endLine === 'number' &&
+		p.endLine < p.startLine
+	) {
+		p.endLine = null;
+	}
+}
+
+function normalizeReadFileParams(p: NormalizedParams): void {
+	parseReadFileRangeFromUri(p);
+	normalizeReadFileLineRange(p);
+}
+
+function normalizePaths(
+	p: NormalizedParams,
+	workspaceRoot: URI | undefined
+): void {
+	const resolvePath = (pathStr: string): URI =>
+		_resolvePathWithWorkspace(pathStr, workspaceRoot);
+
+	if (typeof p.uri === 'string') {
+		p.uri = resolvePath(p.uri);
+	}
+
+	if (typeof p.searchInFolder === 'string') {
+		p.searchInFolder = resolvePath(p.searchInFolder);
+	}
+}
+
+function normalizeBooleans(p: NormalizedParams): void {
+	if (p.isFolder !== null && typeof p.isFolder !== 'boolean') {
+		p.isFolder = String(p.isFolder).toLowerCase() === 'true';
+	}
+}
+
+export const normalizeAcpArgsForUi = (
+	toolName: AnyToolName | string,
+	rawParams: Record<string, unknown> | undefined,
+	workspaceRoot: URI | undefined
+): NormalizedParams => {
+	const src =
+		rawParams &&
+			typeof rawParams === 'object' &&
+			'args' in rawParams
+			? (rawParams as { args?: unknown }).args
+			: rawParams;
+
+	const p = _deepCamelize((src ?? {}) as Record<string, unknown>) as NormalizedParams;
+
+	if (toolName === 'read_file') {
+		normalizeReadFileParams(p);
+	}
+
+	normalizePaths(p, workspaceRoot);
+	normalizeBooleans(p);
+
 	return p;
 };
 
@@ -225,6 +294,7 @@ const _diffsToPatchUnified = (diffs: Array<{ path: string; oldText?: string; new
 
 export interface IThreadStateAccess {
 	getThreadMessages(threadId: string): ChatMessage[];
+	getThreadState(threadId: string): any;
 	getStreamState(threadId: string): any;
 	setStreamState(threadId: string, state: any): void;
 	addMessageToThread(threadId: string, message: ChatMessage): void;
@@ -738,6 +808,8 @@ export class ChatAcpHandler extends Disposable {
 
 				const rawParamsForUi: Record<string, any> = { ...(callInfo?.rawParams ?? {}) };
 				if (typeof tp.terminalId === 'string' && tp.terminalId) rawParamsForUi.terminalId = tp.terminalId;
+				if (typeof tp.cwd === 'string' && tp.cwd) rawParamsForUi.cwd = tp.cwd;
+				if (typeof tp.cwdLabel === 'string' && tp.cwdLabel) rawParamsForUi.cwdLabel = tp.cwdLabel;
 
 				const paramsForUi = callInfo?.paramsForUi
 					?? normalizeAcpArgsForUi(uiToolName, rawParamsForUi, rootUri)
@@ -748,6 +820,8 @@ export class ChatAcpHandler extends Disposable {
 				const resultForUi: any = {
 					toolCallId: id,
 					...(tp.terminalId ? { terminalId: String(tp.terminalId) } : {}),
+					...(tp.cwd ? { cwd: String(tp.cwd) } : {}),
+					...(tp.cwdLabel ? { cwdLabel: String(tp.cwdLabel) } : {}),
 					output,
 					...(typeof tp.truncated === 'boolean' ? { truncated: tp.truncated } : {}),
 					...(exitStatus ? {
@@ -894,6 +968,12 @@ export class ChatAcpHandler extends Disposable {
 					// terminalId
 					if (typeof (rObj as any).terminalId === 'string' && typeof (rawParamsForUi as any).terminalId !== 'string') {
 						(rawParamsForUi as any).terminalId = (rObj as any).terminalId;
+					}
+					if (typeof (rObj as any).cwd === 'string' && typeof (rawParamsForUi as any).cwd !== 'string') {
+						(rawParamsForUi as any).cwd = (rObj as any).cwd;
+					}
+					if (typeof (rObj as any).cwdLabel === 'string' && typeof (rawParamsForUi as any).cwdLabel !== 'string') {
+						(rawParamsForUi as any).cwdLabel = (rObj as any).cwdLabel;
 					}
 
 					// command line (best-effort, now host returns command on waitForTerminalExit)

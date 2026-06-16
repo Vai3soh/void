@@ -127,11 +127,13 @@ suite('ChatThreadService - Agent Skills explicit activation', () => {
 
 		await service.addUserMessageAndStreamResponse({ threadId, userMessage: '$code-review fix this' });
 
-		const userMessage = service.state.allThreads[threadId].messages.find(m => m.role === 'user') as any;
+		const thread = service.state.allThreads[threadId];
+		assert.ok(thread);
+		const userMessage = thread.messages.find(m => m.role === 'user') as any;
 		assert.strictEqual(userMessage.displayContent, '$code-review fix this');
 		assert.ok(userMessage.content.includes('<skill_content name="code-review">Review carefully.</skill_content>'));
 		assert.ok(userMessage.content.includes('$code-review fix this'));
-		assert.strictEqual(service.state.allThreads[threadId].state.activeSkills?.['code-review']?.source, 'explicit');
+		assert.strictEqual(thread.state.activeSkills?.['code-review']?.source, 'explicit');
 		assert.strictEqual(getActivateCalls(), 1);
 	});
 
@@ -142,7 +144,9 @@ suite('ChatThreadService - Agent Skills explicit activation', () => {
 		await service.addUserMessageAndStreamResponse({ threadId, userMessage: '$code-review first' });
 		await service.addUserMessageAndStreamResponse({ threadId, userMessage: '$code-review second' });
 
-		const userMessages = service.state.allThreads[threadId].messages.filter(m => m.role === 'user') as any[];
+		const thread = service.state.allThreads[threadId];
+		assert.ok(thread);
+		const userMessages = thread.messages.filter(m => m.role === 'user') as any[];
 		assert.ok(userMessages[0].content.includes('<skill_content name="code-review">'));
 		assert.ok(!userMessages[1].content.includes('<skill_content name="code-review">'));
 		assert.strictEqual(getActivateCalls(), 1);
@@ -154,10 +158,12 @@ suite('ChatThreadService - Agent Skills explicit activation', () => {
 
 		await service.addUserMessageAndStreamResponse({ threadId, userMessage: '$code-review fix this' });
 
-		const userMessage = service.state.allThreads[threadId].messages.find(m => m.role === 'user') as any;
+		const thread = service.state.allThreads[threadId];
+		assert.ok(thread);
+		const userMessage = thread.messages.find(m => m.role === 'user') as any;
 		assert.strictEqual(userMessage.displayContent, '$code-review fix this');
 		assert.ok(!userMessage.content.includes('<skill_content name="code-review">'));
-		assert.strictEqual(service.state.allThreads[threadId].state.activeSkills?.['code-review'], undefined);
+		assert.strictEqual(thread.state.activeSkills?.['code-review'], undefined);
 		assert.strictEqual(getActivateCalls(), 0);
 	});
 });

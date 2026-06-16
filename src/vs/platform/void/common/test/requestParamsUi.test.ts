@@ -42,7 +42,7 @@ suite('Request parameters UI template', () => {
 					'frequency_penalty', 'logit_bias', 'logprobs', 'max_tokens', 'presence_penalty', 'seed', 'stop', 'top_logprobs',
 					'temperature', 'top_p', 'top_k',
 					// excluded ones should be ignored
-					'tools', 'tool_choice', 'response_format', 'structured_outputs', 'reasoning', 'include_reasoning'
+					'tools', 'tool_choice', 'parallel_tool_calls', 'response_format', 'structured_outputs', 'reasoning', 'include_reasoning'
 				],
 				default_parameters: {
 					max_tokens: 777,
@@ -72,7 +72,7 @@ suite('Request parameters UI template', () => {
 		assert.strictEqual(tpl.temperature, 0.33);
 
 		// Exclusions
-		for (const k of ['tools', 'tool_choice', 'response_format', 'structured_outputs', 'reasoning', 'include_reasoning']) {
+		for (const k of ['tools', 'tool_choice', 'parallel_tool_calls', 'response_format', 'structured_outputs', 'reasoning', 'include_reasoning']) {
 			assert.ok(!(k in tpl), `Should not include excluded param ${k}`);
 		}
 

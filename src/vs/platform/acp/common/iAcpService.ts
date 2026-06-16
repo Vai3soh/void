@@ -1,3 +1,8 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
 import { createDecorator } from '../../instantiation/common/instantiation.js';
 import { Event } from '../../../base/common/event.js';
 import type { LLMTokenUsage } from '../../void/common/sendLLMMessageTypes.js';
@@ -29,6 +34,8 @@ export type IAcpMessageChunk =
 			id: string;
 			name: string;
 			terminalId?: string;
+			cwd?: string;
+			cwdLabel?: string;
 			output: string;
 			truncated?: boolean;
 			exitStatus?: { exitCode: number | null; signal: string | null };

@@ -19,6 +19,7 @@ import { ChatExecutionEngine } from '../../browser/ChatExecutionEngine.js';
 import { ChatAcpHandler } from '../../browser/ChatAcpHandler.js';
 import { ChatToolOutputManager } from '../../browser/ChatToolOutputManager.js';
 import { ChatHistoryCompressor } from '../../browser/ChatHistoryCompressor.js';
+import { __test as convertToLLMMessageServiceTest } from '../../browser/convertToLLMMessageService.js';
 
 function pickMethod<T extends object>(obj: T, names: string[]): (...args: any[]) => any {
 	for (const n of names) {
@@ -39,7 +40,7 @@ function isRelativeToolOutputPath(p: string): boolean {
  * Some refactors moved logic into separate classes; signatures can differ a bit.
  * This helper tries a couple of common call shapes without hiding real failures too much.
  */
-async function callWithFallbacks(fn: Function, _thisArg: any, callShapes: Array<() => Promise<any>>) {
+async function callWithFallbacks(_fn: Function, _thisArg: any, callShapes: Array<() => Promise<any>>) {
 	let firstErr: any;
 	for (let i = 0; i < callShapes.length; i++) {
 		try {
@@ -284,6 +285,172 @@ suite('ChatThreadService - terminal auto-approve overrides for dangerous command
 		}
 	};
 
+	test('non-ACP returned read-only tool calls start concurrently', async () => {
+		const threadId = 'thread-parallel-read-only';
+		const threadsState: ThreadsState = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages: [],
+					state: {
+						currCheckpointIdx: null,
+						stagingSelections: [],
+						focusedMessageIdx: undefined,
+						linksOfMessageIdx: {},
+					},
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		const toolMessages: ChatMessage[] = [];
+		const started: string[] = [];
+		let releaseReads!: () => void;
+		let resolveBothStarted!: () => void;
+		const readGate = new Promise<void>(resolve => { releaseReads = resolve; });
+		const bothStarted = new Promise<void>(resolve => { resolveBothStarted = resolve; });
+
+		const _settingsService: any = {
+			state: {
+				globalSettings: {
+					chatMode: 'normal',
+					mcpAutoApprove: false,
+					useAcp: false,
+					autoApprove: {},
+					disabledToolNames: [],
+				},
+			},
+		};
+		const _toolsService: any = {
+			validateParams: {
+				read_file: (p: any) => p,
+			},
+			callTool: {
+				read_file: async (params: any) => {
+					started.push(String(params.uri));
+					if (started.length === 2) resolveBothStarted();
+					await readGate;
+					return { result: { contents: String(params.uri) } };
+				},
+			},
+			stringOfResult: {
+				read_file: (_params: any, result: any) => String(result.contents),
+			},
+		};
+		const engine = new ChatExecutionEngine(
+			{ abort: () => { }, sendLLMMessage: () => null } as any,
+			_toolsService,
+			_settingsService,
+			{} as any,
+			{} as any,
+			{ capture: () => { } } as any,
+			{} as any,
+			{} as any,
+			{} as any,
+			toolOutputStub,
+		);
+		(engine as any).toolErrMsgs = toolErrMsgs;
+		const streamState: ThreadStreamState = {};
+		const threadAccess = makeThreadAccess(threadsState, streamState, toolMessages);
+		const runReturnedToolCalls = pickMethod(engine as any, ['_runReturnedToolCalls']);
+
+		const runPromise = Promise.resolve(runReturnedToolCalls(threadId, [
+			{ id: 'read-a', name: 'read_file', rawParams: { uri: 'a.ts' }, isDone: true, doneParams: ['uri'] } as any,
+			{ id: 'read-b', name: 'read_file', rawParams: { uri: 'b.ts' }, isDone: true, doneParams: ['uri'] } as any,
+		], { registerToolCall: () => ({ isLoop: false }) } as any, threadAccess));
+		const observedStarted = await Promise.race([
+			bothStarted.then(() => started.slice()),
+			new Promise<string[]>(resolve => setTimeout(() => resolve(started.slice()), 25)),
+		]);
+		releaseReads();
+		await runPromise;
+
+		assert.deepStrictEqual(observedStarted.sort(), ['a.ts', 'b.ts']);
+	});
+
+	test('non-ACP mutating tool waits for pending read-only batch', async () => {
+		const threadId = 'thread-read-before-edit';
+		const threadsState: ThreadsState = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages: [],
+					state: {
+						currCheckpointIdx: null,
+						stagingSelections: [],
+						focusedMessageIdx: undefined,
+						linksOfMessageIdx: {},
+					},
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		const events: string[] = [];
+		const _settingsService: any = {
+			state: {
+				globalSettings: {
+					chatMode: 'normal',
+					mcpAutoApprove: false,
+					useAcp: false,
+					autoApprove: { edits: true },
+					disabledToolNames: [],
+				},
+			},
+		};
+		const _toolsService: any = {
+			validateParams: {
+				read_file: (p: any) => p,
+				edit_file: (p: any) => p,
+			},
+			callTool: {
+				read_file: async () => {
+					events.push('read-start');
+					await new Promise(resolve => setTimeout(resolve, 15));
+					events.push('read-end');
+					return { result: { contents: 'old' } };
+				},
+				edit_file: async () => {
+					events.push('edit-start');
+					return { result: { applied: true } };
+				},
+			},
+			stringOfResult: {
+				read_file: (_params: any, result: any) => String(result.contents),
+				edit_file: () => 'applied',
+			},
+		};
+		const engine = new ChatExecutionEngine(
+			{ abort: () => { }, sendLLMMessage: () => null } as any,
+			_toolsService,
+			_settingsService,
+			{} as any,
+			{} as any,
+			{ capture: () => { } } as any,
+			{} as any,
+			{} as any,
+			{} as any,
+			toolOutputStub,
+		);
+		(engine as any).toolErrMsgs = toolErrMsgs;
+		const streamState: ThreadStreamState = {};
+		const threadAccess = makeThreadAccess(threadsState, streamState, []);
+		const runReturnedToolCalls = pickMethod(engine as any, ['_runReturnedToolCalls']);
+
+		await Promise.resolve(runReturnedToolCalls(threadId, [
+			{ id: 'read-a', name: 'read_file', rawParams: { uri: 'a.ts' }, isDone: true, doneParams: ['uri'] } as any,
+			{ id: 'edit-a', name: 'edit_file', rawParams: { uri: 'a.ts', originalSnippet: 'old', updatedSnippet: 'new' }, isDone: true, doneParams: ['uri'] } as any,
+		], { registerToolCall: () => ({ isLoop: false }) } as any, threadAccess));
+
+		assert.ok(events.indexOf('read-end') !== -1, 'read must finish');
+		assert.ok(events.indexOf('edit-start') !== -1, 'edit must start');
+		assert.ok(events.indexOf('read-end') < events.indexOf('edit-start'), 'edit must wait for pending read-only batch');
+	});
+
 	test('dangerous run_command always requires manual approval even when terminal auto-approve is enabled', async () => {
 		const threadId = 'thread-1';
 
@@ -454,6 +621,114 @@ suite('ChatThreadService - terminal auto-approve overrides for dangerous command
 		// Auto-approved path: we should see running_now and success (no tool_request).
 		assert.ok(toolMessages.some(m => (m as any).type === 'running_now'), 'running_now message should be present');
 		assert.ok(toolMessages.some(m => (m as any).type === 'success'), 'success message should be present');
+	});
+
+	test('run_command final success replaces running progress with canonical output for UI and model history', async () => {
+		const threadId = 'thread-canonical-run-command';
+		const command = 'openspec status --json';
+		const canonicalOutput = `$ ${command}\n{"schemaName":"spec-driven"}\n(exit code 0)`;
+
+		const threadsState: ThreadsState = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages: [],
+					state: {
+						currCheckpointIdx: null,
+						stagingSelections: [],
+						focusedMessageIdx: undefined,
+						linksOfMessageIdx: {},
+					},
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+
+		const toolMessages: ChatMessage[] = [];
+
+		const _settingsService: any = {
+			state: {
+				globalSettings: {
+					chatMode: 'normal',
+					mcpAutoApprove: false,
+					useAcp: false,
+					autoApprove: { terminal: true },
+				},
+			},
+		};
+
+		const _toolsService: any = {
+			validateParams: {
+				run_command: (p: any) => p,
+			},
+			callTool: {
+				run_command: async (_params: any, ctx?: { onOutput?: (chunk: string) => void }) => {
+					ctx?.onOutput?.(`vscode \\u279c /workspaces/void $ ${command}\n{"schemaName":"spec-driven"}\n`);
+					return {
+						result: {
+							resolveReason: { type: 'done', exitCode: 0 },
+							result: canonicalOutput,
+							output: canonicalOutput,
+							cwd: '/workspaces/void',
+							cwdLabel: '.',
+							exitCode: 0,
+						}
+					};
+				},
+			},
+			stringOfResult: {
+				run_command: (_params: any, result: any) => result.result,
+			},
+		};
+
+		const engine = new ChatExecutionEngine(
+			/* llm */ { abort: () => { }, sendLLMMessage: () => null } as any,
+			_toolsService,
+			_settingsService,
+			/* lmTools */ {} as any,
+			{} as any,
+			/* metrics */ { capture: () => { } } as any,
+			/* convert */ {} as any,
+			/* fileService */ {} as any,
+			/* history */ {} as any,
+			/* toolOutput */ toolOutputStub,
+		);
+		(engine as any).toolErrMsgs = toolErrMsgs;
+
+		const streamState: ThreadStreamState = {};
+		const threadAccess = makeThreadAccess(threadsState, streamState, toolMessages);
+		const runToolCall = pickMethod(engine as any, ['_runToolCall', 'runToolCall']);
+
+		const res = await callWithFallbacks(runToolCall, engine, [
+			() => Promise.resolve(runToolCall(threadId, 'run_command', 'tool-canonical', { preapproved: false, unvalidatedToolParams: { command } }, threadAccess)),
+			() => Promise.resolve(runToolCall({ threadId, toolName: 'run_command', toolCallId: 'tool-canonical', preapproved: false, unvalidatedToolParams: { command } }, threadAccess)),
+		]);
+
+		assert.strictEqual(res.awaitingUserApproval, undefined);
+		assert.strictEqual(res.interrupted, undefined);
+
+		const thread = threadsState.allThreads[threadId];
+		assert.ok(thread);
+		const threadMessages = thread.messages as any[];
+		assert.strictEqual(threadMessages.length, 1, 'running_now should be replaced by the final success tool message');
+
+		const finalTool = threadMessages[0];
+		assert.strictEqual(finalTool.type, 'success');
+		assert.strictEqual(finalTool.content, canonicalOutput);
+		assert.strictEqual(finalTool.displayContent, canonicalOutput);
+		assert.ok(!finalTool.content.includes('(cwd='));
+		assert.strictEqual((finalTool.content.match(new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) ?? []).length, 1);
+
+		const modelMessages = convertToLLMMessageServiceTest.prepareOpenAIToolsMessages([
+			{ role: 'assistant', content: 'checking', anthropicReasoning: null },
+			{ role: 'tool', id: finalTool.id, name: finalTool.name, rawParams: finalTool.rawParams, content: finalTool.content },
+		] as any) as any[];
+
+		assert.strictEqual(modelMessages[1].role, 'tool');
+		assert.strictEqual(modelMessages[1].content, canonicalOutput);
 	});
 });
 

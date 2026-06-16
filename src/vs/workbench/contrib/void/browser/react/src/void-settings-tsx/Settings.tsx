@@ -21,12 +21,14 @@ import { ToolApprovalType, toolApprovalTypes } from '../../../../../../../platfo
 import Severity from '../../../../../../../base/common/severity.js';
 import type { RequestParamsConfig, ParameterInjectionMode } from '../../../../../../../platform/void/common/sendLLMMessageTypes.js';
 import { computeRequestParamsTemplate, filterSupportedParams } from '../../../../../../../platform/void/common/requestParams.js';
+import { DEFAULT_PARALLEL_TOOL_CALLS_MODE, parseParallelToolCallsMode, type ParallelToolCallsMode } from '../../../../../../../platform/void/common/parallelToolCalls.js';
 import { parseAcpProcessArgs } from '../../../../../../../platform/void/common/acpArgs.js';
 import { TransferEditorType } from '../../../extensionTransferTypes.js';
 import { MCPServer, removeMCPToolNamePrefix } from '../../../../../../../platform/void/common/mcpServiceTypes.js';
 import { toolNames as staticToolNames } from '../../../../../../../platform/void/common/toolsRegistry.js';
 import { ILanguageModelToolsService, IToolData } from '../../../../../chat/common/languageModelToolsService.js';
 import '../../../../../../../platform/void/common/providerReg.js';
+import { filterDynamicProviderModels, isDynamicProviderFreeModel, type DynamicProviderModelSearchResult } from './dynamicProviderModelSearch.js';
 
 type Tab = 'models' | 'mcp' | 'allTools' | 'feature' | 'options' | 'general';
 
@@ -526,6 +528,9 @@ const DynamicModelSettingsDialog = ({
 	const [toolFormatPreset, setToolFormatPreset] = useState<ToolFormatPreset>('inherit');
 	type SystemMessagePreset = 'inherit' | 'false' | 'system-role' | 'developer-role' | 'separated';
 	const [systemPreset, setSystemPreset] = useState<SystemMessagePreset>('inherit');
+	type ParallelSupportPreset = 'inherit' | 'true' | 'false';
+	const [parallelSupportPreset, setParallelSupportPreset] = useState<ParallelSupportPreset>('inherit');
+	const [parallelToolCallsMode, setParallelToolCallsMode] = useState<ParallelToolCallsMode>(DEFAULT_PARALLEL_TOOL_CALLS_MODE);
 
 
 	const allowedKeys = [
@@ -534,6 +539,7 @@ const DynamicModelSettingsDialog = ({
 		'supportsSystemMessage',
 		'specialToolFormat',
 		'supportsFIM',
+		'supportsParallelToolCalls',
 		'reasoningCapabilities',
 		'supportCacheControl',
 	] as const;
@@ -575,6 +581,12 @@ const DynamicModelSettingsDialog = ({
 		return 'inherit';
 	};
 
+	const inferParallelSupportPreset = (caps: any): ParallelSupportPreset => {
+		if (caps?.supportsParallelToolCalls === true) return 'true';
+		if (caps?.supportsParallelToolCalls === false) return 'false';
+		return 'inherit';
+	};
+
 	useEffect(() => {
 		let cancelled = false;
 		const load = async () => {
@@ -605,6 +617,8 @@ const DynamicModelSettingsDialog = ({
 				setPreset(inferPresetFromRC(rcOverride));
 				setToolFormatPreset(inferToolFormatPreset(ov ?? {}));
 				setSystemPreset(inferSystemPreset(ov ?? {}));
+				setParallelSupportPreset(inferParallelSupportPreset(ov ?? {}));
+				setParallelToolCallsMode(DEFAULT_PARALLEL_TOOL_CALLS_MODE);
 
 				// compute default request params to display
 				try {
@@ -630,6 +644,12 @@ const DynamicModelSettingsDialog = ({
 					const cp = (accessor.get('IVoidSettingsService') as any).state.customProviders?.[slug] || {};
 					const perModel: Record<string, any> = cp.perModel || {};
 					const cfg = perModel[modelId];
+					const storedParallelToolCallsMode = parseParallelToolCallsMode(cfg?.parallelToolCallsMode);
+					setParallelToolCallsMode(
+						storedParallelToolCallsMode === 'enabled'
+							? 'enabled'
+							: DEFAULT_PARALLEL_TOOL_CALLS_MODE
+					);
 					const rp = (cfg?.requestParams ?? {}) as RequestParamsConfig;
 					if (rp && (rp.mode === 'default' || rp.mode === 'off' || rp.mode === 'override')) {
 						setParamMode(rp.mode);
@@ -790,6 +810,48 @@ const DynamicModelSettingsDialog = ({
 		}
 	};
 
+	const applyParallelSupportPreset = (kind: ParallelSupportPreset) => {
+		if (!overrideEnabled) return;
+		const applyToObj = (obj: any) => {
+			if (kind === 'inherit') {
+				delete obj.supportsParallelToolCalls;
+			} else {
+				obj.supportsParallelToolCalls = kind === 'true';
+			}
+		};
+		try {
+			const obj = JSON.parse(jsonText || '{}');
+			applyToObj(obj);
+			setJsonText(JSON.stringify(obj, null, 2));
+		} catch {
+			try {
+				const obj = JSON.parse(placeholder || '{}');
+				applyToObj(obj);
+				setJsonText(JSON.stringify(obj, null, 2));
+			} catch { /* ignore */ }
+		}
+	};
+
+	const draftSupportsParallelToolCalls = useMemo(() => {
+		if (overrideEnabled) {
+			try {
+				const parsed = JSON.parse(jsonText || '{}');
+				if (parsed?.supportsParallelToolCalls === true) return true;
+				if (parsed?.supportsParallelToolCalls === false) return false;
+			} catch { /* ignore */ }
+		}
+		return effectiveCaps?.supportsParallelToolCalls === true;
+	}, [effectiveCaps, jsonText, overrideEnabled]);
+
+	const applyParallelToolCallsModeToPerModel = (cfg: any) => {
+		const mode = parseParallelToolCallsMode(parallelToolCallsMode) ?? DEFAULT_PARALLEL_TOOL_CALLS_MODE;
+		if (mode === DEFAULT_PARALLEL_TOOL_CALLS_MODE) {
+			delete cfg.parallelToolCallsMode;
+		} else {
+			cfg.parallelToolCallsMode = mode;
+		}
+	};
+
 	const onSave = async () => {
 		if (!slug || !modelId) return;
 		if (!overrideEnabled) {
@@ -811,6 +873,7 @@ const DynamicModelSettingsDialog = ({
 				} else {
 					perModel[modelId].requestParams = { mode: paramMode } as RequestParamsConfig;
 				}
+				applyParallelToolCallsModeToPerModel(perModel[modelId]);
 
 				// Provider routing: persist raw object when enabled, clear otherwise
 				if (isOpenRouter) {
@@ -876,6 +939,7 @@ const DynamicModelSettingsDialog = ({
 					rp = { mode: 'default' };
 				}
 				perModel[modelId].requestParams = rp;
+				applyParallelToolCallsModeToPerModel(perModel[modelId]);
 
 				// Provider routing alongside overrides
 				if (isOpenRouter) {
@@ -928,6 +992,24 @@ const DynamicModelSettingsDialog = ({
 				<div className="flex items-center gap-2 mb-2">
 					<VoidSwitch size="xs" value={overrideEnabled} onChange={setOverrideEnabled} />
 					<span className="text-void-fg-3 text-sm">Override model defaults</span>
+				</div>
+
+				<div className="mt-3">
+					<div className="text-xs text-void-fg-3 mb-1">parallel_tool_calls</div>
+					<div className="flex items-center gap-2 text-xs">
+						<VoidCustomDropdownBox
+							options={['safe-disabled', 'enabled'] as ParallelToolCallsMode[]}
+							selectedOption={parallelToolCallsMode}
+							onChangeOption={(opt) => setParallelToolCallsMode((parseParallelToolCallsMode(opt) ?? DEFAULT_PARALLEL_TOOL_CALLS_MODE))}
+							getOptionDisplayName={(o) => o === 'enabled' ? 'Enabled' : 'Safe disabled'}
+							getOptionDropdownName={(o) => o === 'enabled' ? 'Enabled' : 'Safe disabled'}
+							getOptionsEqual={(a, b) => a === b}
+							className="text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-1 rounded p-0.5 px-1"
+						/>
+						<span className="text-xs text-void-fg-3">
+							{draftSupportsParallelToolCalls ? 'Supported' : 'Not supported by current model defaults'}
+						</span>
+					</div>
 				</div>
 
 				{/* Request parameter injection (OpenRouter supported parameters) */}
@@ -1079,6 +1161,28 @@ const DynamicModelSettingsDialog = ({
 								))}
 							</div>
 						</div>
+						<div>
+							<div className="text-xs text-void-fg-3 mb-1">Quick presets for parallel tool support (supportsParallelToolCalls)</div>
+							<div className="flex gap-1 flex-wrap">
+								{(['inherit', 'true', 'false'] as ParallelSupportPreset[]).map((k) => (
+									<button
+										key={k}
+										className={`text-xs px-2 py-1 rounded border ${parallelSupportPreset === k ? 'border-[#0e70c0] text-white bg-[#0e70c0]' : 'border-void-border-2 hover:border-void-border-1'}`}
+										onClick={() => {
+											setParallelSupportPreset(k);
+											applyParallelSupportPreset(k);
+										}}
+										title={
+											k === 'inherit'
+												? 'Use provider metadata'
+												: `Set supportsParallelToolCalls=${k}`
+										}
+									>
+										{k === 'inherit' ? 'Inherit' : (k === 'true' ? 'Yes' : 'No')}
+									</button>
+								))}
+							</div>
+						</div>
 					</div>
 				)}
 
@@ -1121,6 +1225,7 @@ export const DynamicProviderModels = () => {
 	const [renameTarget, setRenameTarget] = useState<{ slug: string; oldName: string } | null>(null);
 	const [renameValue, setRenameValue] = useState<string>('');
 	const [showFreeOnly, setShowFreeOnly] = useState<Record<string, boolean>>({});
+	const [modelSearchBySlug, setModelSearchBySlug] = useState<Record<string, string>>({});
 	const [modelsCollapsedBySlug, setModelsCollapsedBySlug] = useState<Record<string, boolean>>({});
 	const [, force] = useState(0);
 	// allow-any-unicode-next-line
@@ -1129,8 +1234,6 @@ export const DynamicProviderModels = () => {
 	const isOpenRouterSlug = (slug: string) => String(slug).toLowerCase() === 'openrouter';
 
 	const toShortName = (id: string) => id;
-
-	const isFreeVariant = (name: string) => name.endsWith(':free') || name.includes(':free');
 
 	const snapshot = useCallback(() => {
 		try {
@@ -1167,18 +1270,14 @@ export const DynamicProviderModels = () => {
 		try { return registry.getProviderModels(slug) || []; } catch { return []; }
 	};
 
-
-	const visibleModelsOf = (slug: string): string[] => {
-		const models = Array.from(new Set(rawModelsOf(slug)));
-		const onlyFree = !!showFreeOnly[slug];
-		if (onlyFree) return models.filter(isFreeVariant);
-		return models;
-	};
-
-	const hasFreeModels = (slug: string): boolean => {
-		const raw = rawModelsOf(slug);
-
-		return raw.some(id => isFreeVariant(id));
+	const emptyModelMessageOf = (filterResult: DynamicProviderModelSearchResult): string => {
+		if (filterResult.emptyState === 'no-search-results') {
+			return `No models match "${filterResult.searchQuery}".`;
+		}
+		if (filterResult.emptyState === 'no-free-models') {
+			return 'No free models.';
+		}
+		return 'No models yet. Click Refresh models or add manually below.';
 	};
 
 	const onRefresh = async (slug: string) => {
@@ -1205,7 +1304,7 @@ export const DynamicProviderModels = () => {
 			}
 			await registry.setProviderModels(slug, [...raw, m]);
 		} else {
-			if (isFreeVariant(m)) {
+			if (isDynamicProviderFreeModel(m)) {
 				setManualAdd(s => ({ ...s, [slug]: '' }));
 				return;
 			}
@@ -1262,12 +1361,14 @@ export const DynamicProviderModels = () => {
 			) : (
 				<div className="flex flex-col gap-4">
 					{configured.map(slug => {
-						const models = visibleModelsOf(slug);
+						const rawModels = rawModelsOf(slug);
+						const onlyFree = !!showFreeOnly[slug];
+						const searchQuery = modelSearchBySlug[slug] || '';
+						const modelFilter = filterDynamicProviderModels(rawModels, { showFreeOnly: onlyFree, searchQuery });
+						const models = modelFilter.models;
 						const s = (() => {
 							try { return registry.getUserProviderSettings(slug) || {}; } catch { return {}; }
 						})();
-						const hasFree = hasFreeModels(slug);
-						const onlyFree = !!showFreeOnly[slug];
 						const isCollapsed = !!modelsCollapsedBySlug[slug];
 
 						return (
@@ -1275,7 +1376,7 @@ export const DynamicProviderModels = () => {
 								<div className="flex items-center justify-between">
 									<div className="font-medium" title={slug}>{displayNameOf(slug)}</div>
 									<div className="flex items-center gap-3">
-										{hasFree && (
+										{(modelFilter.hasModels || onlyFree) && (
 											<label className="flex items-center gap-1 text-xs">
 												<input
 													type="checkbox"
@@ -1314,19 +1415,64 @@ export const DynamicProviderModels = () => {
 											className={`h-3 w-3 transition-transform ${isCollapsed ? '' : 'rotate-90'}`}
 										/>
 										<span>
-											Models{models.length ? ` (${models.length})` : ''}
+											Models ({models.length})
 										</span>
 									</button>
 									{!isCollapsed && (
-										models.length === 0 ? (
-											<div className="text-xs text-void-fg-4">
-												{onlyFree ? 'No free models.' : 'No models yet. Click Refresh models or add manually below.'}
+										<div className="flex flex-col gap-2">
+											<div className="relative max-w-md">
+												<VoidSimpleInputBox
+													value={searchQuery}
+													onChangeValue={(v) => setModelSearchBySlug(s => ({ ...s, [slug]: v }))}
+													placeholder="Search models"
+													className="pr-8 text-xs"
+													aria-label={`${displayNameOf(slug)} model search`}
+													compact
+												/>
+												{modelFilter.isSearchActive && (
+													<button
+														type="button"
+														className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 text-void-fg-4 hover:text-void-fg-1"
+														onClick={() => setModelSearchBySlug(s => ({ ...s, [slug]: '' }))}
+														title="Clear model search"
+													>
+														<X className="h-3 w-3" />
+													</button>
+												)}
 											</div>
-										) : (
-											<div className="flex flex-wrap gap-2">
-												{models.map(visibleName => {
-													const isRenaming = !!renameTarget && renameTarget.slug === slug && renameTarget.oldName === visibleName;
-													if (isRenaming) {
+											{models.length === 0 ? (
+												<div className="text-xs text-void-fg-4">
+													{emptyModelMessageOf(modelFilter)}
+												</div>
+											) : (
+												<div className="flex flex-wrap gap-2">
+													{models.map(visibleName => {
+														const isRenaming = !!renameTarget && renameTarget.slug === slug && renameTarget.oldName === visibleName;
+														if (isRenaming) {
+															return (
+																<div
+																	key={`${slug}::${visibleName}`}
+																	className="text-xs border border-void-border-2 rounded px-2 py-0.5 flex items-center gap-2"
+																	onContextMenu={(e) => { e.preventDefault(); openRename(slug, visibleName); }}
+																	title="Right-click to rename; click name to edit overrides"
+																>
+																	<div className="flex items-center gap-1">
+																		<input
+																			className="text-xs bg-void-bg-1 border border-void-border-2 rounded px-1 py-0.5"
+																			value={renameValue}
+																			onChange={(e) => setRenameValue(e.target.value)}
+																			onKeyDown={(e) => {
+																				if (e.key === 'Enter') commitRename();
+																				if (e.key === 'Escape') cancelRename();
+																			}}
+																			autoFocus
+																		/>
+																		<button className="text-void-fg-3 hover:text-void-fg-1" onClick={commitRename}>Save</button>
+																		<button className="text-void-fg-4 hover:text-void-fg-2" onClick={cancelRename}>Cancel</button>
+																	</div>
+																</div>
+															);
+														}
 														return (
 															<div
 																key={`${slug}::${visibleName}`}
@@ -1334,48 +1480,26 @@ export const DynamicProviderModels = () => {
 																onContextMenu={(e) => { e.preventDefault(); openRename(slug, visibleName); }}
 																title="Right-click to rename; click name to edit overrides"
 															>
-																<div className="flex items-center gap-1">
-																	<input
-																		className="text-xs bg-void-bg-1 border border-void-border-2 rounded px-1 py-0.5"
-																		value={renameValue}
-																		onChange={(e) => setRenameValue(e.target.value)}
-																		onKeyDown={(e) => {
-																			if (e.key === 'Enter') commitRename();
-																			if (e.key === 'Escape') cancelRename();
-																		}}
-																		autoFocus
-																	/>
-																	<button className="text-void-fg-3 hover:text-void-fg-1" onClick={commitRename}>Save</button>
-																	<button className="text-void-fg-4 hover:text-void-fg-2" onClick={cancelRename}>Cancel</button>
-																</div>
+																<button
+																	className="truncate hover:underline"
+																	onClick={() => setOpenModel({ slug, modelId: visibleName })}
+																>
+																	{visibleName}
+																</button>
+																<button
+																	className="text-void-fg-4 hover:text-void-fg-2"
+																	onClick={() => onRemoveModel(slug, visibleName)}
+																	title="Remove model"
+																>
+																	{removeModelIcon}
+																</button>
 															</div>
 														);
-													}
-													return (
-														<div
-															key={`${slug}::${visibleName}`}
-															className="text-xs border border-void-border-2 rounded px-2 py-0.5 flex items-center gap-2"
-															onContextMenu={(e) => { e.preventDefault(); openRename(slug, visibleName); }}
-															title="Right-click to rename; click name to edit overrides"
-														>
-															<button
-																className="truncate hover:underline"
-																onClick={() => setOpenModel({ slug, modelId: visibleName })}
-															>
-																{visibleName}
-															</button>
-															<button
-																className="text-void-fg-4 hover:text-void-fg-2"
-																onClick={() => onRemoveModel(slug, visibleName)}
-																title="Remove model"
-															>
-																{removeModelIcon}
-															</button>
-														</div>
-													);
-												})}
-											</div>
-										))}
+													})}
+												</div>
+											)}
+										</div>
+									)}
 								</div>
 
 								<div className="flex items-center gap-2">
@@ -2320,21 +2444,36 @@ export const Settings = () => {
 																			/>
 																		</div>
 																	</div>
-																	<div className='flex items-center gap-x-2'>
-																		<span className='w-56'>Read File Chunk Lines</span>
-																		<div className='w-20'>
-																			<VoidSimpleInputBox
-																				compact
-																				placeholder={String(defaultGlobalSettings.readFileChunkLines)}
-																				value={String(settingsState.globalSettings.readFileChunkLines ?? defaultGlobalSettings.readFileChunkLines)}
-																				onChangeValue={(raw) => {
-																					const n = parseInt(raw, 10)
-																					const safe = Number.isFinite(n) && n > 0 ? n : 200
-																					voidSettingsService.setGlobalSetting('readFileChunkLines', safe)
-																				}}
-																			/>
-																		</div>
-																	</div>
+																																												<div className='flex items-center gap-x-2'>
+																												<span className='w-56'>Read File Chunk Lines</span>
+																												<div className='w-20'>
+																													<VoidSimpleInputBox
+																														compact
+																														placeholder={String(defaultGlobalSettings.readFileChunkLines)}
+																														value={String(settingsState.globalSettings.readFileChunkLines ?? defaultGlobalSettings.readFileChunkLines)}
+																														onChangeValue={(raw) => {
+																															const n = parseInt(raw, 10)
+																															const safe = Number.isFinite(n) && n > 0 ? n : 200
+																															voidSettingsService.setGlobalSetting('readFileChunkLines', safe)
+																														}}
+																													/>
+																												</div>
+																											</div>
+																											<div className='flex items-center gap-x-2'>
+																												<span className='w-56'>Terminal Command Timeout (minutes)</span>
+																												<div className='w-20'>
+																													<VoidSimpleInputBox
+																														compact
+																														placeholder={String(defaultGlobalSettings.terminalCommandTimeoutMinutes)}
+																														value={String(settingsState.globalSettings.terminalCommandTimeoutMinutes ?? defaultGlobalSettings.terminalCommandTimeoutMinutes)}
+																														onChangeValue={(raw) => {
+																															const n = parseInt(raw, 10)
+																															const safe = Number.isFinite(n) && n > 0 ? n : defaultGlobalSettings.terminalCommandTimeoutMinutes
+																															voidSettingsService.setGlobalSetting('terminalCommandTimeoutMinutes', safe)
+																														}}
+																													/>
+																												</div>
+																											</div>
 																	<div className='flex items-center gap-x-2 mt-1'>
 																		<VoidSwitch
 																			size='xs'

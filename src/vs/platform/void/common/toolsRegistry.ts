@@ -3,10 +3,6 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import {
-	MAX_TERMINAL_BG_COMMAND_TIME,
-	MAX_TERMINAL_INACTIVE_TIME,
-} from './prompt/constants.js';
 
 import {
 	ToolCallParams, ToolResultType,
@@ -169,32 +165,12 @@ export const voidTools
 		},
 		run_command: {
 			name: 'run_command',
-			description: `Runs a terminal command and waits for the result (times out after ${MAX_TERMINAL_INACTIVE_TIME}s of inactivity). ${terminalDescHelper}`,
+			description: `Runs a terminal command and waits for the result. ${terminalDescHelper}`,
 			params: {
 				command: { description: 'The terminal command to run.' },
 				cwd: { description: cwdHelper },
 			},
 		},
-		run_persistent_command: {
-			name: 'run_persistent_command',
-			description: `Runs a terminal command in the persistent terminal created with open_persistent_terminal (results after ${MAX_TERMINAL_BG_COMMAND_TIME}s are returned, command continues in background). ${terminalDescHelper}`,
-			params: {
-				command: { description: 'The terminal command to run.' },
-				persistent_terminal_id: { description: 'The ID of the terminal created using open_persistent_terminal.' },
-			},
-		},
-		open_persistent_terminal: {
-			name: 'open_persistent_terminal',
-			description: 'Open a new persistent terminal (e.g. for npm run dev).',
-			params: {
-				cwd: { description: cwdHelper },
-			}
-		},
-		kill_persistent_terminal: {
-			name: 'kill_persistent_terminal',
-			description: 'Interrupt and close a persistent terminal opened with open_persistent_terminal.',
-			params: { persistent_terminal_id: { description: 'The ID of the persistent terminal.' } }
-		}
 	} satisfies { [T in keyof ToolResultType]: InternalToolInfo };
 
 export const toolNames = Object.keys(voidTools) as ToolName[];

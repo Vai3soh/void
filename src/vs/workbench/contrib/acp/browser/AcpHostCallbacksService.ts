@@ -1,3 +1,8 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
 import { VSBuffer } from '../../../../base/common/buffer.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { URI } from '../../../../base/common/uri.js';
@@ -13,6 +18,7 @@ import { approvalTypeOfToolName } from '../../../../platform/void/common/toolsSe
 import { isAToolName } from '../../void/common/prompt/prompts.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { computeTruncatedToolOutput } from '../../../../platform/void/common/toolOutputTruncation.js';
+import { normalizeTerminalCommandOutput, normalizeTerminalCwdLabel } from '../../../../platform/void/common/terminalToolOutput.js';
 
 import {
 	toolOutputFileName,
@@ -51,6 +57,21 @@ export class AcpHostCallbacksService {
 		}
 	}
 
+	private _workspaceFolderFsPaths(): string[] {
+		try {
+			const ws = this.instantiationService.invokeFunction(a => a.get(IWorkspaceContextService));
+			return ws.getWorkspace().folders
+				.map(folder => folder.uri.fsPath)
+				.filter(path => typeof path === 'string' && path.length > 0);
+		} catch {
+			return [];
+		}
+	}
+
+	private _defaultCwdForDisplay(): string | null {
+		return this._getWorkspaceRoot()?.fsPath ?? null;
+	}
+
 	private _unwrapDeepRunResult(res: any): any {
 		// Some terminal services return { result, resolveReason } (and sometimes nested result.result...)
 		let cur = res;
@@ -83,6 +104,16 @@ export class AcpHostCallbacksService {
 			if (Number.isFinite(n) && n > 0) return n;
 		} catch { /* ignore */ }
 		return defaultGlobalSettings.readFileChunkLines;
+	}
+
+	private _getTerminalCommandTimeoutMinutes(): number {
+		try {
+			const vss = this.instantiationService.invokeFunction(a => a.get(IVoidSettingsService));
+			const raw = (vss?.state as any)?.globalSettings?.terminalCommandTimeoutMinutes;
+			const n = typeof raw === 'number' ? raw : (typeof raw === 'string' ? Number(raw) : NaN);
+			if (Number.isFinite(n) && n > 0) return n;
+		} catch { /* ignore */ }
+		return defaultGlobalSettings.terminalCommandTimeoutMinutes;
 	}
 
 	private _countLines(text: string): number {
@@ -365,6 +396,8 @@ export class AcpHostCallbacksService {
 		outputPumpPromise?: Promise<void>;
 		outputByteLimit?: number;
 		commandLine?: string;
+		cwd?: string;
+		cwdLabel?: string;
 		runType?: 'ephemeral' | 'persistent';
 		finalOutput?: string;
 
@@ -388,7 +421,54 @@ export class AcpHostCallbacksService {
 
 	private _extractExitStatusFromRunResult(res: any): TerminalExitStatus {
 		try {
+			const readStatus = (r: any): TerminalExitStatus | null => {
+				if (!r || typeof r !== 'object') return null;
+
+				const rr = (r as any).resolveReason;
+				if (rr && typeof rr === 'object') {
+					const rrType = String((rr as any).type ?? '');
+					if (rrType === 'done' && typeof (rr as any).exitCode === 'number' && Number.isFinite((rr as any).exitCode)) {
+						return { exitCode: (rr as any).exitCode, signal: null };
+					}
+					if (rrType === 'timeout') {
+						return { exitCode: null, signal: null };
+					}
+				}
+
+				const es = (r && typeof r === 'object') ? (r as any).exitStatus : undefined;
+				if (es && typeof es === 'object') {
+					let exitCode: number | null = null;
+					let signal: string | null = null;
+					const ec = (es as any).exitCode;
+					const sg = (es as any).signal;
+					if (typeof ec === 'number' && Number.isFinite(ec)) exitCode = ec;
+					else if (ec === null) exitCode = null;
+					if (typeof sg === 'string') signal = sg;
+					else if (sg === null) signal = null;
+					return { exitCode, signal };
+				}
+
+				let exitCode: number | null = null;
+				let signal: string | null = null;
+				if (typeof (r as any).exitCode === 'number' && Number.isFinite((r as any).exitCode)) exitCode = (r as any).exitCode;
+				else if ((r as any).exitCode === null) exitCode = null;
+				else if (typeof (r as any).code === 'number' && Number.isFinite((r as any).code)) exitCode = (r as any).code;
+				else if (typeof (r as any).status === 'number' && Number.isFinite((r as any).status)) exitCode = (r as any).status;
+
+				if (typeof (r as any).signal === 'string') signal = (r as any).signal;
+				else if ((r as any).signal === null) signal = null;
+
+				if (exitCode !== null || signal !== null || (r as any).exitCode === null) return { exitCode, signal };
+				return null;
+			};
+
+			const direct = readStatus(res);
+			if (direct) return direct;
+
 			const r = this._unwrapDeepRunResult(res) ?? {};
+			const nested = readStatus(r);
+			if (nested) return nested;
+
 			let exitCode: number | null = null;
 			let signal: string | null = null;
 
@@ -729,6 +809,8 @@ export class AcpHostCallbacksService {
 
 				const args = p?.args;
 				const cwd: string | null = (p?.cwd ?? null) === null ? null : String(p?.cwd);
+				const cwdForDisplay = cwd ?? this._defaultCwdForDisplay();
+				const cwdLabel = normalizeTerminalCwdLabel(cwdForDisplay, this._workspaceFolderFsPaths());
 
 				const envArr: EnvVar[] = Array.isArray(p?.env) ? p.env : [];
 				const envObj: Record<string, string> = {};
@@ -772,6 +854,8 @@ export class AcpHostCallbacksService {
 					runPromise: Promise.resolve(),
 					outputByteLimit,
 					commandLine: cmdLine,
+					...(cwdForDisplay ? { cwd: cwdForDisplay } : {}),
+					...(cwdLabel ? { cwdLabel } : {}),
 					runType,
 					finalOutput: '',
 					startedAt: Date.now(),
@@ -807,28 +891,51 @@ export class AcpHostCallbacksService {
 						const finalRes = await this._awaitFinalRunResult(startRes);
 						const payload = this._unwrapDeepRunResult(finalRes);
 
-						// merge final output (prefer longer)
+						// Merge final output from the terminal service, then normalize once.
 						let out = this._extractOutputFromRunResult(payload);
 						const st = this._terminalStateById.get(terminalId);
-						if (st) {
-							const prev = String(st.finalOutput ?? '');
-							if (out && out.length >= prev.length) st.finalOutput = out;
-							else if (!out) out = prev;
-						}
 
 						// resolveReason mapping (timeout vs done)
-						const rr = payload && typeof payload === 'object' ? (payload as any).resolveReason : undefined;
+						const rr = finalRes && typeof finalRes === 'object'
+							? (finalRes as any).resolveReason
+							: (payload && typeof payload === 'object' ? (payload as any).resolveReason : undefined);
 						const rrType = rr && typeof rr === 'object' ? String((rr as any).type ?? '') : '';
+						let exitCode: number | null;
+						let signal: string | null;
 
 						if (rrType === 'timeout') {
-							// Host-side inactivity timeout
-							this._markTerminalDone(terminalId, 124, 'VOID_INACTIVITY_TIMEOUT');
+							exitCode = null;
+							signal = null;
+							const timeoutMinutes = this._getTerminalCommandTimeoutMinutes();
+							const timeoutMessage = `Terminal command run, but was stopped by Void because it exceeded the configured terminal command timeout (${timeoutMinutes} minutes).`;
+							if (out) out = `${out}\n${timeoutMessage}`;
+							else out = timeoutMessage;
 						} else if (rrType === 'done' && typeof (rr as any)?.exitCode === 'number') {
-							this._markTerminalDone(terminalId, (rr as any).exitCode, null);
+							exitCode = (rr as any).exitCode;
+							signal = null;
 						} else {
-							const { exitCode, signal } = this._extractExitStatusFromRunResult(payload);
-							this._markTerminalDone(terminalId, exitCode, signal);
+							const extracted = this._extractExitStatusFromRunResult(finalRes);
+							exitCode = extracted.exitCode;
+							signal = extracted.signal;
 						}
+
+						if (st) {
+							const prev = String(st.finalOutput ?? '');
+							if (!out) out = prev;
+							const normalized = normalizeTerminalCommandOutput({
+								command: cmdLine,
+								rawOutput: out,
+								cwd: st.cwd,
+								workspaceFolders: this._workspaceFolderFsPaths(),
+								exitCode,
+								signal,
+								includeCommandHeader: true,
+								includeExitStatus: true,
+							});
+							st.finalOutput = normalized.text;
+							st.cwdLabel = normalized.cwdLabel ?? st.cwdLabel;
+						}
+						this._markTerminalDone(terminalId, exitCode, signal);
 					} catch {
 						this._markTerminalDone(terminalId, 1, null);
 					}
@@ -858,8 +965,15 @@ export class AcpHostCallbacksService {
 					let out = '';
 					try { out = await this._readTerminalBestEffort(termSvc as any, terminalId); } catch { /* ignore */ }
 					const max = this._getMaxToolOutputLength();
-					const t = await this._truncateWithMetaIfNeeded(out, max, undefined, { includeMeta: false, saveToFile: false });
-					return { output: t.text, truncated: t.didTruncateForMax, isRunning: true };
+					const diagnostic = out || `terminal/output: unknown terminalId "${terminalId}"`;
+					const t = await this._truncateWithMetaIfNeeded(diagnostic, max, undefined, { includeMeta: false, saveToFile: false });
+					this.logService.warn(`[AcpHostCallbacksService] terminal/output: unknown terminalId=${terminalId}`);
+					return {
+						output: t.text,
+						truncated: t.didTruncateForMax,
+						isRunning: false,
+						exitStatus: { exitCode: 1, signal: 'UNKNOWN_TERMINAL' } satisfies TerminalExitStatus
+					};
 				}
 
 				// Don't start pump if we already have accumulated output (onOutput should be the source of truth).
@@ -929,17 +1043,25 @@ export class AcpHostCallbacksService {
 						output,
 						truncated,
 						isRunning: false,
-						exitStatus
+						exitStatus,
+						...(st.cwd ? { cwd: st.cwd } : {}),
+						...(st.cwdLabel ? { cwdLabel: st.cwdLabel } : {})
 					};
 				}
 
 				// -------------------------
 				// RUNNING: never write a file; never TRUNCATION_META
-				// Show from start; if too long – show start + footer.
+				// Show from start; if too long - show start + footer.
 				// -------------------------
 				const outputFull = String(st.finalOutput ?? '');
 				if (outputFull.length <= effectiveMax) {
-					return { output: outputFull, truncated: false, isRunning: true };
+					return {
+						output: outputFull,
+						truncated: false,
+						isRunning: true,
+						...(st.cwd ? { cwd: st.cwd } : {}),
+						...(st.cwdLabel ? { cwdLabel: st.cwdLabel } : {})
+					};
 				}
 
 				const footer =
@@ -950,7 +1072,13 @@ export class AcpHostCallbacksService {
 				const bodyMax = Math.max(0, effectiveMax - footer.length);
 				const output = `${outputFull.slice(0, bodyMax)}${footer}`;
 
-				return { output, truncated: true, isRunning: true };
+				return {
+					output,
+					truncated: true,
+					isRunning: true,
+					...(st.cwd ? { cwd: st.cwd } : {}),
+					...(st.cwdLabel ? { cwdLabel: st.cwdLabel } : {})
+				};
 
 			} catch (err) {
 				throw err;

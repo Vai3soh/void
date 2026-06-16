@@ -35,6 +35,24 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { IMCPService } from './mcpService.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { IAgentSkillsService } from './skills/agentSkillsService.js';
+import { createParallelToolCallsConfig, parseParallelToolCallsMode, type ParallelToolCallsMode } from '../../../../platform/void/common/parallelToolCalls.js';
+
+const getCustomProviderConfig = (
+	customProviders: Record<string, { perModel?: Record<string, any> } | undefined> | undefined,
+	providerName: string,
+	providerSlug: string,
+) => {
+	const exact = customProviders?.[providerName];
+	if (exact) return exact;
+	const bySlug = customProviders?.[providerSlug];
+	if (bySlug) return bySlug;
+
+	const lower = providerSlug.toLowerCase();
+	for (const [key, value] of Object.entries(customProviders ?? {})) {
+		if (key.toLowerCase() === lower) return value;
+	}
+	return undefined;
+};
 
 // calls channel to implement features
 export const ILLMMessageService = createDecorator<ILLMMessageService>('llmMessageService');
@@ -316,6 +334,14 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 				dynamicRequestConfig = registry.getRequestConfigForModel(fullId, providerSlug);
 				this.logService.debug(`[DEBUG sendLLMMessageService] dynamicRequestConfig:`, JSON.stringify(dynamicRequestConfig, null, 2));
 
+				let parallelToolCallsMode: ParallelToolCallsMode | undefined;
+				try {
+					const cp = getCustomProviderConfig(this.voidSettingsService.state.customProviders, providerName, providerSlug);
+					const perModel = (cp?.perModel || {}) as Record<string, any>;
+					const cfg = perModel[modelSelection!.modelName];
+					parallelToolCallsMode = parseParallelToolCallsMode(cfg?.parallelToolCallsMode);
+				} catch { /* ignore */ }
+
 				const caps = await registry.getEffectiveModelCapabilities(providerSlug, modelName);
 				if (dynamicRequestConfig) {
 					dynamicRequestConfig = {
@@ -323,12 +349,13 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 						...(caps?.fimTransport ? { fimTransport: caps.fimTransport as any } : {}),
 						...(caps?.reasoningCapabilities !== undefined ? { reasoningCapabilities: caps.reasoningCapabilities as any } : {}),
 						...(caps?.supportCacheControl !== undefined ? { supportCacheControl: !!caps.supportCacheControl } : {}),
+						parallelToolCalls: createParallelToolCallsConfig(caps, parallelToolCallsMode),
 					} as typeof dynamicRequestConfig;
 					this.logService.debug('[DEBUG sendLLMMessageService] effective caps.supportCacheControl =', caps?.supportCacheControl);
 				}
 
 				try {
-					const cp = this.voidSettingsService.state.customProviders?.[providerSlug];
+					const cp = getCustomProviderConfig(this.voidSettingsService.state.customProviders, providerName, providerSlug);
 					const perModel = (cp?.perModel || {}) as Record<string, any>;
 					const cfg = perModel[modelSelection!.modelName];
 

@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import { Disposable } from '../../../../base/common/lifecycle.js';
+import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
@@ -270,7 +271,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		@IFileService private readonly _fileService: IFileService,
 		@ILabelService private readonly _labelService: ILabelService,
 		@ILogService private readonly _logService: ILogService,
-		@IAgentSkillsService private readonly _agentSkillsService: IAgentSkillsService = undefined as unknown as IAgentSkillsService,
+		@IAgentSkillsService private readonly _agentSkillsService: IAgentSkillsService,
 	) {
 		super();
 
@@ -1127,4 +1128,4 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 }
 
-registerSingleton(IChatThreadService, ChatThreadService, InstantiationType.Eager);
+registerSingleton(IChatThreadService, new SyncDescriptor(ChatThreadService, [], Boolean(InstantiationType.Eager)));

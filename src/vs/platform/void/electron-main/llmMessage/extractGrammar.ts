@@ -170,7 +170,7 @@ const maskCodeBlocks = (s: string): string => {
 		}
 	}
 
-	
+
 	if (!mask.includes(1)) return s;
 	const out: string[] = new Array(len);
 	for (let i = 0; i < len; i++) {
@@ -196,7 +196,7 @@ const findFirstToolRegionEnhanced = (
 	const namesAlt = tools.map(t => escapeRegExp(t.name)).join('|');
 	if (!namesAlt) return null;
 
-	
+
 	const anyTagRe = new RegExp(`<\\/?(${namesAlt})\\b[^>]*?>`, 'ig');
 	const first = anyTagRe.exec(text);
 	if (!first) return null;
@@ -213,7 +213,7 @@ const findFirstToolRegionEnhanced = (
 	}
 
 	if (!isClose) {
-		
+
 		const esc = escapeRegExp(name);
 		const openLen = raw.length;
 		const tail = text.slice(idx + openLen);
@@ -226,14 +226,14 @@ const findFirstToolRegionEnhanced = (
 		return { kind: 'openOnly', toolName: name, start: idx, end: text.length };
 	}
 
-	
+
 	const closeLen = raw.length;
 	const mOpenPrev = findLastOpenBefore(text, name, idx);
 	if (mOpenPrev) {
 		return { kind: 'openClose', toolName: name, start: mOpenPrev.index, end: idx + closeLen };
 	}
 
-	
+
 	const anchor = findParamAnchorBefore(text, name, idx, toolOfToolName);
 	const start = (anchor >= 0 ? anchor : idx);
 	return { kind: 'closeOnly', toolName: name, start, end: idx + closeLen };
@@ -378,23 +378,23 @@ const parseXMLPrefixToToolCall = (
 	const openMatch = openRe.exec(str);
 	const selfMatch = selfRe.exec(str);
 
-	
+
 	if (!openMatch && !selfMatch) return getAnswer();
 
-	
+
 	if (selfMatch && (!openMatch || (selfMatch.index ?? 0) < (openMatch.index ?? 0))) {
 		isDone = true;
 		return getAnswer();
 	}
 
-	
+
 	const start = (openMatch!.index ?? 0) + openMatch![0].length;
 	const tail = str.slice(start);
 	const closeMatch = closeRe.exec(tail);
 
 	let inner = '';
 	if (!closeMatch) {
-		
+
 		inner = tail;
 	} else {
 		inner = tail.slice(0, closeMatch.index ?? 0);
@@ -427,7 +427,7 @@ const splitProviderReasoning = (s: string, tags: [string, string] | null): { rea
 
 	const [openTag, closeTag] = tags;
 
-	
+
 	const closeIdx = s.lastIndexOf(closeTag);
 	if (closeIdx >= 0) {
 		const beforeClose = s.slice(0, closeIdx);
@@ -436,7 +436,7 @@ const splitProviderReasoning = (s: string, tags: [string, string] | null): { rea
 		return { reasoning, after };
 	}
 
-	
+
 	const reasoning = s.split(openTag).join('').split(closeTag).join('');
 	return { reasoning, after: '' };
 };
@@ -479,7 +479,7 @@ export const extractReasoningAndXMLToolsWrapper = (
 	let lastReasoningParseObservedLen = 0;
 	let lastThinkDetectObservedLen = 0;
 
-	
+
 	let r_foundTag1 = false;
 	let r_foundTag2 = false;
 	let r_latestAddIdx = 0;
@@ -487,11 +487,11 @@ export const extractReasoningAndXMLToolsWrapper = (
 	let r_fullReasoningSoFar = '';
 	let r_providerReasoningAcc = '';
 
-	
+
 	let lastReasoning = '';
 	let latestToolCall: RawToolCallObj | undefined = undefined;
 
-	
+
 	let activeThinkTags: [string, string] | null = thinkTagsInit;
 
 	const likelyContainsToolMarkup = (s: string): boolean => {
@@ -563,16 +563,16 @@ export const extractReasoningAndXMLToolsWrapper = (
 	const stripToolCallWrapperOnce = (s: string): string => {
 		if (!s) return s;
 
-		
+
 		const full = s.replace(/<tool_call\b[\s\S]*?<\/tool_call\s*>/i, '');
 		if (full !== s) return full.trim();
 
-		
+
 		return s.replace(/<tool_call\b[\s\S]*$/i, '').trimEnd();
 	};
 
 	const isBlockToolCall = (beforeText: string): boolean => {
-		
+
 		const lastNl = beforeText.lastIndexOf('\n');
 		const tail = lastNl >= 0 ? beforeText.slice(lastNl + 1) : beforeText;
 		return tail.trim() === '';
@@ -620,10 +620,10 @@ export const extractReasoningAndXMLToolsWrapper = (
 
 		const masked = (text.includes('`') || text.includes('~')) ? maskCodeBlocks(text) : text;
 
-		
+
 		const toolCallRegion = findToolCallRegion(masked);
 
-		
+
 		const region = findFirstToolRegionEnhanced(masked, toolsList, toolOfToolName);
 
 		const toolCallStartsFirst =
@@ -653,13 +653,13 @@ export const extractReasoningAndXMLToolsWrapper = (
 		let xmlForParse = '';
 
 		if (region.kind === 'closeOnly') {
-			
+
 			const esc = escapeRegExp(region.toolName);
 			const slice = text.slice(region.start, region.end);
 			const inner = slice.replace(new RegExp(`</${esc}\\s*>\\s*$`, 'i'), '');
 			xmlForParse = `<${region.toolName}>` + inner + `</${region.toolName}>`;
 		} else {
-			
+
 			xmlForParse = text.slice(region.start);
 		}
 
@@ -677,7 +677,7 @@ export const extractReasoningAndXMLToolsWrapper = (
 		if (!cand) return curr;
 		if (!curr) return cand;
 
-		
+
 		if (curr.name === cand.name) {
 			const rawParams = { ...(curr.rawParams ?? {}), ...(cand.rawParams ?? {}) } as RawToolParamsObj;
 			const doneParams = Array.from(new Set([...(curr.doneParams ?? []), ...(cand.doneParams ?? [])])) as ToolParamName[];
@@ -697,22 +697,26 @@ export const extractReasoningAndXMLToolsWrapper = (
 			};
 		}
 
-		
+
 		if (curr.isDone) return curr;
 		if (cand.isDone) return cand;
 		return curr;
 	};
 
-	
 	const THINK_PAIRS: [string, string][] = [
+		// angle brackets
 		['<think>', '</think>'],
 		['<thinking>', '</thinking>'],
-		['◁think▷', '◁/think▷'],
-		['◁thinking▷', '◁/thinking▷'],
-		['‹think›', '‹/think›'],
-		['〈think〉', '〈/think〉'],
-		['【think】', '【/think】'],
-		['【thinking】', '【/thinking】'],
+		// triangle brackets (U+25C1/U+25B7)
+		['\u25C1think\u25B7', '\u25C1/think\u25B7'],
+		['\u25C1thinking\u25B7', '\u25C1/thinking\u25B7'],
+		// single guillemets (U+2039/U+203A)
+		['\u2039think\u203A', '\u2039/think\u203A'],
+		// angle quotation marks (U+3008/U+3009)
+		['\u3008think\u3009', '\u3008/think\u3009'],
+		// lenticular brackets (U+3010/U+3011)
+		['\u3010think\u3011', '\u3010/think\u3011'],
+		['\u3010thinking\u3011', '\u3010/thinking\u3011'],
 	];
 
 	const detectThinkTags = (s: string): [string, string] | null => {
@@ -743,7 +747,7 @@ export const extractReasoningAndXMLToolsWrapper = (
 	): { textOut: string; reasoningOut: string; earlyReturn?: boolean } => {
 		const [openTag, closeTag] = tags;
 
-		
+
 		if (!r_foundTag1) {
 			const endsWithOpen = endsWithAnyPrefixOf(fullText_, openTag);
 			if (endsWithOpen && endsWithOpen !== openTag) {
@@ -761,7 +765,7 @@ export const extractReasoningAndXMLToolsWrapper = (
 			}
 		}
 
-		
+
 		if (!r_foundTag2) {
 			const endsWithClose = endsWithAnyPrefixOf(fullText_, closeTag);
 			if (endsWithClose && endsWithClose !== closeTag) {
@@ -785,7 +789,7 @@ export const extractReasoningAndXMLToolsWrapper = (
 			}
 		}
 
-		
+
 		if (fullText_.length > r_latestAddIdx) {
 			r_fullTextSoFar += fullText_.substring(r_latestAddIdx);
 			r_latestAddIdx = fullText_.length;
@@ -798,6 +802,9 @@ export const extractReasoningAndXMLToolsWrapper = (
 	const isValidToolCall = (t?: RawToolCallObj): t is RawToolCallObj =>
 		!!(t && t.name && String(t.name).trim().length > 0);
 
+	const validToolCallsOf = (toolCalls?: RawToolCallObj[]): RawToolCallObj[] =>
+		Array.isArray(toolCalls) ? toolCalls.filter(isValidToolCall) : [];
+
 	const newOnText: OnText = (params) => {
 		const rawFullText = params.fullText || '';
 		const providerReasoning = params.fullReasoning ?? undefined;
@@ -806,7 +813,7 @@ export const extractReasoningAndXMLToolsWrapper = (
 		let textForXml = rawFullText;
 		let reasoningForSearch = lastReasoning;
 
-		
+
 		if (providerReasoning !== undefined) {
 			if (!r_providerReasoningAcc) {
 				r_providerReasoningAcc = providerReasoning;
@@ -818,24 +825,24 @@ export const extractReasoningAndXMLToolsWrapper = (
 					providerReasoning.slice(0, probeLen) === r_providerReasoningAcc.slice(0, probeLen);
 
 				if (providerReasoning.length > prevLen && hasSamePrefix) {
-					
+
 					r_providerReasoningAcc = providerReasoning;
 				} else if (providerReasoning.length < prevLen && hasSamePrefix) {
-					
+
 					r_providerReasoningAcc = providerReasoning;
 				} else if (!(providerReasoning.length === prevLen && hasSamePrefix)) {
-					
+
 					r_providerReasoningAcc += providerReasoning;
 				}
 			}
 
-			
+
 			if (!activeThinkTags) {
 				const maybe = detectThinkTagsByIncrement(r_providerReasoningAcc);
 				if (maybe) { activeThinkTags = maybe; }
 			}
 
-			
+
 			if (activeThinkTags) {
 				const [openTag, closeTag] = activeThinkTags;
 				const pOpen = endsWithAnyPrefixOf(providerReasoning, openTag);
@@ -845,18 +852,18 @@ export const extractReasoningAndXMLToolsWrapper = (
 				}
 			}
 
-			
+
 			const { reasoning, after } = splitProviderReasoning(r_providerReasoningAcc, activeThinkTags);
 			reasoningForSearch = reasoning;
 			textForXml = (textForXml || '') + (after || '');
 		} else {
-			
+
 			if (!activeThinkTags) {
 				const maybe = detectThinkTagsByIncrement(rawFullText);
 				if (maybe) { activeThinkTags = maybe; }
 			}
 
-			
+
 			if (activeThinkTags) {
 				const r = extractReasoningViaTags(rawFullText, activeThinkTags);
 				if (r.earlyReturn) {
@@ -890,7 +897,8 @@ export const extractReasoningAndXMLToolsWrapper = (
 		}
 
 
-		const inboundTool = params.toolCall;
+		const inboundToolCalls = validToolCallsOf(params.toolCalls);
+		const inboundTool = params.toolCall ?? inboundToolCalls[0];
 		latestToolCall = mergeToolCall(latestToolCall, callFromText);
 		if (isValidToolCall(inboundTool)) {
 			latestToolCall = mergeToolCall(latestToolCall, inboundTool);
@@ -908,12 +916,16 @@ export const extractReasoningAndXMLToolsWrapper = (
 		uiText = stripTrailingPartialToolMarker(uiText);
 		uiReasoning = stripTrailingPartialToolMarker(uiReasoning);
 
+		const toolCallsForText = inboundToolCalls.length
+			? inboundToolCalls
+			: (isValidToolCall(latestToolCall)
+				? [latestToolCall]
+				: (isValidToolCall(inboundTool) ? [inboundTool] : []));
+
 		onText({
 			fullText: uiText.trim(),
 			fullReasoning: uiReasoning,
-			toolCall: isValidToolCall(latestToolCall)
-				? latestToolCall
-				: (isValidToolCall(inboundTool) ? inboundTool : undefined),
+			...(toolCallsForText.length ? { toolCalls: toolCallsForText, toolCall: toolCallsForText[0] } : {}),
 			plan: incomingPlan,
 			// propagate provider token usage unchanged
 			tokenUsage: (params as any).tokenUsage,
@@ -951,13 +963,14 @@ export const extractReasoningAndXMLToolsWrapper = (
 		}
 
 		const inboundTool = params.toolCall;
+		const inboundToolCalls = validToolCallsOf(params.toolCalls);
+		const inboundDoneToolCalls = inboundToolCalls.filter(tool => tool.isDone);
 
 		if ((latestToolCall && !latestToolCall.isDone) && !(isValidToolCall(inboundTool) && inboundTool.isDone)) {
 			onFinalMessage({
 				fullText: baseTextForUi.trim(),
 				fullReasoning: finalReasoning,
 				anthropicReasoning: params.anthropicReasoning,
-				toolCall: undefined,
 				plan,
 				// preserve original token usage info
 				tokenUsage: (params as any).tokenUsage,
@@ -989,9 +1002,13 @@ export const extractReasoningAndXMLToolsWrapper = (
 		// So we don't need to parse again.
 
 		const finalTool =
+			inboundDoneToolCalls[0] ||
 			(isValidToolCall(inboundTool) && inboundTool.isDone ? inboundTool : undefined) ||
 			(isValidToolCall(latestToolCall) && latestToolCall.isDone ? latestToolCall : undefined) ||
 			(isValidToolCall(call) && call.isDone ? call : undefined);
+		const finalToolCalls = inboundDoneToolCalls.length
+			? inboundDoneToolCalls
+			: (finalTool ? [finalTool] : []);
 
 		if (finalTool?.isDone) {
 			uiText = stripToolCallWrapperOnce(uiText);
@@ -1004,7 +1021,7 @@ export const extractReasoningAndXMLToolsWrapper = (
 			fullText: uiText,
 			fullReasoning: uiReasoning,
 			anthropicReasoning: params.anthropicReasoning,
-			toolCall: finalTool,
+			...(finalToolCalls.length ? { toolCalls: finalToolCalls, toolCall: finalToolCalls[0] } : {}),
 			plan,
 			// preserve original token usage info
 			tokenUsage: (params as any).tokenUsage,

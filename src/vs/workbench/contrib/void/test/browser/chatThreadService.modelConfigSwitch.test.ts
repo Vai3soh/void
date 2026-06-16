@@ -87,7 +87,10 @@ suite('ChatThreadService -> LLMMessageService: model config does not leak across
 				}
 				return null;
 			},
-			getEffectiveModelCapabilities: async () => ({ supportCacheControl: false }),
+			getEffectiveModelCapabilities: async (_slug: string, modelName: string) => ({
+				supportCacheControl: false,
+				supportsParallelToolCalls: modelName === 'provA/modelA',
+			}),
 		};
 
 		// ---- minimal InstantiationService for LLMMessageService (only what it asks for) ----
@@ -109,7 +112,15 @@ suite('ChatThreadService -> LLMMessageService: model config does not leak across
 					provA: { endpoint: 'https://provider-a.example/v1', apiKey: 'provKeyA', additionalHeaders: {} },
 					provB: { endpoint: 'https://provider-b.example/v1', apiKey: 'provKeyB', additionalHeaders: {} },
 				},
-				customProviders: {},
+				customProviders: {
+					provA: {
+						perModel: {
+							'provA/modelA': {
+								parallelToolCallsMode: 'enabled',
+							},
+						},
+					},
+				},
 				overridesOfModel: {},
 
 				modelSelectionOfFeature: {
@@ -172,6 +183,7 @@ suite('ChatThreadService -> LLMMessageService: model config does not leak across
 			/* file */ { readFile: async () => ({ value: { toString: () => '' } }) } as any,
 			/* label */ { getUriLabel: () => './x' } as any,
 			/* log */ logService as any,
+			/* agentSkills */ { getActiveSkills: () => [], activateSkill: async () => { throw new Error('not used in this test'); } } as any,
 		);
 
 		const realAcp = (svc as any)._acpHandler;
@@ -230,11 +242,19 @@ suite('ChatThreadService -> LLMMessageService: model config does not leak across
 			assert.strictEqual(c1.modelSelection.modelName, 'provA/modelA');
 			assert.strictEqual(c1.dynamicRequestConfig.endpoint, 'https://api-a.example/v1');
 			assert.strictEqual(c1.dynamicRequestConfig.headers.Authorization, 'Bearer keyA');
+			assert.deepStrictEqual(c1.dynamicRequestConfig.parallelToolCalls, {
+				supported: true,
+				mode: 'enabled',
+			});
 
 			assert.strictEqual(c2.modelSelection.providerName, 'provB');
 			assert.strictEqual(c2.modelSelection.modelName, 'provB/modelB');
 			assert.strictEqual(c2.dynamicRequestConfig.endpoint, 'https://api-b.example/v1');
 			assert.strictEqual(c2.dynamicRequestConfig.headers.Authorization, 'Bearer keyB');
+			assert.deepStrictEqual(c2.dynamicRequestConfig.parallelToolCalls, {
+				supported: false,
+				mode: 'safe-disabled',
+			});
 
 
 			assert.strictEqual(c2.settingsOfProvider.provB.apiKey, 'provKeyB_NEW');

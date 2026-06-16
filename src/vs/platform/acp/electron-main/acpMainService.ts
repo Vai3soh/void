@@ -1442,6 +1442,8 @@ export class AcpMainService implements IAcpMainServiceForChannel {
 							id: toolCallId,
 							name: canonicalName,
 							...(terminalIdForProgress ? { terminalId: terminalIdForProgress } : {}),
+							...(typeof (rObj as any).cwd === 'string' ? { cwd: String((rObj as any).cwd) } : {}),
+							...(typeof (rObj as any).cwdLabel === 'string' ? { cwdLabel: String((rObj as any).cwdLabel) } : {}),
 							output: progressText,
 							...(typeof truncated === 'boolean' ? { truncated } : {}),
 							...(exitStatus ? { exitStatus } : {})

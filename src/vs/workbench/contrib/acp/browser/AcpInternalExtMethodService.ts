@@ -17,6 +17,7 @@ import { ILanguageModelToolsService, IToolData } from '../../chat/common/languag
 
 import { IDynamicProviderRegistryService } from '../../../../platform/void/common/providerReg.js';
 import { getModelApiConfiguration, getModelCapabilities } from '../../../../platform/void/common/modelInference.js';
+import { createParallelToolCallsConfig, parseParallelToolCallsMode } from '../../../../platform/void/common/parallelToolCalls.js';
 
 import {
 	FeatureName,
@@ -52,6 +53,23 @@ import { URI } from '../../../../base/common/uri.js';
 import { IAgentSkillsService } from '../../void/common/skills/agentSkillsService.js';
 import { formatAgentSkillsCatalogForToolActivation } from '../../void/common/skills/agentSkillsPrompt.js';
 import { IChatThreadService } from '../../void/browser/chatThreadService.js';
+
+const getCustomProviderConfig = (
+	customProviders: Record<string, { perModel?: Record<string, any> } | undefined> | undefined,
+	providerName: string,
+	providerSlug: string,
+) => {
+	const exact = customProviders?.[providerName];
+	if (exact) return exact;
+	const bySlug = customProviders?.[providerSlug];
+	if (bySlug) return bySlug;
+
+	const lower = providerSlug.toLowerCase();
+	for (const [key, value] of Object.entries(customProviders ?? {})) {
+		if (key.toLowerCase() === lower) return value;
+	}
+	return undefined;
+};
 
 const IMCPServiceId = createDecorator<any>('mcpConfigService');
 
@@ -726,16 +744,22 @@ export class AcpInternalExtMethodService {
 					const caps =
 						await registry.getEffectiveModelCapabilities(providerSlug, modelName)
 							.catch(async () => registry.getEffectiveModelCapabilities(providerSlug, fullModelId as any));
+					const capsToolFormat = asToolFormat(caps?.specialToolFormat);
+					const customProvider = getCustomProviderConfig(st.customProviders, providerName, providerSlug);
+					const parallelToolCallsMode = parseParallelToolCallsMode(
+						customProvider?.perModel?.[modelName]?.parallelToolCallsMode
+					);
 
 					dynamicRequestConfig = {
 						endpoint: baseCfg.endpoint,
 						apiStyle: baseCfg.apiStyle,
 						supportsSystemMessage: baseCfg.supportsSystemMessage,
-						specialToolFormat: baseCfg.specialToolFormat,
+						specialToolFormat: capsToolFormat ?? baseCfg.specialToolFormat,
 						headers: { ...baseCfg.headers },
 						...(caps?.fimTransport ? { fimTransport: caps.fimTransport as any } : {}),
 						...(caps?.reasoningCapabilities !== undefined ? { reasoningCapabilities: caps.reasoningCapabilities as any } : {}),
 						...(caps?.supportCacheControl !== undefined ? { supportCacheControl: !!caps.supportCacheControl } : {}),
+						parallelToolCalls: createParallelToolCallsConfig(caps, parallelToolCallsMode),
 					};
 				} catch (e) {
 					this.logService.warn('[ACP getLLMConfig] Failed to build dynamicRequestConfig:', e);
@@ -789,6 +813,7 @@ export class AcpInternalExtMethodService {
 						toolFormat,
 						ptyHostService: dummyPty,
 						disabledStaticToolNames: disabledStaticTools,
+						parallelToolCalls: dynamicRequestConfig?.parallelToolCalls ?? null,
 						skillsSection,
 					});
 				} catch {

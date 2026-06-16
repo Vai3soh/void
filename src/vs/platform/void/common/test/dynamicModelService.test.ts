@@ -232,6 +232,32 @@ suite('DynamicModelService', () => {
 
 			fetchStub.restore();
 		});
+
+		test('should preserve raw supported_parameters while inferring parallel tool call capability', async () => {
+			const mockData = {
+				data: [{
+					id: 'test/parallel',
+					canonical_slug: 'canonical/test-parallel',
+					name: 'Parallel Model',
+					context_length: 4096,
+					pricing: { prompt: '0.01', completion: '0.02' },
+					top_provider: { max_completion_tokens: 2048, is_moderated: false },
+					supported_parameters: ['tools', 'tool_choice', 'parallel_tool_calls', 'temperature'],
+					architecture: { modality: 'text->text', input_modalities: ['text'], output_modalities: ['text'], tokenizer: 'Other' }
+				}]
+			};
+
+			const service = new DynamicModelService({ request: async () => { throw new Error('should not be used'); } } as any, NullLogService as any);
+			const fetchStub = stubFetch(service, async () => mockData);
+
+			await service.initialize();
+
+			const capabilities = service.getDynamicCapabilities('test/parallel') as any;
+			assert.strictEqual(capabilities.supportsParallelToolCalls, true);
+			assert.deepStrictEqual(service.getSupportedParameters('test/parallel'), ['tools', 'tool_choice', 'parallel_tool_calls', 'temperature']);
+
+			fetchStub.restore();
+		});
 	});
 
 	suite('getAllDynamicCapabilities', () => {

@@ -56,4 +56,24 @@ suite('chat_systemMessage - specialToolFormat', () => {
 		assert.ok(msg.includes('- run_command:'), 'enabled static tools should stay in XML tools list');
 		assert.ok(!msg.includes('- read_file:'), 'disabled static tools must be excluded from XML tools list');
 	});
+
+	test('parallel tool calls section does not switch openai-style prompt to XML', async () => {
+		const msg = await chat_systemMessage({
+			workspaceFolders,
+			chatMode,
+			toolFormat: 'openai-style',
+			ptyHostService,
+			parallelToolCalls: { supported: true, mode: 'enabled' },
+		});
+
+		assert.ok(msg.includes('Parallel tool calls:'), 'parallel tool calls section must be present');
+		assert.ok(
+			!msg.includes('!!!CRITICAL: YOU MUST USE XML TOOLS - NO EXCEPTIONS!!!'),
+			'openai-style with parallel tool calls must remain native'
+		);
+		assert.ok(
+			msg.includes('Provider format: OpenAI function-calling.'),
+			'openai-style tool format help must be present'
+		);
+	});
 });

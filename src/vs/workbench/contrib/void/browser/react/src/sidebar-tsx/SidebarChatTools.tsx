@@ -23,9 +23,9 @@ import { IconLoading, ToolChildrenWrapper, CodeChildren, ListableToolItem } from
 import { LintErrorItem, ToolCallParams, ShallowDirectoryItem } from '../../../../../../../platform/void/common/toolsServiceTypes.js';
 import { ChatMarkdownRender, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
 import { RawToolCallObj } from '../../../../../../../platform/void/common/sendLLMMessageTypes.js';
-import { persistentTerminalNameOfId } from '../../../terminalToolService.js';
 import { BlockCode } from '../util/inputs.js';
 import { MAX_FILE_CHARS_PAGE } from '../../../../../../../platform/void/common/prompt/constants.js';
+import { formatTerminalCommandLine, normalizeTerminalCommandOutput, normalizeTerminalCwdLabel } from '../../../../../../../platform/void/common/terminalToolOutput.js';
 
 const USER_CANCELED_TOOL_LABEL = 'User canceled tool';
 
@@ -88,17 +88,10 @@ export const titleOfToolName = {
 		proposed: 'Run terminal',
 		running: loadingTitleWrapper('Run terminal'),
 	},
-	'run_persistent_command': {
-		done: 'Run terminal',
-		proposed: 'Run terminal',
-		running: loadingTitleWrapper('Run terminal'),
-	},
-
-	'open_persistent_terminal': { done: `Opened terminal`, proposed: 'Open terminal', running: loadingTitleWrapper('Opening terminal') },
-	'kill_persistent_terminal': { done: `Killed terminal`, proposed: 'Kill terminal', running: loadingTitleWrapper('Killing terminal') },
 
 	'read_lint_errors': { done: `Read lint errors`, proposed: 'Read lint errors', running: loadingTitleWrapper('Reading lint errors') },
 	'search_in_file': { done: 'Searched in file', proposed: 'Search in file', running: loadingTitleWrapper('Searching in file') },
+	'activate_skill': { done: 'Activated skill', proposed: 'Activate skill', running: loadingTitleWrapper('Activating skill') },
 	'edit_file': { done: 'Previewed edit', proposed: 'Edit file (preview)', running: loadingTitleWrapper('Preparing preview') },
 } as const;
 
@@ -205,12 +198,14 @@ export const toolNameToDesc = (toolName: ToolName, _toolParams: any, accessor: a
 			};
 		},
 
-		'run_command': () => ({ desc1: '' }),
-		'run_persistent_command': () => ({ desc1: '' }),
-		'open_persistent_terminal': () => ({ desc1: '' }),
-		'kill_persistent_terminal': () => {
+		'run_command': () => {
 			const toolParams = _toolParams as any;
-			return { desc1: toolParams?.persistentTerminalId ?? '' };
+			const explicitLabel = typeof toolParams?.cwdLabel === 'string' ? toolParams.cwdLabel : '';
+			const cwd = typeof toolParams?.cwd === 'string' ? toolParams.cwd : '';
+			const workspaceContextService = accessor.get('IWorkspaceContextService');
+			const workspaceFolders = workspaceContextService.getWorkspace().folders.map((folder: any) => String(folder.uri.fsPath ?? ''));
+			const cwdLabel = explicitLabel || normalizeTerminalCwdLabel(cwd, workspaceFolders) || '';
+			return { desc1: cwdLabel };
 		},
 
 		'get_dir_tree': () => {
@@ -230,6 +225,10 @@ export const toolNameToDesc = (toolName: ToolName, _toolParams: any, accessor: a
 				desc1: fsPath ? getBasename(fsPath) : '',
 				desc1Info: uri ? getRelative(uri, accessor) : undefined,
 			};
+		},
+		'activate_skill': () => {
+			const toolParams = _toolParams as any;
+			return { desc1: toolParams?.name ?? '' };
 		},
 
 		'edit_file': () => {
@@ -582,7 +581,7 @@ export const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolNam
 
 	const approvalType = approvalTypeOfToolName[toolName];
 	let alwaysRequireManualApproval = false;
-	if (approvalType === 'terminal' && (toolName === 'run_command' || toolName === 'run_persistent_command')) {
+	if (approvalType === 'terminal' && toolName === 'run_command') {
 		try {
 			const threadId = chatThreadsService.state.currentThreadId;
 			const thread = chatThreadsService.state.allThreads[threadId];
@@ -831,15 +830,8 @@ export const EditToolSoFar = ({ toolCallSoFar, }: { toolCallSoFar: RawToolCallOb
 };
 
 
-export const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
-	toolMessage: Exclude<ToolMessage<'run_command'>, { type: 'invalid_params' }>;
-	type: 'run_command';
-} | {
-	toolMessage: Exclude<ToolMessage<'run_persistent_command'>, { type: 'invalid_params' }>;
-	type: 'run_persistent_command';
-})) => {
+export const CommandTool = ({ toolMessage, threadId }: { threadId: string; toolMessage: Exclude<ToolMessage<'run_command'>, { type: 'invalid_params' }> }) => {
 	const accessor = useAccessor();
-	const terminalToolsService = accessor.get('ITerminalToolService');
 	const toolsService = accessor.get('IToolsService');
 	const chatThreadsService = accessor.get('IChatThreadService');
 
@@ -863,15 +855,57 @@ export const CommandTool = ({ toolMessage, type, threadId }: { threadId: string 
 	applyCanceledUi(componentParams, toolMessage);
 
 	const commandStr = useMemo(() => {
-		try {
-			if (type === 'run_command') {
-				return (toolMessage.params as ToolCallParams['run_command']).command;
+		const commandLineFrom = (value: any): string => {
+			if (!value || typeof value !== 'object') return '';
+			if (typeof value.commandLine === 'string' && value.commandLine.trim()) return value.commandLine.trim();
+			if (typeof value.command === 'string' && value.command.trim()) {
+				return formatTerminalCommandLine(value.command, value.args);
 			}
-			return (toolMessage.params as ToolCallParams['run_persistent_command']).command;
+			return '';
+		};
+		try {
+			const t: any = toolMessage as any;
+			const candidates = [
+				commandLineFrom(t.result),
+				commandLineFrom(t.rawOutput),
+				commandLineFrom(t.params),
+				commandLineFrom(t.rawParams),
+				toolMessage.params.command,
+			];
+			return candidates.find(c => typeof c === 'string' && c.trim())?.trim() ?? '';
 		} catch {
 			return '';
 		}
-	}, [toolMessage, type]);
+	}, [toolMessage]);
+
+	const normalizeTerminalPreviewText = useCallback((raw: string, includeExitStatus: boolean): string => {
+		if (!raw || !commandStr) return raw;
+
+		const resultAny = (toolMessage as any)?.result ?? {};
+		const exitStatus = resultAny?.exitStatus;
+		const exitCode =
+			(typeof exitStatus?.exitCode === 'number' || exitStatus?.exitCode === null)
+				? exitStatus.exitCode
+				: (typeof resultAny?.exitCode === 'number' || resultAny?.exitCode === null)
+					? resultAny.exitCode
+					: undefined;
+		const signal =
+			(typeof exitStatus?.signal === 'string' || exitStatus?.signal === null)
+				? exitStatus.signal
+				: (typeof resultAny?.signal === 'string' || resultAny?.signal === null)
+					? resultAny.signal
+					: undefined;
+		const hasExitStatus = typeof exitCode === 'number' || exitCode === null || typeof signal === 'string' || signal === null;
+
+		return normalizeTerminalCommandOutput({
+			command: commandStr,
+			rawOutput: raw,
+			exitCode: includeExitStatus && hasExitStatus ? exitCode : undefined,
+			signal: includeExitStatus && hasExitStatus ? signal : undefined,
+			includeCommandHeader: true,
+			includeExitStatus: includeExitStatus && hasExitStatus,
+		}).text || raw;
+	}, [commandStr, toolMessage]);
 
 	const onSkipRunningCommand = useCallback(() => {
 		try {
@@ -889,10 +923,6 @@ export const CommandTool = ({ toolMessage, type, threadId }: { threadId: string 
 		return () => clearInterval(id);
 	}, [toolMessage.type]);
 
-	const [attachFailed, setAttachFailed] = useState(false);
-	const terminalContainerRef = useRef<HTMLDivElement | null>(null);
-
-
 	const streamStateContent = useMemo((): string => {
 		try {
 			if (!threadStreamState) return '';
@@ -900,7 +930,7 @@ export const CommandTool = ({ toolMessage, type, threadId }: { threadId: string 
 
 			const toolInfo = threadStreamState.toolInfo;
 			if (!toolInfo) return '';
-			if (toolInfo.toolName !== type) return '';
+			if (toolInfo.toolName !== 'run_command') return '';
 
 
 			const msgId = (toolMessage as any)?.id;
@@ -918,77 +948,10 @@ export const CommandTool = ({ toolMessage, type, threadId }: { threadId: string 
 		} catch {
 			return '';
 		}
-	}, [threadStreamState, toolMessage, type, commandStr, pollTick]);
+	}, [threadStreamState, toolMessage, commandStr, pollTick]);
 
-	const tmpTerminalId: string | undefined = useMemo(() => {
-		const p: any = (toolMessage as any)?.params ?? {};
-		const r: any = (toolMessage as any)?.result ?? {};
-		const ro: any = (toolMessage as any)?.rawOutput ?? {};
-		const rp: any = (toolMessage as any)?.rawParams ?? {};
-
-
-		const toolInfoParams: any = threadStreamState?.toolInfo?.toolParams ?? {};
-
-		const candidates = [
-			p.terminalId, p.tmpTerminalId, p.temporaryTerminalId,
-			r.terminalId, r.tmpTerminalId, r.temporaryTerminalId,
-			ro.terminalId, ro.tmpTerminalId, ro.temporaryTerminalId,
-			rp.terminalId, rp.tmpTerminalId, rp.temporaryTerminalId,
-
-			toolInfoParams.terminalId,
-			toolInfoParams.tmpTerminalId,
-			toolInfoParams.temporaryTerminalId,
-		];
-
-		for (const c of candidates) {
-			if (typeof c === 'string' && c.trim()) return c.trim();
-		}
-		return undefined;
-		// pollTick forces re-evaluation even if objects were mutated without state updates
-	}, [toolMessage, pollTick, threadStreamState]);
-
-	const attachableTerminal = useMemo(() => {
-		if (type !== 'run_command') return undefined;
-		if (toolMessage.type !== 'running_now') return undefined;
-		if (!tmpTerminalId) return undefined;
-		return terminalToolsService.getTemporaryTerminal(tmpTerminalId);
-	}, [terminalToolsService, tmpTerminalId, toolMessage.type, type]);
-
-	useEffect(() => {
-		if (!attachableTerminal) return;
-
-		const container = terminalContainerRef.current;
-		if (!container) return;
-
-		try {
-			if (typeof (attachableTerminal as any).attachToElement !== 'function') {
-				setAttachFailed(true);
-				return;
-			}
-			(attachableTerminal as any).attachToElement(container);
-			(attachableTerminal as any).setVisible(true);
-			setAttachFailed(false);
-		} catch {
-			setAttachFailed(true);
-			return;
-		}
-
-		const resizeObserver = new ResizeObserver((entries) => {
-			const height = entries[0].borderBoxSize[0].blockSize;
-			const width = entries[0].borderBoxSize[0].inlineSize;
-			if (typeof (attachableTerminal as any).layout === 'function') {
-				(attachableTerminal as any).layout({ width, height });
-			}
-		});
-		resizeObserver.observe(container);
-
-		return () => {
-			try { (attachableTerminal as any).detachFromElement?.(); } catch { }
-			try { resizeObserver.disconnect(); } catch { }
-		};
-	}, [attachableTerminal]);
 	const commandBlock = commandStr
-		? <div className="px-2 pt-1 pb-0 text-xs text-void-fg-4 font-mono whitespace-pre-wrap break-all">{commandStr}</div>
+		? <div className="px-2 pt-1 pb-0 text-xs text-void-fg-4 font-mono truncate">{commandStr}</div>
 		: null;
 
 	// Avoid showing engine placeholder as "output"
@@ -1022,26 +985,26 @@ export const CommandTool = ({ toolMessage, type, threadId }: { threadId: string 
 	const TAIL_LIMIT = 6000;
 	const displayStreamingText = useMemo(() => {
 		if (!streamingText) return '';
-		if (toolMessage.type !== 'running_now') return streamingText;
-		if (streamingText.length <= TAIL_LIMIT) return streamingText;
+		const normalized = normalizeTerminalPreviewText(streamingText, false);
+		if (toolMessage.type !== 'running_now') return normalized;
+		if (normalized.length <= TAIL_LIMIT) return normalized;
 
-		const tail = streamingText.slice(streamingText.length - TAIL_LIMIT);
+		const tail = normalized.slice(normalized.length - TAIL_LIMIT);
 		return (
-			`[showing last ${TAIL_LIMIT} chars of ${streamingText.length}]\n` +
+			`[showing last ${TAIL_LIMIT} chars of ${normalized.length}]\n` +
 			`…\n` +
 			tail
 		);
-	}, [streamingText, toolMessage.type]);
+	}, [streamingText, toolMessage.type, normalizeTerminalPreviewText]);
 
 	const outputScrollRef = useRef<HTMLDivElement | null>(null);
 	useEffect(() => {
 		if (toolMessage.type !== 'running_now') return;
-		if (attachableTerminal) return;
 
 		const el = outputScrollRef.current;
 		if (!el) return;
 		el.scrollTop = el.scrollHeight;
-	}, [attachableTerminal, displayStreamingText, toolMessage.type]);
+	}, [displayStreamingText, toolMessage.type]);
 
 	if (toolMessage.type === 'success') {
 		const { result } = toolMessage;
@@ -1049,9 +1012,8 @@ export const CommandTool = ({ toolMessage, type, threadId }: { threadId: string 
 		let msg: string =
 			toolMessage.displayContent
 			?? toolMessage.content
-			?? (type === 'run_command'
-				? toolsService.stringOfResult['run_command'](toolMessage.params, result)
-				: toolsService.stringOfResult['run_persistent_command'](toolMessage.params, result));
+			?? toolsService.stringOfResult['run_command'](toolMessage.params, result);
+		msg = normalizeTerminalPreviewText(msg, true);
 
 		componentParams.children = (
 			<ToolChildrenWrapper className="whitespace-pre text-nowrap overflow-auto text-sm">
@@ -1078,33 +1040,17 @@ export const CommandTool = ({ toolMessage, type, threadId }: { threadId: string 
 	}
 
 	if (toolMessage.type === 'running_now') {
-		if (type === 'run_command') {
-			componentParams.children = (attachableTerminal && !attachFailed)
-				? <div ref={terminalContainerRef} className="relative h-[300px] text-sm" />
-				: (
-					<ToolChildrenWrapper className="overflow-auto max-h-[300px]">
-						<CodeChildren className="bg-void-bg-3">
-							<div ref={outputScrollRef} className="max-h-[300px] overflow-auto">
-								<pre className="font-mono whitespace-pre-wrap break-words">
-									{displayStreamingText || '(waiting for output...)'}
-								</pre>
-							</div>
-						</CodeChildren>
-					</ToolChildrenWrapper>
-				);
-		} else {
-			componentParams.children = (
-				<ToolChildrenWrapper className="overflow-auto max-h-[300px]">
-					<CodeChildren className="bg-void-bg-3">
-						<div ref={outputScrollRef} className="max-h-[300px] overflow-auto">
-							<pre className="font-mono whitespace-pre-wrap break-words">
-								{displayStreamingText || '(running...)'}
-							</pre>
-						</div>
-					</CodeChildren>
-				</ToolChildrenWrapper>
-			);
-		}
+		componentParams.children = (
+			<ToolChildrenWrapper className="overflow-auto max-h-[300px]">
+				<CodeChildren className="bg-void-bg-3">
+					<div ref={outputScrollRef} className="max-h-[300px] overflow-auto">
+						<pre className="font-mono whitespace-pre-wrap break-words">
+							{displayStreamingText || '(waiting for output...)'}
+						</pre>
+					</div>
+				</CodeChildren>
+			</ToolChildrenWrapper>
+		);
 
 		componentParams.bottomChildren = (
 			<>
@@ -1382,6 +1328,45 @@ const EditTool = (
 
 type AnyResultWrapper = (props: any) => React.ReactNode
 export const toolNameToComponent: Partial<Record<ToolName, { resultWrapper: AnyResultWrapper }>> = {
+	'activate_skill': {
+		resultWrapper: ({ toolMessage }) => {
+			const paramsAny = (toolMessage as any).params ?? {};
+			const rawParamsAny = (toolMessage as any).rawParams ?? {};
+			const resultAny = (toolMessage as any).result ?? {};
+			const skillName = resultAny?.name ?? paramsAny?.name ?? rawParamsAny?.name ?? '';
+			const skillFileUriRaw = resultAny?.skillFileUri;
+			const skillFileUri = skillFileUriRaw
+				? (typeof skillFileUriRaw?.toString === 'function' ? skillFileUriRaw.toString() : String(skillFileUriRaw))
+				: undefined;
+			const isError = toolMessage.type === 'tool_error';
+			const isRejected = toolMessage.type === 'rejected';
+			const contentToShow =
+				toolMessage.type === 'tool_error'
+					? String((toolMessage as any).result ?? '')
+					: (resultAny?.contentForModel ?? (toolMessage as any).displayContent ?? (toolMessage as any).content ?? '');
+
+			const componentParams: ToolHeaderParams = {
+				title: getTitle(toolMessage),
+				desc1: skillName,
+				desc1Info: skillFileUri,
+				desc2: resultAny?.alreadyActive ? 'Already active' : undefined,
+				info: skillFileUri ? `Skill file: ${skillFileUri}` : undefined,
+				isError,
+				isRejected,
+			};
+			applyCanceledUi(componentParams, toolMessage);
+
+			if (contentToShow) {
+				componentParams.children = (
+					<ToolChildrenWrapper>
+						<CodeChildren>{contentToShow}</CodeChildren>
+					</ToolChildrenWrapper>
+				);
+			}
+
+			return <ToolHeaderWrapper {...componentParams} defaultIsOpen={false} />;
+		},
+	},
 	'read_file': {
 		resultWrapper: ({ toolMessage }) => {
 			const accessor = useAccessor();
@@ -2026,79 +2011,7 @@ export const toolNameToComponent: Partial<Record<ToolName, { resultWrapper: AnyR
 	},
 	'run_command': {
 		resultWrapper: (params) => {
-			return <CommandTool {...params} type='run_command' />
+			return <CommandTool {...params} />
 		}
-	},
-
-	'run_persistent_command': {
-		resultWrapper: (params) => {
-			return <CommandTool {...params} type='run_persistent_command' />
-		}
-	},
-	'open_persistent_terminal': {
-		resultWrapper: ({ toolMessage }) => {
-			const accessor = useAccessor()
-			const terminalToolsService = accessor.get('ITerminalToolService')
-
-			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
-			const title = getTitle(toolMessage)
-			const icon = null
-			const isError = false
-			const isRejected = toolMessage.type === 'rejected'
-			const { rawParams, params } = toolMessage
-			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected, }
-			applyCanceledUi(componentParams, toolMessage);
-			const cwdUri = resolvePathLikeToUri(params?.cwd, accessor)
-			const relativePath = cwdUri ? getRelative(cwdUri, accessor) : ''
-			componentParams.info = relativePath ? `Running in ${relativePath}` : undefined
-
-			if (toolMessage.type === 'success') {
-				const { result } = toolMessage
-				const { persistentTerminalId } = result
-				componentParams.desc1 = persistentTerminalNameOfId(persistentTerminalId)
-				componentParams.onClick = () => terminalToolsService.focusPersistentTerminal(persistentTerminalId)
-			}
-			else if (toolMessage.type === 'tool_error') {
-				const { result } = toolMessage
-				componentParams.bottomChildren = <BottomChildren title='Error'>
-					<CodeChildren>
-						{result}
-					</CodeChildren>
-				</BottomChildren>
-			}
-
-			return <ToolHeaderWrapper {...componentParams} />
-		},
-	},
-	'kill_persistent_terminal': {
-		resultWrapper: ({ toolMessage }) => {
-			const accessor = useAccessor()
-			const commandService = accessor.get('ICommandService')
-			const terminalToolsService = accessor.get('ITerminalToolService')
-
-			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
-			const title = getTitle(toolMessage)
-			const icon = null
-			const isError = false
-			const isRejected = toolMessage.type === 'rejected'
-			const { rawParams, params } = toolMessage
-			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected, }
-			applyCanceledUi(componentParams, toolMessage);
-			if (toolMessage.type === 'success') {
-				const { persistentTerminalId } = params
-				componentParams.desc1 = persistentTerminalNameOfId(persistentTerminalId)
-				componentParams.onClick = () => terminalToolsService.focusPersistentTerminal(persistentTerminalId)
-			}
-			else if (toolMessage.type === 'tool_error') {
-				const { result } = toolMessage
-				componentParams.bottomChildren = <BottomChildren title='Error'>
-					<CodeChildren>
-						{result}
-					</CodeChildren>
-				</BottomChildren>
-			}
-
-			return <ToolHeaderWrapper {...componentParams} />
-		},
 	},
 };

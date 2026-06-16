@@ -21,6 +21,7 @@ import { ChatMessage, ToolMessage, ChatAttachment } from '../../../../platform/v
 import { ModelSelection, ModelSelectionOptions } from '../../../../platform/void/common/voidSettingsTypes.js';
 import { getModelCapabilities } from '../../../../platform/void/common/modelInference.js';
 import { type JsonObject, type JsonValue, isJsonObject, stringifyUnknown, toJsonObject } from '../../../../platform/void/common/jsonTypes.js';
+import { classifyToolCall, duplicateWriteTargetError } from '../../../../platform/void/common/toolExecutionPolicy.js';
 
 import { ChatHistoryCompressor } from './ChatHistoryCompressor.js';
 import { ChatToolOutputManager } from './ChatToolOutputManager.js';
@@ -253,12 +254,10 @@ export class ChatExecutionEngine {
 				nAttempts += 1;
 				let lastUsageForTurn: LLMTokenUsage | undefined;
 
-				let limitsForThisRequest: any;
 				try {
 					if (modelSelection) {
 						const { providerName, modelName } = modelSelection;
 						const caps = getModelCapabilities(providerName as any, modelName, overridesOfModel);
-						limitsForThisRequest = { contextWindow: caps.contextWindow };
 						const reserved = caps.reservedOutputTokenSpace ?? 0;
 						const maxInputTokens = Math.max(0, caps.contextWindow - reserved);
 						access.setThreadState(threadId, { tokenUsageLastRequestLimits: { maxInputTokens } });
@@ -266,7 +265,7 @@ export class ChatExecutionEngine {
 				} catch { /* noop */ }
 
 				type ResTypes =
-					| { type: 'llmDone'; toolCall?: RawToolCallObj; info: { fullText: string; fullReasoning: string; anthropicReasoning: any }; tokenUsage?: LLMTokenUsage }
+					| { type: 'llmDone'; toolCalls?: RawToolCallObj[]; toolCall?: RawToolCallObj; info: { fullText: string; fullReasoning: string; anthropicReasoning: any }; tokenUsage?: LLMTokenUsage }
 					| { type: 'llmError'; error?: { message: string; fullError: Error | null } }
 					| { type: 'llmAborted' };
 
@@ -282,17 +281,18 @@ export class ChatExecutionEngine {
 					overridesOfModel,
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
 					separateSystemMessage: separateSystemMessage,
-					onText: ({ fullText, fullReasoning, toolCall, tokenUsage }) => {
+					onText: ({ fullText, fullReasoning, toolCalls, toolCall, tokenUsage }) => {
 						if (tokenUsage) lastUsageForTurn = tokenUsage;
+						const displayToolCall = toolCall ?? toolCalls?.[0] ?? null;
 						access.setStreamState(threadId, {
 							isRunning: 'LLM',
-							llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallSoFar: toolCall ?? null },
+							llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallSoFar: displayToolCall },
 							interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken); })
 						});
 					},
-					onFinalMessage: async ({ fullText, fullReasoning, toolCall, anthropicReasoning, tokenUsage, }) => {
+					onFinalMessage: async ({ fullText, fullReasoning, toolCalls, toolCall, anthropicReasoning, tokenUsage, }) => {
 						if (tokenUsage) lastUsageForTurn = tokenUsage;
-						resMessageIsDonePromise({ type: 'llmDone', toolCall, info: { fullText, fullReasoning, anthropicReasoning }, tokenUsage });
+						resMessageIsDonePromise({ type: 'llmDone', toolCalls, toolCall, info: { fullText, fullReasoning, anthropicReasoning }, tokenUsage });
 					},
 					onError: async (error) => {
 						resMessageIsDonePromise({ type: 'llmError', error: error });
@@ -345,7 +345,7 @@ export class ChatExecutionEngine {
 				}
 
 				// Success
-				const { toolCall, info, tokenUsage } = llmRes;
+				const { toolCalls, toolCall, info, tokenUsage } = llmRes;
 				const effectiveUsage = tokenUsage ?? lastUsageForTurn;
 				if (effectiveUsage) access.accumulateTokenUsage(threadId, effectiveUsage);
 
@@ -361,120 +361,26 @@ export class ChatExecutionEngine {
 
 				access.setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' });
 
+				const returnedToolCalls = (toolCalls?.length ? toolCalls : (toolCall ? [toolCall] : []))
+					.filter((call): call is RawToolCallObj => !!call?.name);
 
-				if (toolCall && toolCall.name) {
-					const loopAfterTool = loopDetector.registerToolCall(toolCall.name, toolCall.rawParams);
-					if (loopAfterTool.isLoop) {
+				if (returnedToolCalls.length) {
+					const batchResult = await this._runReturnedToolCalls(threadId, returnedToolCalls, loopDetector, access);
+					if (batchResult.loopDetected) {
 						access.setStreamState(threadId, { isRunning: undefined, error: { message: LOOP_DETECTED_MESSAGE, fullError: null } });
 						access.addUserCheckpoint(threadId);
 						return;
 					}
-
-					if (isAToolName(toolCall.name)) {
-						const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, {
-							preapproved: false,
-							unvalidatedToolParams: toolCall.rawParams
-						}, access);
-
-						if (interrupted) {
-							if (this.skippedToolCallIds.delete(toolCall.id)) {
-								shouldSendAnotherMessage = true;
-								access.setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' });
-							} else {
-								access.setStreamState(threadId, undefined);
-								return;
-							}
-						} else {
-							if (awaitingUserApproval) { isRunningWhenEnd = 'awaiting_user'; }
-							else { shouldSendAnotherMessage = true; }
-							access.setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' });
-						}
-					} else {
-						// Dynamic Tool (MCP)
-						if (this._isToolDisabled(toolCall.name)) {
-							const disabledError = this._disabledToolError(toolCall.name);
-							access.addMessageToThread(threadId, {
-								role: 'tool',
-								type: 'tool_error',
-								params: toolCall.rawParams as any,
-								result: disabledError,
-								name: toolCall.name as any,
-								content: disabledError,
-								displayContent: disabledError,
-								id: toolCall.id,
-								rawParams: toolCall.rawParams
-							});
-							shouldSendAnotherMessage = true;
-							access.setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' });
-							continue;
-						}
-
-						if (this._settingsService.state.globalSettings.mcpAutoApprove) {
-							access.updateLatestTool(threadId, {
-								role: 'tool',
-								type: 'running_now',
-								name: toolCall.name as any,
-								params: toolCall.rawParams as any,
-								content: 'running...',
-								displayContent: 'running...',
-								result: null,
-								id: toolCall.id,
-								rawParams: toolCall.rawParams
-							});
-
-							const exec = await this._runDynamicToolExec(
-								toolCall.name,
-								toJsonObject(toolCall.rawParams)
-							);
-
-							if (!exec.ok) {
-								access.updateLatestTool(threadId, {
-									role: 'tool',
-									type: 'tool_error',
-									params: toolCall.rawParams as any,
-									result: exec.error,
-									name: toolCall.name as any,
-									content: exec.error,
-									displayContent: exec.error,
-									id: toolCall.id,
-									rawParams: toolCall.rawParams
-								});
-
-								shouldSendAnotherMessage = true;
-								access.setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' });
-							} else {
-								const { result: processedResult, content, displayContent } =
-									await this._toolOutputManager.processToolResult(exec.value, toolCall.name);
-
-								access.updateLatestTool(threadId, {
-									role: 'tool',
-									type: 'success',
-									params: toolCall.rawParams as any,
-									result: processedResult,
-									name: toolCall.name as any,
-									content,
-									displayContent,
-									id: toolCall.id,
-									rawParams: toolCall.rawParams
-								});
-
-								shouldSendAnotherMessage = true;
-								access.setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' });
-							}
-						} else {
-							access.addMessageToThread(threadId, {
-								role: 'tool',
-								type: 'tool_request',
-								content: '(Awaiting user permission...)',
-								result: null,
-								name: toolCall.name as any,
-								params: toolCall.rawParams as any,
-								id: toolCall.id,
-								rawParams: toolCall.rawParams
-							});
-							isRunningWhenEnd = 'awaiting_user';
-						}
+					if (batchResult.interrupted) {
+						access.setStreamState(threadId, undefined);
+						return;
 					}
+					if (batchResult.awaitingUserApproval) {
+						isRunningWhenEnd = 'awaiting_user';
+					} else {
+						shouldSendAnotherMessage = true;
+					}
+					access.setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' });
 				}
 			}
 		}
@@ -482,6 +388,215 @@ export class ChatExecutionEngine {
 		access.setStreamState(threadId, { isRunning: isRunningWhenEnd });
 		if (!isRunningWhenEnd) access.addUserCheckpoint(threadId);
 		this._metricsService.capture('Agent Loop Done', { nMessagesSent, chatMode });
+	}
+
+	private _addToolErrorMessage(
+		threadId: string,
+		toolCall: RawToolCallObj,
+		error: string,
+		access: IThreadStateAccess
+	): void {
+		access.addMessageToThread(threadId, {
+			role: 'tool',
+			type: 'tool_error',
+			params: toolCall.rawParams as any,
+			result: error,
+			name: toolCall.name as any,
+			content: error,
+			displayContent: error,
+			id: toolCall.id,
+			rawParams: toolCall.rawParams
+		});
+	}
+
+	private _addSkippedToolResultsForRemainingBatch(
+		threadId: string,
+		toolCalls: readonly RawToolCallObj[],
+		startIndex: number,
+		reason: string,
+		access: IThreadStateAccess
+	): void {
+		for (let i = startIndex; i < toolCalls.length; i += 1) {
+			this._addToolErrorMessage(threadId, toolCalls[i], reason, access);
+		}
+	}
+
+	private async _runReturnedToolCalls(
+		threadId: string,
+		toolCalls: readonly RawToolCallObj[],
+		loopDetector: LLMLoopDetector,
+		access: IThreadStateAccess
+	): Promise<{ awaitingUserApproval?: boolean; interrupted?: boolean; loopDetected?: boolean }> {
+		const seenWriteTargets = new Set<string>();
+		let executedOrErrored = false;
+		let pendingReadOnlyToolExecutions: Promise<{ toolCall: RawToolCallObj; awaitingUserApproval?: boolean; interrupted?: boolean }>[] = [];
+
+		const drainPendingReadOnlyToolExecutions = async (): Promise<{ awaitingUserApproval?: boolean; interrupted?: boolean }> => {
+			if (!pendingReadOnlyToolExecutions.length) return {};
+			const batch = pendingReadOnlyToolExecutions;
+			pendingReadOnlyToolExecutions = [];
+			const results = await Promise.all(batch);
+			for (const result of results) {
+				if (result.interrupted) {
+					if (this.skippedToolCallIds.delete(result.toolCall.id)) {
+						executedOrErrored = true;
+						continue;
+					}
+					return { interrupted: true };
+				}
+				if (result.awaitingUserApproval) {
+					return { awaitingUserApproval: true };
+				}
+				executedOrErrored = true;
+			}
+			return {};
+		};
+
+		for (let i = 0; i < toolCalls.length; i += 1) {
+			const toolCall = toolCalls[i];
+			const plan = classifyToolCall({ id: toolCall.id, name: toolCall.name, rawParams: toolCall.rawParams as Record<string, unknown> });
+
+			if (plan.kind !== 'read-only') {
+				const pendingResult = await drainPendingReadOnlyToolExecutions();
+				if (pendingResult.interrupted || pendingResult.awaitingUserApproval) return pendingResult;
+			}
+
+			if (plan.kind === 'mutating') {
+				const target = plan.writeTarget;
+				if (!target || seenWriteTargets.has(target)) {
+					this._addToolErrorMessage(threadId, toolCall, duplicateWriteTargetError(target), access);
+					executedOrErrored = true;
+					continue;
+				}
+				seenWriteTargets.add(target);
+			}
+
+			const loopAfterTool = loopDetector.registerToolCall(toolCall.name, toolCall.rawParams);
+			if (loopAfterTool.isLoop) {
+				const pendingResult = await drainPendingReadOnlyToolExecutions();
+				if (pendingResult.interrupted || pendingResult.awaitingUserApproval) return pendingResult;
+				return { loopDetected: true };
+			}
+
+			if (isAToolName(toolCall.name)) {
+				const runBuiltInTool = async () => {
+					const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, {
+						preapproved: false,
+						unvalidatedToolParams: toolCall.rawParams
+					}, access);
+					return { toolCall, awaitingUserApproval, interrupted };
+				};
+
+				if (plan.kind === 'read-only') {
+					pendingReadOnlyToolExecutions.push(runBuiltInTool());
+					continue;
+				}
+
+				const { awaitingUserApproval, interrupted } = await runBuiltInTool();
+
+				if (interrupted) {
+					if (this.skippedToolCallIds.delete(toolCall.id)) {
+						executedOrErrored = true;
+						continue;
+					}
+					return { interrupted: true };
+				}
+
+				if (awaitingUserApproval) {
+					this._addSkippedToolResultsForRemainingBatch(
+						threadId,
+						toolCalls,
+						i + 1,
+						'Tool call was skipped because another tool call in the same assistant turn is awaiting user approval.',
+						access
+					);
+					return { awaitingUserApproval: true };
+				}
+
+				executedOrErrored = true;
+				continue;
+			}
+
+			if (this._isToolDisabled(toolCall.name)) {
+				this._addToolErrorMessage(threadId, toolCall, this._disabledToolError(toolCall.name), access);
+				executedOrErrored = true;
+				continue;
+			}
+
+			if (!this._settingsService.state.globalSettings.mcpAutoApprove) {
+				access.addMessageToThread(threadId, {
+					role: 'tool',
+					type: 'tool_request',
+					content: '(Awaiting user permission...)',
+					result: null,
+					name: toolCall.name as any,
+					params: toolCall.rawParams as any,
+					id: toolCall.id,
+					rawParams: toolCall.rawParams
+				});
+				this._addSkippedToolResultsForRemainingBatch(
+					threadId,
+					toolCalls,
+					i + 1,
+					'Tool call was skipped because another tool call in the same assistant turn is awaiting user approval.',
+					access
+				);
+				return { awaitingUserApproval: true };
+			}
+
+			access.updateLatestTool(threadId, {
+				role: 'tool',
+				type: 'running_now',
+				name: toolCall.name as any,
+				params: toolCall.rawParams as any,
+				content: 'running...',
+				displayContent: 'running...',
+				result: null,
+				id: toolCall.id,
+				rawParams: toolCall.rawParams
+			});
+
+			const exec = await this._runDynamicToolExec(
+				toolCall.name,
+				toJsonObject(toolCall.rawParams)
+			);
+
+			if (!exec.ok) {
+				access.updateLatestTool(threadId, {
+					role: 'tool',
+					type: 'tool_error',
+					params: toolCall.rawParams as any,
+					result: exec.error,
+					name: toolCall.name as any,
+					content: exec.error,
+					displayContent: exec.error,
+					id: toolCall.id,
+					rawParams: toolCall.rawParams
+				});
+			} else {
+				const { result: processedResult, content, displayContent } =
+					await this._toolOutputManager.processToolResult(exec.value, toolCall.name);
+
+				access.updateLatestTool(threadId, {
+					role: 'tool',
+					type: 'success',
+					params: toolCall.rawParams as any,
+					result: processedResult,
+					name: toolCall.name as any,
+					content,
+					displayContent,
+					id: toolCall.id,
+					rawParams: toolCall.rawParams
+				});
+			}
+
+			executedOrErrored = true;
+		}
+
+		const pendingResult = await drainPendingReadOnlyToolExecutions();
+		if (pendingResult.interrupted || pendingResult.awaitingUserApproval) return pendingResult;
+
+		return executedOrErrored ? {} : {};
 	}
 
 	private async _runToolCall(
@@ -575,7 +690,7 @@ export class ChatExecutionEngine {
 				const approvalType = approvalTypeOfToolName[toolName];
 				if (approvalType) {
 					let autoApprove = this._settingsService.state.globalSettings.autoApprove[approvalType];
-					if (approvalType === 'terminal' && (toolName === 'run_command' || toolName === 'run_persistent_command')) {
+					if (approvalType === 'terminal' && toolName === 'run_command') {
 						try {
 							const cmd = (toolParams as any)?.command ?? String((opts.unvalidatedToolParams as any)?.command ?? '');
 							if (isDangerousTerminalCommand(cmd)) autoApprove = false;

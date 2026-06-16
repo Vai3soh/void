@@ -6,6 +6,8 @@
 import { AdditionalToolInfo, AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolCallObjKnown, RawToolCallObjDynamic, RawToolParamsObj, DynamicRequestConfig, RequestParamsConfig, ProviderRouting, LLMTokenUsage } from '../../common/sendLLMMessageTypes.js';
 import { ChatMode, specialToolFormat, displayInfoOfProviderName, ModelSelectionOptions, OverridesOfModel, ProviderName, SettingsOfProvider } from '../../common/voidSettingsTypes.js';
 import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, getReservedOutputTokenSpace } from '../../common/modelInference.js';
+import { isExcluded } from '../../common/requestParams.js';
+import { createParallelToolCallsConfig, getParallelToolCallsPayloadValue } from '../../common/parallelToolCalls.js';
 
 import { extractReasoningAndXMLToolsWrapper, extractReasoningWrapper } from './extractGrammar.js';
 import { availableTools, InternalToolInfo, isAToolName, voidTools } from '../../common/toolsRegistry.js';
@@ -28,14 +30,65 @@ const XML_TOOL_FORMAT_CORRECTION_PROMPT = [
 ].join(' ');
 
 type ChatCompletionCreateParamsStreaming = import('openai/resources/chat/completions').ChatCompletionCreateParamsStreaming;
-//type ChatCompletionChunk = import('openai/resources/chat/completions').ChatCompletionChunk;
-//type OpenAIStream<T> = import('openai/streaming').Stream<T>;
 type OpenAIChatCompletionTool = import('openai/resources/chat/completions/completions.js').ChatCompletionTool;
 type OpenAIClient = import('openai').OpenAI;
 type OpenAIClientOptions = import('openai').ClientOptions;
 type GoogleGeminiTool = import('@google/genai').Tool;
 type GoogleThinkingConfig = import('@google/genai').ThinkingConfig;
 type AnthropicToolUseBlock = import('@anthropic-ai/sdk').Anthropic.ToolUseBlock;
+type AnthropicClientOptions = import('@anthropic-ai/sdk').ClientOptions;
+
+type FetchForOpenAI = NonNullable<OpenAIClientOptions['fetch']>;
+type FetchForAnthropic = NonNullable<AnthropicClientOptions['fetch']>;
+type GlobalFetchInit = Parameters<typeof globalThis.fetch>[1];
+type NodeFetchModule = typeof import('node-fetch');
+type NodeFetchResponse = InstanceType<NodeFetchModule['Response']>;
+type FetchResponseForOpenAI = Awaited<ReturnType<FetchForOpenAI>>;
+type FetchResponseForAnthropic = Awaited<ReturnType<FetchForAnthropic>>;
+
+const toNodeFetchResponseForAnthropic = async (response: Response): Promise<FetchResponseForAnthropic> => {
+	const nodeFetch = await import('node-fetch');
+	const headers: Record<string, string> = {};
+	response.headers.forEach((value, key) => {
+		headers[key] = value;
+	});
+	const body = Buffer.from(await response.arrayBuffer());
+	return new nodeFetch.Response(body, {
+		headers,
+		status: response.status,
+		statusText: response.statusText,
+	});
+};
+
+const toOpenAICompatibleFetchResponse = async (response: Response): Promise<NodeFetchResponse> => {
+	const nodeFetch = await import('node-fetch');
+	const headers: Record<string, string> = {};
+	response.headers.forEach((value, key) => {
+		headers[key] = value;
+	});
+	const isStreamingResponse = response.headers.get('content-type')?.toLowerCase().includes('text/event-stream') ?? false;
+	const body = isStreamingResponse ? undefined : Buffer.from(await response.arrayBuffer());
+	const nodeResponse = new nodeFetch.Response(body, {
+		headers,
+		status: response.status,
+		statusText: response.statusText,
+	});
+	if (isStreamingResponse) {
+		Object.defineProperty(nodeResponse, 'body', {
+			value: response.body,
+		});
+	}
+	return nodeResponse;
+};
+
+const fetchForOpenAI: FetchForOpenAI = async (url, init): Promise<FetchResponseForOpenAI> => {
+	const response = await globalThis.fetch(String(url), init as GlobalFetchInit);
+	return toOpenAICompatibleFetchResponse(response);
+};
+const fetchForAnthropic: FetchForAnthropic = async (url, init) => {
+	const response = await globalThis.fetch(String(url), init as GlobalFetchInit);
+	return toNodeFetchResponseForAnthropic(response);
+};
 
 let openAIModule: (typeof import('openai')) | undefined;
 const getOpenAIModule = async () => openAIModule ??= await import('openai');
@@ -72,6 +125,7 @@ const normalizeHeaders = (h: any): Record<string, string> => {
 };
 
 let _fetchDebugInstalled = false;
+let _origFetchForDebugLogging: typeof globalThis.fetch | undefined;
 
 const _safeJson = (v: unknown): string => {
 	try { return JSON.stringify(v, null, 2); } catch { return String(v); }
@@ -133,6 +187,20 @@ const _deepRedact = (v: unknown): unknown => {
 	return out;
 };
 
+const _redactUrl = (url: string): string => {
+	try {
+		const parsed = new URL(url);
+		for (const key of Array.from(parsed.searchParams.keys())) {
+			if (_shouldRedactKey(key) || key.toLowerCase() === 'key') {
+				parsed.searchParams.set(key, '***');
+			}
+		}
+		return parsed.toString();
+	} catch {
+		return url.replace(/([?&](?:key|api[-_]?key|token|secret|password|authorization)=)[^&]*/gi, '$1***');
+	}
+};
+
 /**
  * Optional debugging helper. Call from electron-main startup when log level is Debug/Trace.
  * Redacts API keys/tokens from headers and JSON bodies.
@@ -145,15 +213,17 @@ export function installDebugFetchLogging(logService: ILogService): void {
 		const desc = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
 		if (!desc || desc.writable) {
 			const orig = globalThis.fetch;
-			globalThis.fetch = async (input: any, init?: any) => {
+			_origFetchForDebugLogging = orig;
+			globalThis.fetch = async (input: Parameters<typeof globalThis.fetch>[0], init?: Parameters<typeof globalThis.fetch>[1]) => {
 				let url = '';
 				let method = 'GET';
 
 				try {
-					url = typeof input === 'string' ? input : (input?.url ?? String(input));
-					method = init?.method ?? 'GET';
+					const request = input instanceof Request ? input : undefined;
+					url = _redactUrl(typeof input === 'string' ? input : request ? request.url : String(input));
+					method = init?.method ?? request?.method ?? 'GET';
 
-					const hdrsRaw = normalizeHeaders(init?.headers ?? input?.headers);
+					const hdrsRaw = normalizeHeaders(init?.headers ?? request?.headers);
 					const hdrs = _redactHeaders(hdrsRaw);
 
 					_logDebug(logService, `HTTP Request ${method} ${url}`);
@@ -176,7 +246,7 @@ export function installDebugFetchLogging(logService: ILogService): void {
 					// ignore
 				}
 
-				const resp = await (orig as any)(input, init);
+				const resp = await orig(input, init);
 
 				try {
 					const respHdrsRaw = normalizeHeaders(resp?.headers);
@@ -448,6 +518,7 @@ const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includ
 	const { default: OpenAI } = await getOpenAIModule();
 	const commonPayloadOpts: OpenAIClientOptions = {
 		dangerouslyAllowBrowser: true,
+		fetch: fetchForOpenAI,
 		...includeInPayload,
 	};
 
@@ -550,16 +621,17 @@ const _sendOpenAICompatibleFIM = async (params: SendFIMParams_Internal) => {
 			apiKey: token,
 			defaultHeaders: headersNoAuth,
 			dangerouslyAllowBrowser: true,
+			fetch: fetchForOpenAI,
 			maxRetries: 0,
 		});
 
-		
+
 		modelForRequest = modelName;
 	} else {
 		openai = await newOpenAICompatibleSDK({ providerName, settingsOfProvider });
 	}
 
-	
+
 	const basePayload: any = {
 		model: modelForRequest,
 		prompt: prefix,
@@ -886,9 +958,9 @@ export async function runStream({
 
 	const __TOOL_TAG_RE: RegExp = (() => {
 		const names = __toolNames.map(__escapeRe).filter(Boolean);
-		
+
 		// - <tool_call ...> / </tool_call>
-		
+
 		const alts = names.length ? `|${names.join('|')}` : '';
 		return new RegExp(`<\\s*(?:\\/\\s*)?(?:tool_call\\b${alts})`, 'i');
 	})();
@@ -1038,13 +1110,16 @@ export async function runStream({
 
 	type ToolAcc = { name: string; id: string; args: string; };
 
-	const pickPreferredToolAcc = (m: Map<number, ToolAcc>): ToolAcc | undefined => {
-		if (m.has(0)) return m.get(0);
-		let bestIdx: number | null = null;
-		for (const k of m.keys()) {
-			if (bestIdx === null || k < bestIdx) bestIdx = k;
+	const buildToolCallsFromAcc = (m: Map<number, ToolAcc>, toolDefsMap?: ReadonlyMap<string, ToolInfoUnion>): RawToolCallObj[] => {
+		const calls: RawToolCallObj[] = [];
+		const indexes = Array.from(m.keys()).sort((a, b) => a - b);
+		for (const idx of indexes) {
+			const acc = m.get(idx);
+			if (!acc) continue;
+			const call = rawToolCallObjOf(acc.name, acc.args, acc.id, toolDefsMap);
+			if (call) calls.push(call);
 		}
-		return bestIdx === null ? undefined : m.get(bestIdx);
+		return calls;
 	};
 
 	for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
@@ -1063,16 +1138,18 @@ export async function runStream({
 		let sawAnyReasoningDelta = false;
 		let sawAnyTextDelta = false;
 
-		// “reasoning stopped” heuristic
+		//reasoning stopped heuristic
 		let lastReasoningAppendChunk = -1;
 		let loggedReasoningStop = false;
 
-		// “XML tool tags seen”
+		//XML tool tags seen
 		let sawXmlToolTagInText = false;
 		let sawXmlToolTagInReasoning = false;
 		let sawToolCallsStructured = false;
 
 		const toolAccByIdx = new Map<number, ToolAcc>();
+		const idxOfToolCallId = new Map<string, number>();
+		let currentImplicitToolIdx = 0;
 		const getAcc = (idx: number): ToolAcc => {
 			let acc = toolAccByIdx.get(idx);
 			if (!acc) {
@@ -1081,12 +1158,45 @@ export async function runStream({
 			}
 			return acc;
 		};
-
-		const buildToolCall = (): RawToolCallObj | null => {
-			const pref = pickPreferredToolAcc(toolAccByIdx);
-			if (!pref) return null;
-			return rawToolCallObjOf(pref.name, pref.args, pref.id, toolDefsMap);
+		const nextToolIdx = (): number => {
+			const indexes = Array.from(toolAccByIdx.keys());
+			return indexes.length ? Math.max(...indexes) + 1 : 0;
 		};
+		const resolveStreamingToolIdx = (tool: any): number => {
+			const rawIdx = tool?.index;
+			if (rawIdx !== undefined && rawIdx !== null) {
+				const idx = normalizeToolIndex(rawIdx);
+				const id = typeof tool?.id === 'string' ? tool.id : '';
+				if (id) idxOfToolCallId.set(id, idx);
+				currentImplicitToolIdx = idx;
+				return idx;
+			}
+
+			const id = typeof tool?.id === 'string' ? tool.id : '';
+			const existingIdx = id ? idxOfToolCallId.get(id) : undefined;
+			if (existingIdx !== undefined) {
+				currentImplicitToolIdx = existingIdx;
+				return existingIdx;
+			}
+
+			const functionName = typeof tool?.function?.name === 'string' ? tool.function.name : '';
+			if (id || functionName) {
+				const currentAcc = toolAccByIdx.get(currentImplicitToolIdx);
+				if (currentAcc && (currentAcc.id || currentAcc.name || currentAcc.args)) {
+					const isSameId = !!id && currentAcc.id === id;
+					const isSameNameWithoutNewId = !id && !!functionName && currentAcc.name === functionName && !tryParseJsonWhenComplete(currentAcc.args).ok;
+					if (!isSameId && !isSameNameWithoutNewId) {
+						currentImplicitToolIdx = nextToolIdx();
+					}
+				}
+				if (id) idxOfToolCallId.set(id, currentImplicitToolIdx);
+				return currentImplicitToolIdx;
+			}
+
+			return currentImplicitToolIdx;
+		};
+
+		const buildToolCalls = (): RawToolCallObj[] => buildToolCallsFromAcc(toolAccByIdx, toolDefsMap);
 
 		__dbg('attempt start', {
 			attempt,
@@ -1151,11 +1261,13 @@ export async function runStream({
 				const toolCalls = msg?.tool_calls ?? msg?.toolCalls ?? [];
 				if (Array.isArray(toolCalls) && toolCalls.length > 0) {
 					sawToolCallsStructured = true;
-					const t0 = toolCalls[0];
-					const acc = getAcc(0);
-					acc.name = t0?.function?.name ?? '';
-					acc.id = t0?.id ?? '';
-					acc.args = coerceArgsToString(t0?.function?.arguments ?? '');
+					for (let i = 0; i < toolCalls.length; i += 1) {
+						const tool = toolCalls[i];
+						const acc = getAcc(normalizeToolIndex((tool as any)?.index ?? i));
+						acc.name = tool?.function?.name ?? '';
+						acc.id = tool?.id ?? '';
+						acc.args = coerceArgsToString(tool?.function?.arguments ?? '');
+					}
 				}
 
 				const legacyFC = msg?.function_call;
@@ -1167,7 +1279,8 @@ export async function runStream({
 					acc.args = coerceArgsToString(legacyFC?.arguments ?? '');
 				}
 
-				const toolCall = buildToolCall();
+				const toolCallsFinal = buildToolCalls();
+				const toolCall = toolCallsFinal[0] ?? null;
 
 				__dbg('non-stream end', {
 					attempt,
@@ -1211,6 +1324,7 @@ export async function runStream({
 						fullText: text ?? '',
 						fullReasoning: collectedReasoning ?? '',
 						anthropicReasoning: null,
+						...(toolCallsFinal.length ? { toolCalls: toolCallsFinal } : {}),
 						...(toolCall ? { toolCall } : {}),
 						...(tokenUsage ? { tokenUsage } : {}),
 					});
@@ -1338,7 +1452,7 @@ export async function runStream({
 					}
 				}
 
-				// Reasoning “stopped coming” heuristic (log once)
+				// Reasoning "stopped coming" heuristic (log once)
 				if (__isHeavyDebugEnabled && !loggedReasoningStop && sawAnyReasoningDelta && lastReasoningAppendChunk >= 0) {
 					if ((chunkCount - lastReasoningAppendChunk) >= 30) {
 						loggedReasoningStop = true;
@@ -1370,14 +1484,17 @@ export async function runStream({
 				}
 
 				for (const tool of toolCalls) {
-					const idx = normalizeToolIndex((tool as any)?.index);
+					const idx = resolveStreamingToolIdx(tool);
 					const acc = getAcc(idx);
 
 					const functionName = tool.function?.name ?? '';
 					const id = tool.id ?? '';
 					const functionArgs = coerceArgsToString(tool.function?.arguments);
 
-					if (id && !acc.id) acc.id = id;
+					if (id && !acc.id) {
+						acc.id = id;
+						idxOfToolCallId.set(id, idx);
+					}
 					if (functionName && !acc.name) acc.name = functionName;
 
 					if (allowedToolNames && acc.name && !allowedToolNames.includes(acc.name)) {
@@ -1458,20 +1575,23 @@ export async function runStream({
 
 				// progress
 				if (emitToolCallProgress || fullTextSoFar || fullReasoningSoFar) {
-					const pref = pickPreferredToolAcc(toolAccByIdx);
-					const prefName = pref?.name ?? '';
-					const prefId = pref?.id ?? '';
-
-					const knownTool = !!prefName && ((toolDefsMap?.has(prefName)) || isAToolName(prefName));
-					const toolCallInfo = knownTool
-						? { name: prefName as string, rawParams: {}, isDone: false, doneParams: [], id: prefId } as RawToolCallObj
-						: undefined;
+					const toolCallInfos: RawToolCallObj[] = [];
+					for (const idx of Array.from(toolAccByIdx.keys()).sort((a, b) => a - b)) {
+						const acc = toolAccByIdx.get(idx);
+						const name = acc?.name ?? '';
+						const id = acc?.id ?? '';
+						const knownTool = !!name && ((toolDefsMap?.has(name)) || isAToolName(name));
+						if (knownTool) {
+							toolCallInfos.push({ name, rawParams: {}, isDone: false, doneParams: [], id } as RawToolCallObj);
+						}
+					}
+					const toolCallInfo = toolCallInfos[0];
 
 					const usagePayload = lastTokenUsage ? { tokenUsage: lastTokenUsage } : {};
 					onText({
 						fullText: fullTextSoFar,
 						fullReasoning: fullReasoningSoFar,
-						toolCall: toolCallInfo,
+						...(toolCallInfos.length ? { toolCalls: toolCallInfos, toolCall: toolCallInfo } : {}),
 						...usagePayload,
 					});
 				}
@@ -1486,7 +1606,8 @@ export async function runStream({
 				timeoutHandle = null;
 			}
 
-			const toolCall = buildToolCall();
+			const toolCallsFinal = buildToolCalls();
+			const toolCall = toolCallsFinal[0] ?? null;
 			const usagePayload = lastTokenUsage ? { tokenUsage: lastTokenUsage } : {};
 
 			__dbg('attempt end', {
@@ -1507,7 +1628,7 @@ export async function runStream({
 				finalToolName: (toolCall as any)?.name ?? null,
 			});
 
-			// ✅ IMPORTANT: retry on length/timeout EVEN IF we already got partial output,
+			// IMPORTANT: retry on length/timeout EVEN IF we already got partial output,
 			// but only when there is NO tool call (tool calls are handled differently).
 			const hitLimit = (lastFinishReason === 'length');
 			const hitTimeout = abortedByTimeout;
@@ -1531,7 +1652,7 @@ export async function runStream({
 				continue;
 			}
 
-			// ✅ No more retries → notify (best-effort) if truncated
+			//No more retries → notify (best-effort) if truncated
 			if (!toolCall && (hitLimit || hitTimeout)) {
 				notifyTruncationOnce({
 					kind: hitTimeout ? 'timeout' : 'length',
@@ -1550,6 +1671,7 @@ export async function runStream({
 					fullText: fullTextSoFar,
 					fullReasoning: fullReasoningSoFar,
 					anthropicReasoning: null,
+					...(toolCallsFinal.length ? { toolCalls: toolCallsFinal } : {}),
 					...(toolCall ? { toolCall } : {}),
 					...usagePayload,
 				});
@@ -1587,7 +1709,8 @@ export async function runStream({
 			}
 
 			if (isAbortError(error) && abortedByUsForCompletedTool) {
-				const toolCall = buildToolCall();
+				const toolCallsFinal = buildToolCalls();
+				const toolCall = toolCallsFinal[0] ?? null;
 				if (toolCall) {
 					const usagePayload = lastTokenUsage ? { tokenUsage: lastTokenUsage } : {};
 					__dbg('caught AbortError after tool completion; finalizing with toolCall', {
@@ -1598,6 +1721,7 @@ export async function runStream({
 						fullText: fullTextSoFar,
 						fullReasoning: fullReasoningSoFar,
 						anthropicReasoning: null,
+						...(toolCallsFinal.length ? { toolCalls: toolCallsFinal } : {}),
 						toolCall,
 						...usagePayload,
 					});
@@ -1790,6 +1914,7 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 		potentialTools && fmtForTools && fmtForTools !== 'disabled'
 			? createNativeTools(potentialTools, tool_choice, fmtForTools)
 			: {};
+	const hasNativeTools = Array.isArray((nativeToolsObj as any).tools) && (nativeToolsObj as any).tools.length > 0;
 
 
 	let openai: OpenAIClient;
@@ -1809,6 +1934,7 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 			apiKey: token,
 			defaultHeaders: headersNoAuth,
 			dangerouslyAllowBrowser: true,
+			fetch: fetchForOpenAI,
 			maxRetries: 0,
 		});
 
@@ -1888,11 +2014,20 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 	if (requestParams && requestParams.mode !== 'off') {
 		if (requestParams.mode === 'override' && requestParams.params && typeof requestParams.params === 'object') {
 			for (const [k, v] of Object.entries(requestParams.params)) {
-				if (k === 'tools' || k === 'tool_choice' || k === 'response_format') continue;
+				if (isExcluded(k)) continue;
 				(options as any)[k] = v as any;
 			}
 		}
 		// 'default' mode: nothing extra here; defaults already applied elsewhere
+	}
+
+	const parallelToolCallsValue = getParallelToolCallsPayloadValue(
+		dyn?.parallelToolCalls ?? createParallelToolCallsConfig(baseCaps),
+		{ hasNativeTools }
+	);
+	const enableParallelToolCallsRuntime = parallelToolCallsValue === true;
+	if (parallelToolCallsValue !== undefined) {
+		(options as any).parallel_tool_calls = parallelToolCallsValue;
 	}
 
 	// Add reasoning payload to options
@@ -1917,7 +2052,7 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 		const debugEnabled = !!params.logService?.debug;
 
 		const safeJson = (v: unknown, maxLen = 2500) => {
-void safeJson;
+			void safeJson;
 			try {
 				const s = JSON.stringify(v, null, 2);
 				return s.length > maxLen ? s.slice(0, maxLen) + `…(+${s.length - maxLen})` : s;
@@ -2159,6 +2294,7 @@ void safeJson;
 				toolDefsMap,
 				allowedToolNames,
 				logService: params.logService,
+				stopOnFirstToolCall: !enableParallelToolCallsRuntime,
 
 				notificationService: params.notificationService,
 				notifyOnTruncation: notifyOnTruncation ?? true,
@@ -2291,7 +2427,7 @@ const sendAnthropicChat = async ({
 		...(dyn?.headers || {}),
 	};
 
-	// Don’t forward Authorization to Anthropic SDK; it uses x-api-key internally
+	// Don't forward Authorization to Anthropic SDK; it uses x-api-key internally
 	delete (mergedHeaders as any).Authorization;
 	delete (mergedHeaders as any).authorization;
 	delete (mergedHeaders as any)['x-api-key'];
@@ -2303,13 +2439,14 @@ const sendAnthropicChat = async ({
 			? dyn.endpoint.trim().replace(/\/v1\/?$/i, '')
 			: undefined;
 
-	const anthropic = new Anthropic({
+	const anthropicOptions: AnthropicClientOptions = {
 		apiKey,
 		dangerouslyAllowBrowser: true,
+		fetch: fetchForAnthropic,
 		...(baseURL ? { baseURL } : {}),
-		// NOTE: SDK supports defaultHeaders in modern versions; keep as any to be safe with typing drift
-		...(Object.keys(mergedHeaders).length ? ({ defaultHeaders: mergedHeaders } as any) : {}),
-	} as any);
+		...(Object.keys(mergedHeaders).length ? { defaultHeaders: mergedHeaders } : {}),
+	};
+	const anthropic = new Anthropic(anthropicOptions);
 
 	// Map requestParams (override mode) to Anthropic fields
 	let overrideAnthropic: Record<string, any> = {};
@@ -2434,8 +2571,11 @@ const sendAnthropicChat = async ({
 	stream.on('finalMessage', (response) => {
 		const anthropicReasoning = response.content.filter(c => c.type === 'thinking' || c.type === 'redacted_thinking');
 		const tools = response.content.filter(c => c.type === 'tool_use');
-		const toolCall = tools[0] && anthropicToolToRawToolCallObj(tools[0] as any, toolDefsMap);
-		const toolCallObj = toolCall ? { toolCall } : {};
+		const toolCalls = tools
+			.map(tool => anthropicToolToRawToolCallObj(tool as any, toolDefsMap))
+			.filter((tool): tool is RawToolCallObj => !!tool);
+		const toolCall = toolCalls[0];
+		const toolCallObj = toolCalls.length ? { toolCalls, toolCall } : {};
 		const tokenUsageFromResp = validateLLMTokenUsage(mapAnthropicUsageToLLMTokenUsage((response as any)?.usage), logService);
 		if (tokenUsageFromResp) lastTokenUsage = tokenUsageFromResp;
 
@@ -2607,9 +2747,7 @@ const sendGeminiChat = async ({
 	let fullReasoningSoFar = ''
 	let fullTextSoFar = ''
 
-	let toolName = ''
-	let toolParamsStr = ''
-	let toolId = ''
+	const geminiToolCalls: Array<{ name: string; args: Record<string, unknown>; id: string }> = [];
 	let lastTokenUsage: LLMTokenUsage | undefined;
 
 
@@ -2661,32 +2799,41 @@ const sendGeminiChat = async ({
 				// tool call
 				const functionCalls = chunk.functionCalls
 				if (functionCalls && functionCalls.length > 0) {
-					const functionCall = functionCalls[0] // Get the first function call
-					toolName = functionCall.name ?? ''
-					toolParamsStr = JSON.stringify(functionCall.args ?? {})
-					toolId = functionCall.id ?? ''
+					for (const functionCall of functionCalls) {
+						geminiToolCalls.push({
+							name: functionCall.name ?? '',
+							args: (functionCall.args ?? {}) as Record<string, unknown>,
+							id: functionCall.id ?? '',
+						});
+					}
 				}
 
 				// (do not handle reasoning yet)
 
 				// call onText
-				const knownTool = !!toolName && ((toolDefsMap?.has(toolName)) || isAToolName(toolName));
+				const progressToolCalls: RawToolCallObj[] = geminiToolCalls
+					.filter(call => !!call.name && ((toolDefsMap?.has(call.name)) || isAToolName(call.name)))
+					.map(call => ({ name: call.name as ToolName, rawParams: {}, isDone: false, doneParams: [], id: call.id } as RawToolCallObj));
 				const usagePayload = lastTokenUsage ? { tokenUsage: lastTokenUsage } : {};
 				onText({
 					fullText: fullTextSoFar,
 					fullReasoning: fullReasoningSoFar,
-					toolCall: knownTool ? { name: toolName as ToolName, rawParams: {}, isDone: false, doneParams: [], id: toolId } : undefined,
+					...(progressToolCalls.length ? { toolCalls: progressToolCalls, toolCall: progressToolCalls[0] } : {}),
 					...usagePayload,
 				})
 			}
 
 			// on final
-			if (!fullTextSoFar && !fullReasoningSoFar && !toolName) {
+			if (!fullTextSoFar && !fullReasoningSoFar && !geminiToolCalls.length) {
 				onError({ message: 'Void: Response from model was empty.', fullError: null })
 			} else {
-				if (!toolId) toolId = generateUuid() // ids are empty, but other providers might expect an id
-				const toolCall = rawToolCallObjOf(toolName, toolParamsStr, toolId, toolDefsMap)
-				const toolCallObj = toolCall ? { toolCall } : {}
+				const toolCalls = geminiToolCalls
+					.map(call => {
+						const id = call.id || generateUuid();
+						return rawToolCallObjOf(call.name, JSON.stringify(call.args ?? {}), id, toolDefsMap);
+					})
+					.filter((tool): tool is RawToolCallObj => !!tool);
+				const toolCallObj = toolCalls.length ? { toolCalls, toolCall: toolCalls[0] } : {}
 				onFinalMessage({
 					fullText: fullTextSoFar,
 					fullReasoning: fullReasoningSoFar,
@@ -2850,6 +2997,7 @@ export const __test = {
 	setGetSendableReasoningInfo(fn: typeof getSendableReasoningInfo) {
 		getSendableReasoningInfoImpl = fn;
 	},
+	installDebugFetchLogging,
 	reset() {
 		openAIModule = undefined as any;
 		anthropicModule = undefined as any;
@@ -2858,5 +3006,10 @@ export const __test = {
 		googleGenAIModule = undefined as any;
 		ollamaModule = undefined as any;
 		getSendableReasoningInfoImpl = getSendableReasoningInfo;
+		if (_origFetchForDebugLogging) {
+			globalThis.fetch = _origFetchForDebugLogging;
+			_origFetchForDebugLogging = undefined;
+		}
+		_fetchDebugInstalled = false;
 	},
 };

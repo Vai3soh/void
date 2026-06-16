@@ -7,12 +7,59 @@ import assert from 'assert';
 import { Event } from '../../../../../base/common/event.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
+import { IFileService } from '../../../../../platform/files/common/files.js';
+import { IMarkerService } from '../../../../../platform/markers/common/markers.js';
+import { IDirectoryStrService } from '../../../../../platform/void/common/directoryStrService.js';
+import { IVoidSettingsService } from '../../../../../platform/void/common/voidSettingsService.js';
+import { ISearchService } from '../../../../../workbench/services/search/common/search.js';
+import { IVoidModelService } from '../../common/voidModelService.js';
+import { IEditCodeService } from '../../browser/editCodeServiceInterface.js';
+import { ITerminalToolService } from '../../browser/terminalToolService.js';
+import { IVoidCommandBarService } from '../../browser/voidCommandBarService.js';
 import { ToolsService } from '../../browser/toolsService.js';
 
 suite('ToolsService - Agent Skills', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
 
 	function createToolsService(agentSkillsService: any) {
+		const fileService = {} as IFileService;
+		const searchService = {} as ISearchService;
+		const voidModelService = {} as IVoidModelService;
+		const editCodeService = {} as IEditCodeService;
+		const terminalToolService = {} as ITerminalToolService;
+		const directoryStrService: IDirectoryStrService = {
+			_serviceBrand: undefined,
+			getDirectoryStrTool: async () => '',
+			getAllDirectoriesStr: async () => '',
+			getAllURIsInDirectory: async () => [],
+		};
+		const markerService: IMarkerService = {
+			_serviceBrand: undefined,
+			getStatistics: () => ({ errors: 0, warnings: 0, infos: 0, unknowns: 0 }),
+			changeOne: () => { },
+			changeAll: () => { },
+			remove: () => { },
+			read: () => [],
+			installResourceFilter: () => ({ dispose: () => { } }),
+			onMarkerChanged: Event.None,
+		};
+		const voidSettingsService = { state: { globalSettings: { includeToolLintErrors: false } } } as IVoidSettingsService;
+		const commandBarService: IVoidCommandBarService = {
+			_serviceBrand: undefined,
+			stateOfURI: {},
+			sortedURIs: [],
+			activeURI: null,
+			onDidChangeState: Event.None,
+			onDidChangeActiveURI: Event.None,
+			getStreamState: () => 'idle-no-changes',
+			setDiffIdx: () => { },
+			getNextDiffIdx: () => null,
+			getNextUriIdx: () => null,
+			goToDiffIdx: () => { },
+			goToURIIdx: async () => { },
+			acceptOrRejectAllFiles: () => { },
+			anyFileIsStreaming: () => false,
+		};
 		const workspaceContextService: any = {
 			getWorkspace() {
 				return { folders: [{ uri: URI.file('/workspace') }] };
@@ -28,17 +75,17 @@ suite('ToolsService - Agent Skills', () => {
 		};
 
 		return new ToolsService(
-			{},
+			fileService,
 			workspaceContextService,
-			{},
+			searchService,
 			instantiationService,
-			{},
-			{},
-			{},
-			{ getStreamState: () => 'idle' },
-			{},
-			{ read: () => [] },
-			{ state: { globalSettings: { includeToolLintErrors: false } } },
+			voidModelService,
+			editCodeService,
+			terminalToolService,
+			commandBarService,
+			directoryStrService,
+			markerService,
+			voidSettingsService,
 			agentSkillsService,
 		);
 	}

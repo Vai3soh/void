@@ -45,6 +45,7 @@ suite('ToolsService - search_in_file', () => {
 		const directoryStrService: any = {};
 		const markerService: any = { read: () => [] };
 		const voidSettingsService: any = { state: { globalSettings: { includeToolLintErrors: false } } };
+		const agentSkillsService: any = { activateSkill: async () => { throw new Error('not used in this test'); } };
 
 		return new ToolsService(
 			fileService,
@@ -58,6 +59,7 @@ suite('ToolsService - search_in_file', () => {
 			directoryStrService,
 			markerService,
 			voidSettingsService,
+			agentSkillsService,
 		);
 	};
 

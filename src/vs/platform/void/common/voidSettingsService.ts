@@ -48,6 +48,7 @@ export type ModelCapabilityOverride = {
 	reasoningCapabilities?: false | any;
 	fimTransport?: 'openai-compatible' | 'mistral-native' | 'ollama-native' | 'emulated';
 	supportCacheControl?: boolean;
+	supportsParallelToolCalls?: boolean;
 };
 
 export type CustomProviderSettings = {
@@ -55,6 +56,7 @@ export type CustomProviderSettings = {
 	apiKey?: string;
 	apiStyle?: 'openai-compatible' | 'anthropic-style' | 'gemini-style';
 	supportsSystemMessage?: supportsSystemMessage;
+	specialToolFormat?: specialToolFormat;
 	auth?: { header: string; format: 'Bearer' | 'direct' };
 	additionalHeaders?: Record<string, string>;
 	perModel?: Record<string, any>;

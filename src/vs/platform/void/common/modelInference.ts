@@ -18,6 +18,8 @@ export type VoidStaticModelInfo = {
 	// cache_control breakpoints (Anthropic / OpenRouter / Gemini-on-OpenRouter, etc.).
 	// Default is false and can be opted into per model via overrides.
 	supportCacheControl?: boolean;
+	// Whether the provider/model reports support for top-level parallel_tool_calls.
+	supportsParallelToolCalls?: boolean;
 	// Input modalities supported by the model (e.g. ["text", "image", "audio"]) as reported by OpenRouter/underlying provider
 	inputModalities?: string[];
 	reasoningCapabilities: false | {
@@ -42,7 +44,7 @@ export type VoidStaticModelInfo = {
 }
 
 export type ModelOverrides = Pick<VoidStaticModelInfo,
-	'contextWindow' | 'reservedOutputTokenSpace' | 'specialToolFormat' | 'supportsSystemMessage' | 'supportsFIM' | 'reasoningCapabilities' | 'fimTransport' | 'supportCacheControl'
+	'contextWindow' | 'reservedOutputTokenSpace' | 'specialToolFormat' | 'supportsSystemMessage' | 'supportsFIM' | 'reasoningCapabilities' | 'fimTransport' | 'supportCacheControl' | 'supportsParallelToolCalls'
 >
 
 let __dynamicModelService: IDynamicModelService | null = null;
@@ -95,8 +97,8 @@ export const getModelCapabilities = (
 				isUnrecognizedModel: false,
 			};
 
-			
-			
+
+
 			const rc = merged.reasoningCapabilities;
 			if (rc && typeof rc === 'object' && (rc as any).hideEncryptedReasoning === undefined) {
 				merged.reasoningCapabilities = { ...(rc as any), hideEncryptedReasoning: true };
@@ -108,7 +110,7 @@ export const getModelCapabilities = (
 		console.warn('[getModelCapabilities] Dynamic lookup failed:', error);
 	}
 
-	
+
 	const overrides = findOverrides(overridesOfModel, providerName, modelName);
 	const base: any = {
 		...defaultModelOptions,
@@ -489,7 +491,7 @@ function apiStyleToToolFormat(style: ModelApiConfig['apiStyle']): ModelApiConfig
 
 export function getModelApiConfiguration(modelId: string): ModelApiConfig {
 
-	
+
 	if (_userModelGetter) {
 		const userCfg = _userModelGetter(modelId);
 		if (userCfg) {
@@ -499,7 +501,7 @@ export function getModelApiConfiguration(modelId: string): ModelApiConfig {
 
 	const providerSlug = getProviderSlug(modelId);
 
-	
+
 	if (_providerResolver) {
 		const p = _providerResolver(providerSlug, modelId);
 		if (p) {
@@ -519,7 +521,7 @@ export function getModelApiConfiguration(modelId: string): ModelApiConfig {
 		}
 	}
 
-	
+
 	const known = WELL_KNOWN_PROVIDER_DEFAULTS[providerSlug] || WELL_KNOWN_PROVIDER_DEFAULTS._default;
 	const apiStyle = known.apiStyle;
 	const result: ModelApiConfig = {
@@ -550,7 +552,7 @@ export function inferCapabilitiesFromOpenRouterModel(model: OpenRouterModel): Pa
 	const hasTools = params.includes('tools') && params.includes('tool_choice');
 	capabilities.supportsSystemMessage = hasTools ? apiConfig.supportsSystemMessage : false;
 
-	
+
 	if (hasTools) {
 		capabilities.specialToolFormat = apiConfig.specialToolFormat;
 	} else {
@@ -559,13 +561,14 @@ export function inferCapabilitiesFromOpenRouterModel(model: OpenRouterModel): Pa
 
 	// Inference reasoning capabilities
 	capabilities.reasoningCapabilities = inferReasoningCapabilities(params, model);
+	capabilities.supportsParallelToolCalls = params.includes('parallel_tool_calls');
 
 	// Input modalities (text, image, audio, etc.)
 	if (Array.isArray(model.architecture?.input_modalities) && model.architecture.input_modalities.length > 0) {
 		capabilities.inputModalities = model.architecture.input_modalities.slice();
 	}
 
-	
+
 	const description = model.description?.toLowerCase() || '';
 	if (description.includes('fill-in-middle') ||
 		description.includes('autocomplete') ||
@@ -575,7 +578,7 @@ export function inferCapabilitiesFromOpenRouterModel(model: OpenRouterModel): Pa
 		capabilities.supportsFIM = false;
 	}
 
-	
+
 	if (capabilities.supportsFIM) {
 		if (model.id.includes('codellama') || model.id.includes('ollama')) {
 			capabilities.fimTransport = 'ollama-native';
@@ -612,7 +615,7 @@ export function inferReasoningCapabilities(params: string[], model: OpenRouterMo
 		};
 	}
 
-	
+
 	if (isThinkingOnlyModel(model)) {
 		return {
 			supportsReasoning: true,
@@ -661,13 +664,13 @@ function isThinkingOnlyModel(model: OpenRouterModel): boolean {
 		thinkingOnly: ['thinking only', 'thinking-only', 'thinking', '<think>', 'code reasoning']
 	};
 
-	
+
 	if (patterns.nonThinking.some(pattern => searchText.includes(pattern))) {
 		return false;
 	}
 
-	
-	
+
+
 	return patterns.thinkingOnly.some(pattern => searchText.includes(pattern));
 }
 
@@ -681,4 +684,3 @@ export function inferApiStyle(providerSlug: string): 'openai-compatible' | 'anth
 	const config = WELL_KNOWN_PROVIDER_DEFAULTS[providerSlug];
 	return config?.apiStyle || 'openai-compatible';
 }
-

@@ -195,6 +195,7 @@ suite('ChatThreadService - switch non-ACP -> ACP builtin', () => {
 			/* file */ { readFile: async () => ({ value: { toString: () => '' } }) } as any,
 			/* label */ { getUriLabel: () => './x' } as any,
 			/* log */ logService as any,
+			/* agentSkills */ { getActiveSkills: () => [], activateSkill: async () => { throw new Error('not used in this test'); } } as any,
 		);
 
 		const realAcp = (svc as any)._acpHandler;

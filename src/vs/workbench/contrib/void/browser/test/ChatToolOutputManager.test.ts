@@ -1,3 +1,8 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
 // eslint-disable-next-line local/code-import-patterns
 import assert from 'assert';
 import { URI } from '../../../../../base/common/uri.js';
@@ -7,6 +12,8 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/tes
 import { ChatToolOutputManager } from '../ChatToolOutputManager.js';
 
 import { stableToolOutputsRelPath } from '../../../../../platform/void/common/toolOutputFileNames.js';
+import { normalizeTerminalCommandOutput } from '../../../../../platform/void/common/terminalToolOutput.js';
+import { computeTruncatedToolOutput } from '../../../../../platform/void/common/toolOutputTruncation.js';
 
 suite('ChatToolOutputManager TRUNCATION_META consistency', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -95,6 +102,22 @@ suite('ChatToolOutputManager TRUNCATION_META consistency', () => {
 		const sep = process.platform === 'win32' ? '\\' : '/';
 		const relOs = rel.replace(/\//g, sep);
 		return `${rootPath}${sep}${relOs}`;
+	}
+
+	function expectedFittedToolOutput(originalText: string, maxChars: number, suffixOfBody: (body: string) => string): { text: string; body: string } {
+		let bodyMax = maxChars;
+		for (let iter = 0; iter < 4; iter++) {
+			const { truncatedBody } = bodyMax > 0
+				? computeTruncatedToolOutput(originalText, bodyMax)
+				: { truncatedBody: '' };
+			const suffix = suffixOfBody(truncatedBody);
+			const nextBodyMax = Math.max(0, maxChars - suffix.length);
+			if (nextBodyMax === bodyMax || iter === 3) {
+				return { text: `${truncatedBody}${suffix}`, body: truncatedBody };
+			}
+			bodyMax = nextBodyMax;
+		}
+		return { text: originalText.slice(0, maxChars), body: originalText.slice(0, maxChars) };
 	}
 
 	// -------------------------
@@ -544,4 +567,415 @@ suite('ChatToolOutputManager TRUNCATION_META consistency', () => {
 		assert.strictEqual(fileService.__debug.listFilesUnderToolOutputs().length, 0);
 	});
 
+	test('run_command uses canonical output and keeps cwd metadata out of content', async () => {
+		const { fileService, workspaceService, settingsService } = makeServices(16000);
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+
+		const result = {
+			toolCallId: 'tc_terminal',
+			terminalId: 'term_1',
+			output: '$ pwd\n/ws/src\n(exit code 0)',
+			cwd: '/ws/src',
+			cwdLabel: './src',
+			exitCode: 0,
+		};
+
+		const out = await mgr.processToolResult(result, 'run_command');
+
+		assert.strictEqual(out.content, '$ pwd\n/ws/src\n(exit code 0)');
+		assert.strictEqual(out.displayContent, out.content);
+		assert.ok(!out.content.includes('(cwd='));
+		assert.strictEqual((out.result as any).cwdLabel, './src');
+	});
+
+	test('run_command with simulated big log (tail-captured stdout) - truncation meta consistency (BUG REPRO)', async () => {
+		const maxToolOutputLength = 5000;
+		const { fileService, workspaceService, settingsService } = makeServices(maxToolOutputLength);
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+
+		const marker = '/* Called from syscall or from eBPF program */';
+
+		const header =
+			`// SPDX-License-Identifier: GPL-2.0-only\n` +
+			`/* Copyright (c) 2011-2014 PLUMgrid */\n` +
+			`#include <linux/bpf.h>\n` +
+			`#include <linux/btf.h>\n` +
+			`\n`;
+
+		const preludeLines = Array.from({ length: 180 }, (_, i) =>
+			`prelude_${String(i).padStart(3, '0')}: ${'A'.repeat(60)}\n`
+		).join('');
+
+		const beforeMarker =
+			`static int something_before_marker(void) {\n` +
+			`        return 123;\n` +
+			`}\n` +
+			`\n`;
+
+		const markerBlock =
+			`}\n\n` +
+			`${marker}\n` +
+			`static long array_map_delete_elem(struct bpf_map *map, void *key)\n` +
+			`{\n` +
+			`        return -EINVAL;\n` +
+			`}\n\n`;
+
+		const bigTailLines = Array.from({ length: 900 }, (_, i) =>
+			`tail_${String(i).padStart(4, '0')}: ${'B'.repeat(70)}\n`
+		).join('');
+
+		const fileContent = header + preludeLines + beforeMarker + markerBlock + bigTailLines;
+
+		assert.ok(fileContent.startsWith('// SPDX-License-Identifier'), 'sanity: synthetic file must start with SPDX');
+		const markerIdx = fileContent.indexOf(marker);
+		assert.ok(markerIdx > 0, 'sanity: marker must exist in synthetic file');
+		assert.ok(fileContent.length > maxToolOutputLength, 'sanity: synthetic file must exceed truncation limit');
+
+		const fileTail = fileContent.slice(Math.max(0, markerIdx - 4));
+
+		const rawTerminalOutput = `$ cat tsets.non.log\n${fileTail}`;
+		const normalized = normalizeTerminalCommandOutput({
+			command: 'cat tsets.non.log',
+			rawOutput: rawTerminalOutput,
+			cwd: '/workspace',
+			workspaceFolders: [workspaceRoot.fsPath],
+			includeCommandHeader: true,
+			includeExitStatus: true,
+			exitCode: 0,
+			signal: null,
+		});
+
+		assert.ok(normalized.text.startsWith('$ cat tsets.non.log'), 'normalized.text should start with command header');
+		assert.ok(
+			normalized.stdoutStderr.startsWith('}'),
+			'stdoutStderr should start with tail segment (repro: head is missing)'
+		);
+
+		const normalizedIdeal = normalizeTerminalCommandOutput({
+			command: 'cat tsets.non.log',
+			rawOutput: `$ cat tsets.non.log\n${fileContent}`,
+			cwd: '/workspace',
+			workspaceFolders: [workspaceRoot.fsPath],
+			includeCommandHeader: true,
+			includeExitStatus: true,
+			exitCode: 0,
+			signal: null,
+		});
+		const fullOutput = normalizedIdeal.text;
+
+		const result = {
+			result: normalized.text,
+			output: normalized.text,
+			fileContents: normalizedIdeal.text,
+			stdoutStderr: normalized.stdoutStderr,
+			commandHeader: normalized.commandHeader,
+			...(normalized.cwd ? { cwd: normalized.cwd } : {}),
+			...(normalized.cwdLabel ? { cwdLabel: normalized.cwdLabel } : {}),
+			...(normalized.exitStatus
+				? { exitStatus: { exitCode: normalized.exitStatus.exitCode, signal: normalized.exitStatus.signal } }
+				: {}),
+			resolveReason: { type: 'done', exitCode: 0 },
+			terminalId: 'terminal_TEST',
+			toolCallId: 'call_TEST',
+		};
+
+		const out = await mgr.processToolResult(result, 'run_command');
+
+		assert.strictEqual(
+			out.content,
+			out.displayContent,
+			'For run_command, content and displayContent should be identical'
+		);
+
+		assert.ok(out.content.includes('[VOID] TOOL OUTPUT TRUNCATED'), 'Output should indicate truncation');
+		const meta = parseMeta(out.content);
+
+		assert.ok(meta.logFilePath, 'meta should have logFilePath');
+		assert.strictEqual(meta.maxChars, maxToolOutputLength, 'meta.maxChars should match settings');
+		assert.strictEqual(meta.originalLength, fullOutput.length, 'meta.originalLength should match manager fullOutput length');
+		assert.strictEqual(typeof meta.startLineExclusive, 'number', 'meta.startLineExclusive should be a number');
+		assert.strictEqual(
+			meta.startLineExclusive,
+			fullOutput.slice(0, maxToolOutputLength).split(/\r\n|\r|\n/).length,
+			'meta.startLineExclusive should match computed lines'
+		);
+
+		const fileUri = toolOutputFileUri(meta.logFilePath);
+		assert.ok(fileService.__debug.hasFile(fileUri), 'Truncated output should be saved to file');
+		assert.strictEqual(
+			fileService.__debug.readFileString(fileUri),
+			fullOutput,
+			'Saved file should contain the full original content that manager received'
+		);
+
+		const files = fileService.__debug.listFilesUnderToolOutputs();
+		assert.strictEqual(files.length, 1, `expected exactly 1 file, got: ${files.join(', ')}`);
+
+		const { truncatedBody: expectedBody } = computeTruncatedToolOutput(normalizedIdeal.text, maxToolOutputLength);
+		const expectedPreview = `${expectedBody}...`;
+
+		const cut = '\n\n[VOID] TOOL OUTPUT TRUNCATED';
+		const cutIdx = out.content.indexOf(cut);
+		assert.ok(cutIdx > 0, 'expected truncation banner in output');
+		const actualPreview = out.content.slice(0, cutIdx);
+
+		assert.strictEqual(
+			actualPreview,
+			expectedPreview,
+			'BUG REPRO: run_command preview does not match full file prefix (stdout head was lost before ChatToolOutputManager)'
+		);
+	});
+
+	test('run_command timeout: preserves full timeout output without TRUNCATION_META', async () => {
+		// --- local workspaceRoot + services (so no dependency on outer helpers) ---
+		const rootPathLocal = process.platform === 'win32' ? 'C:\\ws' : '/ws';
+		const workspaceRootLocal = URI.file(rootPathLocal);
+
+		const makeServicesLocal = (maxToolOutputLength: number) => {
+			const files = new Map<string, string>();
+			const dirs = new Set<string>();
+			let writeCount = 0;
+
+			const fileService: any = {
+				async exists(uri: URI) {
+					return files.has(uri.fsPath) || dirs.has(uri.fsPath);
+				},
+				async createFolder(uri: URI) {
+					dirs.add(uri.fsPath);
+				},
+				async writeFile(uri: URI, buffer: VSBuffer) {
+					writeCount++;
+					files.set(uri.fsPath, buffer.toString());
+				},
+				__debug: {
+					writeCount: () => writeCount,
+					listFilesUnderToolOutputs: () => {
+						const out: string[] = [];
+						const sep = process.platform === 'win32' ? '\\' : '/';
+						const marker = `${rootPathLocal}${sep}.void${sep}tool_outputs${sep}`;
+						for (const k of files.keys()) {
+							if (k.includes(marker)) out.push(k);
+						}
+						return out.sort();
+					}
+				}
+			};
+
+			const workspaceService: any = {
+				getWorkspace() {
+					return { folders: [{ uri: workspaceRootLocal }] };
+				}
+			};
+
+			const settingsService: any = {
+				state: { globalSettings: { maxToolOutputLength } }
+			};
+
+			return { fileService, workspaceService, settingsService };
+		};
+
+		const maxToolOutputLength = 16000;
+		const { fileService, workspaceService, settingsService } = makeServicesLocal(maxToolOutputLength);
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+
+		// --- build "UI output" as it should look on timeout ---
+		const command = `bash -lc "for i in {1..100}; do echo $i; sleep 1; done"`;
+		const numbers1to60 = Array.from({ length: 60 }, (_, i) => String(i + 1)).join('\n') + '\n';
+
+		const rawTerminalOutput = `$ ${command}\n${numbers1to60}`;
+		const normalized = normalizeTerminalCommandOutput({
+			command,
+			rawOutput: rawTerminalOutput,
+			cwd: '/workspace',
+			workspaceFolders: [workspaceRootLocal.fsPath],
+			includeCommandHeader: true,
+			includeExitStatus: false,
+			exitCode: null,
+			signal: null,
+		});
+
+		const timeoutMessage =
+			'Terminal command run, but was stopped by Void because it exceeded the configured terminal command timeout (1 minutes).';
+
+		const uiText = `${normalized.text}\n${timeoutMessage}`;
+
+		assert.ok(uiText.includes('\n60\n'), 'sanity: uiText should contain line 60');
+		assert.ok(uiText.includes(timeoutMessage), 'sanity: uiText should contain timeout message');
+		assert.ok(!uiText.includes('TRUNCATION_META:'), 'sanity: uiText should NOT contain TRUNCATION_META');
+		assert.ok(!uiText.includes('[VOID] TOOL OUTPUT TRUNCATED'), 'sanity: uiText should NOT contain truncation banner');
+
+		const idxOfLine39 = uiText.indexOf('\n39\n');
+		assert.ok(idxOfLine39 > 0, 'sanity: expected to find "\\n39\\n" in uiText');
+
+		const modelText = uiText.slice(0, idxOfLine39).trimEnd() + '...';
+
+		assert.ok(modelText.includes('\n38'), 'sanity: modelText should include line 38');
+		assert.ok(!modelText.includes('\n39\n'), 'sanity: modelText should NOT include line 39');
+		assert.ok(modelText.endsWith('...'), 'sanity: modelText should end with "..."');
+		assert.ok(!modelText.includes(timeoutMessage), 'sanity: modelText should NOT include timeout message');
+		assert.ok(!modelText.includes('TRUNCATION_META:'), 'sanity: modelText should NOT contain TRUNCATION_META');
+		assert.ok(!modelText.includes('[VOID] TOOL OUTPUT TRUNCATED'), 'sanity: modelText should NOT contain truncation banner');
+
+		const uiOut = await mgr.processToolResult(
+			{
+				output: uiText,
+				result: uiText,
+				resolveReason: { type: 'timeout' },
+				exitCode: null,
+				terminalId: 'term_timeout',
+				toolCallId: 'tc_timeout',
+			} as any,
+			'run_command'
+		);
+
+		// run_command => displayContent === content
+		assert.strictEqual(uiOut.displayContent, uiOut.content);
+
+		assert.strictEqual(fileService.__debug.writeCount(), 0);
+		assert.strictEqual(fileService.__debug.listFilesUnderToolOutputs().length, 0);
+
+		assert.strictEqual(uiOut.content, uiText);
+	});
+
+	test('ACP builtin agent/run_command: should NOT add a second truncation banner; TRUNCATION_META must stay consistent (BUG REPRO)', async () => {
+		const maxToolOutputLength = 5000;
+		const { fileService, workspaceService, settingsService } = makeServices(maxToolOutputLength);
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+
+		// -----------------------------
+		// Build a big realistic terminal output (normalized)
+		// -----------------------------
+		const command = 'cat tsets.non.log';
+
+		const bigStdout = Array.from({ length: 2500 }, (_, i) => {
+			// keep lines fairly long to exceed 5000 chars comfortably
+			return `LINE_${String(i + 1).padStart(4, '0')}: ${'X'.repeat(40)}\n`;
+		}).join('');
+
+		const rawTerminalOutput = `$ ${command}\n${bigStdout}`;
+
+		const normalized = normalizeTerminalCommandOutput({
+			command,
+			rawOutput: rawTerminalOutput,
+			cwd: '/ws',
+			workspaceFolders: [workspaceRoot.fsPath],
+			includeCommandHeader: true,
+			includeExitStatus: true,
+			exitCode: 0,
+			signal: null,
+		});
+
+		const fullOutput = normalized.text;
+		assert.ok(fullOutput.length > maxToolOutputLength * 3, 'sanity: fullOutput should be large');
+
+		// Use a stable-ish ACP-like terminal log path (keyed by terminalId, like ACP does)
+		const terminalId = 'terminal_f9c5a0cc';
+		const toolCallId = 'call_acp_1';
+
+		const stableRel = stableToolOutputsRelPath({
+			toolName: 'run_command',
+			terminalId,
+			toolCallId,
+			keyText: fullOutput,
+			fullText: fullOutput,
+		});
+
+		// Pretend ACP already saved the full output into the tool_outputs log file
+		await fileService.createFolder(URI.joinPath(workspaceRoot, '.void', 'tool_outputs'));
+		await fileService.writeFile(toolOutputFileUri(stableRel), VSBuffer.fromString(fullOutput));
+		const writesBefore = fileService.__debug.writeCount();
+
+		// -----------------------------
+		// Helper: ACP-style truncation (mimics AcpHostCallbacksService._truncateWithMetaIfNeeded)
+		// -----------------------------
+		const acpTruncateWithMeta = (s: string, maxChars: number, savedPath: string): { text: string; body: string; meta: { logFilePath: string; startLineExclusive: number; maxChars: number; originalLength: number } } => {
+			const originalLength = s.length;
+
+			const fitted = expectedFittedToolOutput(s, maxChars, truncatedBody => {
+				const startLineExclusive = truncatedBody ? truncatedBody.split(/\r\n|\r|\n/).length : 0;
+
+				const headerLines = [
+					`[VOID] TOOL OUTPUT TRUNCATED, SEE TRUNCATION_META BELOW.`,
+					`Only the first ${maxChars} characters are included in this message.`,
+					`Display limit: maxToolOutputLength = ${maxChars} characters.`,
+				];
+
+				// ACP wording differs slightly from ChatToolOutputManager wording
+				const instructionsLines = [
+					`IMPORTANT FOR THE MODEL:`,
+					`  1. Do NOT guess based only on this truncated output.`,
+					`  2. To see the rest of this tool output, call read_file on logFilePath, starting from line startLineExclusive + 1.`,
+				];
+
+				const meta = { logFilePath: savedPath, startLineExclusive, maxChars, originalLength };
+				const metaLine = `TRUNCATION_META: ${JSON.stringify(meta)}`;
+
+				return `...\n\n${headerLines.join('\n')}\n${instructionsLines.join('\n')}\n${metaLine}`;
+			});
+			const startLineExclusive = fitted.body ? fitted.body.split(/\r\n|\r|\n/).length : 0;
+			return { text: fitted.text, body: fitted.body, meta: { logFilePath: savedPath, startLineExclusive, maxChars, originalLength } };
+		};
+
+		// This is the "good" ACP output (length <= 5000, TRUNCATION_META at end)
+		const acp = acpTruncateWithMeta(fullOutput, maxToolOutputLength, stableRel);
+		const acpText = acp.text;
+		assert.strictEqual(acpText.length, maxToolOutputLength, 'sanity: ACP text should be exactly maxToolOutputLength');
+		const acpMeta = parseMeta(acpText);
+		assert.deepStrictEqual(acpMeta, acp.meta, 'sanity: ACP meta should match exact expected numbers');
+		assert.strictEqual(acpMeta.startLineExclusive, acp.body.split(/\r\n|\r|\n/).length, 'sanity: ACP startLineExclusive should match visible body lines');
+		assert.strictEqual(acpMeta.originalLength, fullOutput.length, 'sanity: ACP meta.originalLength should be full output length');
+		assert.strictEqual(acpMeta.maxChars, maxToolOutputLength, 'sanity: ACP meta.maxChars should match limit');
+		assert.strictEqual(acpMeta.logFilePath, stableRel, 'sanity: ACP meta.logFilePath should be stableRel');
+
+		// -----------------------------
+		// BUG trigger:
+		// append extra content AFTER ACP meta so TRUNCATION_META is NOT at end anymore,
+		// and total length becomes > maxToolOutputLength. This matches the observed
+		// "double banner" behavior.
+		// -----------------------------
+		const buggyAcpLikePayload = `${acpText}\n(exit code 0)\n`;
+		assert.ok(buggyAcpLikePayload.length > maxToolOutputLength, 'sanity: payload should exceed maxToolOutputLength');
+		assert.ok(!buggyAcpLikePayload.trimEnd().endsWith('}'), 'sanity: TRUNCATION_META JSON is not at end anymore');
+
+		const out = await mgr.processToolResult(
+			{
+				output: buggyAcpLikePayload,
+				result: buggyAcpLikePayload,
+				terminalId,
+				toolCallId,
+				exitCode: 0,
+				resolveReason: { type: 'done', exitCode: 0 },
+			} as any,
+			'run_command'
+		);
+
+		// For run_command: UI and model receive identical strings
+		assert.strictEqual(out.content, out.displayContent);
+
+		// -----------------------------
+		// EXPECTED (correct) behavior:
+		// - should NOT add a second banner/meta (should respect ACP truncation)
+		// - should NOT overwrite the existing tool_outputs file
+		// - the meta at end should still reflect the FULL original output length
+		// -----------------------------
+		assert.strictEqual(out.content.length, maxToolOutputLength, 'Output should preserve ACP-fitted display length');
+		assert.strictEqual(out.content, acpText, 'Output should preserve ACP truncation and drop post-meta decorations');
+
+		const bannerCount = (out.content.match(/\[VOID\] TOOL OUTPUT TRUNCATED/g) ?? []).length;
+		assert.strictEqual(bannerCount, 1, 'Should contain exactly 1 truncation banner (ACP provided one already)');
+
+		const metaEnd = parseMeta(out.content);
+		assert.deepStrictEqual(metaEnd, acp.meta, 'TRUNCATION_META should preserve all ACP numbers exactly');
+		assert.strictEqual(metaEnd.logFilePath, stableRel, 'meta.logFilePath should remain the ACP stable path');
+		assert.strictEqual(metaEnd.maxChars, maxToolOutputLength, 'meta.maxChars should remain consistent');
+		assert.strictEqual(metaEnd.originalLength, fullOutput.length, 'meta.originalLength must remain the FULL original output length');
+		assert.strictEqual(metaEnd.startLineExclusive, acpMeta.startLineExclusive, 'startLineExclusive must remain consistent with ACP');
+		assert.strictEqual(metaEnd.startLineExclusive, acp.body.split(/\r\n|\r|\n/).length, 'startLineExclusive must match ACP visible body lines');
+
+		// Ensure manager did not rewrite the already-saved log
+		assert.strictEqual(fileService.__debug.writeCount(), writesBefore, 'Should not overwrite tool_outputs log when ACP already saved it');
+		assert.strictEqual(fileService.__debug.readFileString(toolOutputFileUri(stableRel)), fullOutput, 'Saved log must stay the full original output');
+	});
+
 });
+

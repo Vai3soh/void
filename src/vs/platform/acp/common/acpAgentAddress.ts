@@ -15,6 +15,7 @@ export interface AcpAgentAddress {
 export interface AcpAgentAddressEnv {
 	readonly VOID_ACP_AGENT_HOST?: string;
 	readonly VOID_ACP_AGENT_PORT?: string;
+	readonly [key: string]: string | undefined;
 }
 
 export interface ResolveAcpAgentAddressInput {

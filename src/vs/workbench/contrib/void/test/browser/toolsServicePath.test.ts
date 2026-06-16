@@ -33,6 +33,7 @@ suite('ToolsService - workspace-aware URI normalization', () => {
 		const directoryStrService: any = {};
 		const markerService: any = { read: () => [] };
 		const voidSettingsService: any = { state: { globalSettings: { includeToolLintErrors: false } } };
+		const agentSkillsService: any = { activateSkill: async () => { throw new Error('not used in this test'); } };
 
 		return new ToolsService(
 			fileService,
@@ -46,6 +47,7 @@ suite('ToolsService - workspace-aware URI normalization', () => {
 			directoryStrService,
 			markerService,
 			voidSettingsService,
+			agentSkillsService,
 		);
 	}
 	function createToolsServiceWithWorkspaceRoot(rootFsPath: string) {
@@ -161,6 +163,7 @@ suite('ToolsService - workspace-aware URI normalization', () => {
 		const directoryStrService: any = {};
 		const markerService: any = { read: () => [] };
 		const voidSettingsService: any = { state: { globalSettings: { includeToolLintErrors: false } } };
+		const agentSkillsService: any = { activateSkill: async () => { throw new Error('not used in this test'); } };
 
 		const svc = new ToolsService(
 			fileService,
@@ -174,6 +177,7 @@ suite('ToolsService - workspace-aware URI normalization', () => {
 			directoryStrService,
 			markerService,
 			voidSettingsService,
+			agentSkillsService,
 		);
 
 		const params = svc.validateParams.read_file({
