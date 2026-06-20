@@ -1,3 +1,8 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
 import { IAcpService, IAcpStream, IAcpChatMessage, IAcpUserMessage, IAcpSendOptions } from '../../../../platform/acp/common/iAcpService.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
@@ -8,7 +13,10 @@ import { AcpChannelClient, AcpChannelName, AcpHostCallbackRequest } from '../../
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName } from '../../../../platform/void/common/voidSettingsTypes.js';
-import { IVoidSettingsService } from '../../../../platform/void/common/voidSettingsService.js';
+import { URI } from '../../../../base/common/uri.js';
+import { EndOfLinePreference } from '../../../../editor/common/language/model.js';
+import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
+import { IVoidModelService } from '../../void/common/voidModelService.js';
 
 import { AcpHostCallbacksService } from './AcpHostCallbacksService.js';
 import { AcpInternalExtMethodService } from './AcpInternalExtMethodService.js';
@@ -135,16 +143,36 @@ export class AcpService extends Disposable implements IAcpService {
 		return this.client.sendChatMessage(threadId, history, message, nextOpts);
 	}
 
+	private _getVoidMdText(): string {
+		const workspaceContext = this.instantiationService.invokeFunction(a => a.get(IWorkspaceContextService));
+		const voidModelService = this.instantiationService.invokeFunction(a => a.get(IVoidModelService));
+
+		const folders = workspaceContext.getWorkspace().folders;
+
+		let out = '';
+		for (const folder of folders) {
+			const voidMdUri = URI.joinPath(folder.uri, 'VOID.md');
+
+
+			try { voidModelService.initializeModel(voidMdUri); } catch { /* ignore */ }
+
+			const { model } = voidModelService.getModel(voidMdUri);
+			if (!model) continue;
+
+			const text = model.getValue(EndOfLinePreference.LF).trim();
+			if (!text) continue;
+
+			out += (out ? '\n\n' : '') + text;
+		}
+
+		return out.trim();
+	}
+
 	private async _computeDefaultAcpSystemPrompt(_feature: FeatureName): Promise<string | null> {
-		const vss = this.instantiationService.invokeFunction(a => a.get(IVoidSettingsService));
-		const st = vss.state;
+		const voidMd = this._getVoidMdText();
+		if (!voidMd) return '';
 
-		const explicit = (st.globalSettings.acpSystemPrompt ?? '').trim();
-		//It doesn't make any sense
-		if (explicit) return explicit;
-
-		// The ACP protocol does not support the transfer of system prompt for external agents
-		return '';
+		return `GUIDELINES (from the workspace VOID.md file):\n${voidMd}`;
 	}
 
 	private async handleHostCallback(req: AcpHostCallbackRequest): Promise<any> {

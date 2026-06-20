@@ -266,6 +266,8 @@ type SessionState = {
 	// Used to aggregate per-prompt usage and send it back to the host via PromptResponse._meta.
 	llmTokenUsageLast?: LLMTokenUsage | undefined;
 	threadId?: string;
+	// System prompt from client (VOID.md from renderer) to inject into every turn
+	clientSystemPrompt?: string | null;
 	llmCfg: {
 		providerName: ProviderNameStr;
 		settingsOfProvider: SettingsOfProviderLike;
@@ -419,12 +421,19 @@ class VoidPipelineAcpAgent implements Agent {
 			}
 		}
 
+		// Extract client system prompt from _params (VOID.md)
+		const clientSystemPrompt =
+			(typeof (_params as any)?.systemPrompt === 'string' && (_params as any).systemPrompt.trim())
+				? String((_params as any).systemPrompt)
+				: null;
+
 		this.sessions.set(sessionId, {
 			cancelled: false,
 			pendingToolCall: null,
 			pendingToolCallsById: {},
 			messages,
 			threadId: threadIdFromMeta,
+			clientSystemPrompt,
 			llmCfg: {
 				providerName,
 				settingsOfProvider: cfg?.settingsOfProvider,
@@ -537,6 +546,17 @@ class VoidPipelineAcpAgent implements Agent {
 					? String(metaWrapper._meta.threadId).trim()
 					: undefined;
 			if (tidFromPrompt) state.threadId = tidFromPrompt;
+
+			// Update clientSystemPrompt from prompt _meta (VOID.md)
+			try {
+				const m: any = metaWrapper._meta;
+				const sp = (typeof m?.systemPrompt === 'string' && m.systemPrompt.trim()) ? String(m.systemPrompt) : null;
+				if (sp !== null) {
+					state.clientSystemPrompt = sp;
+				}
+			} catch {
+				// ignore
+			}
 
 			const rawCfg = await this.conn.extMethod('void/settings/getLLMConfig', {
 				featureName: 'Chat',
@@ -1838,6 +1858,32 @@ class VoidPipelineAcpAgent implements Agent {
 
 			const messagesForSend: LLMChatMessage[] = toLLMChatMessages(state.messages || [], dynamicRequestConfig.apiStyle);
 
+			// Combine separateSystemMessage with clientSystemPrompt (VOID.md)
+			const baseSystem = (separateSystemMessage ?? '').trim();
+			const voidMdSystem = (state.clientSystemPrompt ?? '').trim();
+			const combinedSystem = [baseSystem, voidMdSystem].filter(Boolean).join('\n\n');
+
+			let finalMessagesForSend = messagesForSend;
+			let finalSeparateSystemMessage: string | undefined = undefined;
+
+			if (combinedSystem) {
+				const ssm = dynamicRequestConfig.supportsSystemMessage;
+
+				if (ssm === 'separated') {
+					finalSeparateSystemMessage = combinedSystem;
+				} else if (ssm === 'developer-role') {
+					finalMessagesForSend = [{ role: 'developer', content: combinedSystem } as any, ...finalMessagesForSend];
+				} else if (ssm === 'system-role') {
+					finalMessagesForSend = [{ role: 'system', content: combinedSystem } as any, ...finalMessagesForSend];
+				} else {
+					// supportsSystemMessage === false
+					finalMessagesForSend = [
+						{ role: 'user', content: `<SYSTEM_MESSAGE>\n${combinedSystem}\n</SYSTEM_MESSAGE>` } as any,
+						...finalMessagesForSend
+					];
+				}
+			}
+
 			this.log?.debug?.('[ACP Agent][runOneTurn] calling sendChatRouter', {
 				sessionId: sid,
 				providerName: providerNameForSend,
@@ -1852,8 +1898,8 @@ class VoidPipelineAcpAgent implements Agent {
 			try {
 				const ret = void sendChatRouterImpl({
 					logService: this.log,
-					messages: messagesForSend,
-					separateSystemMessage: separateSystemMessage ?? undefined,
+					messages: finalMessagesForSend,
+					separateSystemMessage: finalSeparateSystemMessage,
 					providerName: providerNameForSend,
 					settingsOfProvider: settingsForSend,
 					modelSelectionOptions: selOptsForSend,

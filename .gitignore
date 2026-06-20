@@ -23,6 +23,7 @@ product.overrides.json
 .vscode-test
 .void
 .serena
+Void.md
 
 # Void added these:
 .tmp/

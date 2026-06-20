@@ -366,7 +366,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 	// A COMPLETE HACK: last message is system message for context purposes
 
 	const sysMsgParts: string[] = []
-	if (aiInstructions) sysMsgParts.push(`GUIDELINES (from the user's .voidrules file):\n${aiInstructions}`)
+	if (aiInstructions) sysMsgParts.push(`GUIDELINES (from the workspace VOID.md file):\n${aiInstructions}`)
 	if (systemMessage) sysMsgParts.push(systemMessage)
 	const combinedSystemMessage = sysMsgParts.join('\n\n')
 
@@ -680,18 +680,18 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		}
 	}
 
-	// Read .voidrules files from workspace folders
-	private _getVoidRulesFileContents(): string {
+	// Read VOID.md files from workspace folders
+	private _getVoidMdFileContents(): string {
 		try {
 			const workspaceFolders = this.workspaceContextService.getWorkspace().folders;
-			let voidRules = '';
+			let voidMd = '';
 			for (const folder of workspaceFolders) {
-				const uri = URI.joinPath(folder.uri, '.voidrules');
+				const uri = URI.joinPath(folder.uri, 'VOID.md');
 				const { model } = this.voidModelService.getModel(uri);
 				if (!model) continue;
-				voidRules += model.getValue(EndOfLinePreference.LF) + '\n\n';
+				voidMd += model.getValue(EndOfLinePreference.LF) + '\n\n';
 			}
-			return voidRules.trim();
+			return voidMd.trim();
 		} catch {
 			return '';
 		}
@@ -779,15 +779,9 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		}
 	}
 
-	// Get combined AI instructions from settings and .voidrules files
-	private _getCombinedAIInstructions(): string {
-		const globalAIInstructions = this.voidSettingsService.state.globalSettings.aiInstructions;
-		const voidRulesFileContent = this._getVoidRulesFileContents();
-
-		const ans: string[] = [];
-		if (globalAIInstructions) ans.push(globalAIInstructions);
-		if (voidRulesFileContent) ans.push(voidRulesFileContent);
-		return ans.join('\n\n');
+	// System-level instructions come only from workspace VOID.md
+	private _getSystemInstructionsText(): string {
+		return this._getVoidMdFileContents();
 	}
 
 	// system message
@@ -912,8 +906,8 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 
 		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection[featureName][modelSelection.providerName]?.[modelSelection.modelName]
 
-		// Get combined AI instructions
-		const aiInstructions = this._getCombinedAIInstructions();
+		// Get system instructions
+		const aiInstructions = this._getSystemInstructionsText();
 
 		const isReasoningEnabled = getIsReasoningEnabledState(featureName, providerName, modelName, modelSelectionOptions, overridesOfModel)
 		const reservedOutputTokenSpace = getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
@@ -990,8 +984,8 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 
 		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
-		// Get combined AI instructions
-		const aiInstructions = this._getCombinedAIInstructions();
+		// Get system instructions
+		const aiInstructions = this._getSystemInstructionsText();
 
 		const isReasoningEnabled = getIsReasoningEnabledState('Chat', providerName, modelName, modelSelectionOptions, overridesOfModel)
 		const reservedOutputTokenSpace = getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
@@ -1014,8 +1008,8 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	// --- FIM ---
 
 	prepareFIMMessage: IConvertToLLMMessageService['prepareFIMMessage'] = ({ messages }) => {
-		// Get combined AI instructions with the provided aiInstructions as the base
-		const combinedInstructions = this._getCombinedAIInstructions();
+		// System instructions come from workspace VOID.md
+		const combinedInstructions = this._getSystemInstructionsText();
 
 		let prefix = `\
 ${!combinedInstructions ? '' : `\

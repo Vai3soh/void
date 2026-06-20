@@ -598,7 +598,6 @@ export class ChatAcpHandler extends Disposable {
 					args: gs.acpProcessArgs || undefined,
 					env: gs.acpProcessEnv || undefined,
 					model: gs.acpModel || undefined,
-					system: gs.acpSystemPrompt || undefined,
 					featureName: 'Chat',
 					maxToolOutputLength: gs.maxToolOutputLength,
 					readFileChunkLines: gs.readFileChunkLines,

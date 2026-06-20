@@ -769,7 +769,6 @@ suite('ChatThreadService - ACP process mode', () => {
 					acpProcessArgs: ['arg1', 'arg2'],
 					acpProcessEnv: { TEST_ENV: 'val' },
 					acpModel: 'acp-model',
-					acpSystemPrompt: 'acp-system',
 					chatRetries: 0,
 					retryDelay: 0,
 				},
@@ -851,7 +850,7 @@ suite('ChatThreadService - ACP process mode', () => {
 			assert.deepStrictEqual(capturedOpts.args, ['arg1', 'arg2']);
 			assert.deepStrictEqual(capturedOpts.env, { TEST_ENV: 'val' });
 			assert.strictEqual(capturedOpts.model, 'acp-model');
-			assert.strictEqual(capturedOpts.system, 'acp-system');
+			assert.ok(!('system' in capturedOpts), 'ChatAcpHandler should not pass opts.system; it is resolved in AcpService from VOID.md');
 		} finally {
 			// prevent Disposable leak + stop any active ACP stream
 			try { (handler as any).clearAcpState?.(threadId); } catch { }

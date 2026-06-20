@@ -922,6 +922,9 @@ export class AcpMainService implements IAcpMainServiceForChannel {
 
 		// IMPORTANT: attach threadId and truncation knobs to prompt _meta for builtin ACP agent.
 		const promptMeta: Record<string, unknown> = { threadId: args.threadId };
+		if (args?.opts?.system && args.opts.system.trim()) {
+			promptMeta.systemPrompt = args.opts.system;
+		}
 		if (promptMaxToolOutputLength !== undefined) promptMeta.maxToolOutputLength = promptMaxToolOutputLength;
 		if (promptReadFileChunkLines !== undefined) promptMeta.readFileChunkLines = promptReadFileChunkLines;
 		if (promptMaxToolOutputLength !== undefined || promptReadFileChunkLines !== undefined) {

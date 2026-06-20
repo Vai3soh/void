@@ -163,7 +163,6 @@ export const DISABLE_TELEMETRY_KEY = 'void.settings.disableTelemetry';
 
 export type GlobalSettings = {
 	autoRefreshModels: boolean;
-	aiInstructions: string;
 	enableAutocomplete: boolean;
 	syncApplyToChat: boolean;
 	syncSCMToChat: boolean;
@@ -210,7 +209,6 @@ export type GlobalSettings = {
 
 export const defaultGlobalSettings: GlobalSettings = {
 	autoRefreshModels: true,
-	aiInstructions: '',
 	enableAutocomplete: false,
 	syncApplyToChat: true,
 	enableFastApply: true,

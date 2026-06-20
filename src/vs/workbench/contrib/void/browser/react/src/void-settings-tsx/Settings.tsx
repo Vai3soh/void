@@ -9,7 +9,7 @@ import {
 	defaultGlobalSettings
 } from '../../../../../../../platform/void/common/voidSettingsTypes.js';
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js';
-import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js';
+import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js';
 import { useAccessor, useIsDark, useMCPServiceState, useSettingsState } from '../util/services.js';
 import { X, ChevronRight } from 'lucide-react';
 import { ModelDropdown } from './ModelDropdown.js';
@@ -1531,20 +1531,7 @@ export const DynamicProviderModels = () => {
 	);
 };
 
-export const AIInstructionsBox = () => {
-	const accessor = useAccessor()
-	const voidSettingsService = accessor.get('IVoidSettingsService')
-	const voidSettingsState = useSettingsState()
-	return <VoidInputBox2
-		className='w-full min-h-[81px] p-3 rounded-sm border border-void-border-2 bg-void-bg-1'
-		initValue={voidSettingsState.globalSettings.aiInstructions}
-		placeholder={`Insert your instruction here; this will add your instructions to the system prompt. To make them global, save your instructions in a .voidrules file at the workspace root.`}
-		multiline
-		onChangeText={(newText) => {
-			voidSettingsService.setGlobalSetting('aiInstructions', newText)
-		}}
-	/>
-}
+
 
 const FastApplyMethodDropdown = () => {
 	const accessor = useAccessor()
@@ -2616,16 +2603,6 @@ export const Settings = () => {
 																		onChange={(e) => voidSettingsService.setGlobalSetting('acpModel', e.target.value || null)}
 																	/>
 																</div>
-																<div className='flex flex-col gap-1'>
-																	<label className='text-void-fg-3'>ACP System Prompt (optional)</label>
-																	<textarea
-																		className='text-xs text-void-fg-1 bg-void-bg-1 border border-void-border-1 rounded px-2 py-1'
-																		rows={4}
-																		placeholder='System instructions for the agent'
-																		value={settingsState.globalSettings.acpSystemPrompt ?? ''}
-																		onChange={(e) => voidSettingsService.setGlobalSetting('acpSystemPrompt', e.target.value || null)}
-																	/>
-																</div>
 																<div className="flex items-center gap-x-2 my-1">
 																	<VoidSwitch
 																		size='xs'
@@ -2749,20 +2726,17 @@ export const Settings = () => {
 								</div>
 
 								<div className='max-w-[600px]'>
-									<h2 className={`text-3xl mb-2`}>AI Instructions</h2>
-									<h4 className={`text-void-fg-3 mb-4`}>
+									<h2 className='text-3xl mb-2'>VOID.md</h2>
+									<h4 className='text-void-fg-3 mb-4'>
 										<ChatMarkdownRender
 											inPTag={true}
 											string={`
-System instructions to include with all AI requests.
-Alternatively, place a \`.voidrules\` file in the root of your workspace.
-								`}
+Create a \`VOID.md\` file in the root of your workspace.
+Its contents will be appended to the system prompt for all AI requests.
+								`.trim()}
 											chatMessageLocation={undefined}
 										/>
 									</h4>
-									<ErrorBoundary>
-										<AIInstructionsBox />
-									</ErrorBoundary>
 								</div>
 							</div>
 						</div>
