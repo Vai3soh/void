@@ -41,8 +41,8 @@ export type IAcpMessageChunk =
 			exitStatus?: { exitCode: number | null; signal: string | null };
 		};
 	}
-	| { type: 'error'; error: string }
-	| { type: 'done'; tokenUsageSnapshot?: LLMTokenUsage };
+	| { type: 'error'; error: string; tokenUsageTurns?: LLMTokenUsage[] }
+	| { type: 'done'; tokenUsageSnapshot?: LLMTokenUsage; tokenUsageTurns?: LLMTokenUsage[]; };
 
 export interface IAcpSendOptions {
 	mode?: 'builtin' | 'websocket' | 'process';

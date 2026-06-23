@@ -44,7 +44,9 @@ export const TokenUsageSpoiler = () => {
 	const usage = thread?.state?.tokenUsageSession;
 	const last = (thread?.state as any)?.tokenUsageLastRequest as (LLMTokenUsage | undefined);
 	const limits = (thread?.state as any)?.tokenUsageLastRequestLimits as ({ maxInputTokens: number } | undefined);
-	const total = usage ? (usage.input + usage.cacheCreation + usage.cacheRead + usage.output) : 0;
+	
+	const promptTotal = usage ? (usage.input + usage.cacheCreation + usage.cacheRead) : 0;
+	const total = usage ? (promptTotal + usage.output) : 0;
 	const hasUsage = !!usage && total > 0;
 
 	const [isOpen, setIsOpen] = useState(false);
@@ -57,8 +59,9 @@ export const TokenUsageSpoiler = () => {
 
 	const format = (n: number) => n.toLocaleString?.() ?? String(n);
 	const formatPct = (v: number) => `${(Math.round(v * 10) / 10).toFixed(1)}%`;
+	const lastPromptTotal = last ? (last.input + last.cacheCreation + last.cacheRead) : 0;
 	const lastPct = (last && limits && limits.maxInputTokens > 0)
-		? (last.input / limits.maxInputTokens) * 100
+		? (lastPromptTotal / limits.maxInputTokens) * 100
 		: null;
 
 	return (
@@ -94,15 +97,16 @@ export const TokenUsageSpoiler = () => {
 						<div className='flex justify-between'>
 							<span>Last request</span>
 							<span>
-								input {format(last.input)}
+								prompt {format(lastPromptTotal)}
 								{limits?.maxInputTokens && lastPct !== null
 									? ` (~${formatPct(lastPct)} of ${format(limits.maxInputTokens)})`
 									: ''}
 							</span>
 						</div>
 					)}
-					<div className='flex justify-between'><span>Input</span><span>{format(usage!.input)}</span></div>
-					<div className='flex justify-between'><span>Cache creation</span><span>{format(usage!.cacheCreation)}</span></div>
+					<div className='flex justify-between'><span>Prompt (total)</span><span>{format(promptTotal)}</span></div>
+					<div className='flex justify-between'><span>Uncached prompt</span><span>{format(usage!.input)}</span></div>
+					<div className='flex justify-between'><span>Cache write</span><span>{format(usage!.cacheCreation)}</span></div>
 					<div className='flex justify-between'><span>Cache read</span><span>{format(usage!.cacheRead)}</span></div>
 					<div className='flex justify-between'><span>Output</span><span>{format(usage!.output)}</span></div>
 				</div>

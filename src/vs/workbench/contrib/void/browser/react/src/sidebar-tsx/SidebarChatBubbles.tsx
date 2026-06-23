@@ -2,6 +2,7 @@
  *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
+import { LLMTokenUsage } from '../../../../../../../platform/void/common/sendLLMMessageTypes.js';
 import React, { KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAccessor, useChatThreadsStreamState, useFullChatThreadsStreamState } from '../util/services.js';
 import { ChatMarkdownRender, ChatMessageLocation } from '../markdown/ChatMarkdownRender.js';
@@ -52,8 +53,9 @@ export const ReasoningSpoiler = ({ reasoning, anthropicReasoning }: { reasoning:
 			>
 				<span className="truncate">
 					{open ? 'Hide reasoning' : 'Show reasoning'}
-					{!open && preview && <span className="opacity-70"> — {preview}</span>}
+					{!open && preview && <span className="opacity-70"> - {preview}</span>}
 				</span>
+				// allow-any-unicode-next-line
 				<span className="ml-2 text-[10px]">{open ? '▲' : '▼'}</span>
 			</button>
 			{open && (
@@ -285,24 +287,24 @@ export const UserMessageComponent = ({
 	return <div
 		// align chatbubble accoridng to role
 		className={`
-        relative ml-auto
-        ${mode === 'edit' ? 'w-full max-w-full'
+			relative ml-auto
+			${mode === 'edit' ? 'w-full max-w-full'
 				: mode === 'display' ? `self-end w-fit max-w-full whitespace-pre-wrap` : '' // user words should be pre
 			}
 
-        ${isCheckpointGhost && !isMsgAfterCheckpoint ? 'opacity-50 pointer-events-none' : ''}
-    `}
+			${isCheckpointGhost && !isMsgAfterCheckpoint ? 'opacity-50 pointer-events-none' : ''}
+		`}
 		onMouseEnter={() => setIsHovered(true)}
 		onMouseLeave={() => setIsHovered(false)}
 	>
 		<div
 			// style chatbubble according to role
 			className={`
-            text-left rounded-lg max-w-full
-            ${mode === 'edit' ? ''
+				text-left rounded-lg max-w-full
+				${mode === 'edit' ? ''
 					: mode === 'display' ? 'p-2 flex flex-col bg-void-bg-1 text-void-fg-1 overflow-x-auto cursor-pointer' : ''
 				}
-        `}
+			`}
 			onClick={() => { if (mode === 'display') { onOpenEdit(); } }}
 		>
 			{chatbubbleContents}
@@ -333,6 +335,36 @@ export const UserMessageComponent = ({
 			/>
 		</div>
 	</div>;
+};
+
+export const TokenUsageInline = ({ usage }: { usage: LLMTokenUsage }) => {
+	const [open, setOpen] = useState(false);
+	const fmt = (n: number) => (typeof n === 'number' ? (n.toLocaleString?.() ?? String(n)) : '0');
+
+	const promptTotal = usage.input + usage.cacheCreation + usage.cacheRead;
+	const total = promptTotal + usage.output;
+
+	return (
+		<div className="mt-1 text-[11px] text-void-fg-3">
+			<button
+				type="button"
+				className="opacity-80 hover:opacity-100"
+				onClick={() => setOpen(v => !v)}
+			>
+				Tokens: total {fmt(total)} (prompt {fmt(promptTotal)}, output {fmt(usage.output)})
+			</button>
+
+			{open && (
+				<div className="mt-1 space-y-0.5 border border-void-border-3 rounded bg-void-bg-2/80 px-2 py-1">
+					<div className="flex justify-between"><span>Prompt (total)</span><span>{fmt(promptTotal)}</span></div>
+					<div className="flex justify-between"><span>Uncached prompt</span><span>{fmt(usage.input)}</span></div>
+					<div className="flex justify-between"><span>Cache write</span><span>{fmt(usage.cacheCreation)}</span></div>
+					<div className="flex justify-between"><span>Cache read</span><span>{fmt(usage.cacheRead)}</span></div>
+					<div className="flex justify-between"><span>Output</span><span>{fmt(usage.output)}</span></div>
+				</div>
+			)}
+		</div>
+	);
 };
 
 export const AssistantMessageComponent = ({
@@ -372,7 +404,8 @@ export const AssistantMessageComponent = ({
 	// Only hide reasoning when it's the provider "encrypted" placeholder (not normal reasoning)
 	const showReasoning = hasReasoning && !(hideEncryptedReasoning && reasoningIsEncryptedPlaceholder);
 
-	if (!hasText && !showReasoning) return null;
+	const hasUsage = !!(chatMessage as any).tokenUsage;
+	if (!hasText && !showReasoning && !hasUsage) return null;
 
 	return (
 		<div className={`${isCheckpointGhost ? 'opacity-50' : ''}`}>
@@ -387,14 +420,14 @@ export const AssistantMessageComponent = ({
 				<ProseWrapper>
 					<div
 						className={`
-				  [&_p:last-child]:mb-0
-				  [&_pre:last-child]:mb-0
-				  [&_ul:last-child]:mb-0
-				  [&_ol:last-child]:mb-0
-				  [&_blockquote:last-child]:mb-0
-				  [&_table:last-child]:mb-0
-				  [&_hr:last-child]:mb-0
-				`}
+							[&_p:last-child]:mb-0
+							[&_pre:last-child]:mb-0
+							[&_ul:last-child]:mb-0
+							[&_ol:last-child]:mb-0
+							[&_blockquote:last-child]:mb-0
+							[&_table:last-child]:mb-0
+							[&_hr:last-child]:mb-0
+						`}
 					>
 						<ChatMarkdownRender
 							string={displayContent}
@@ -405,6 +438,9 @@ export const AssistantMessageComponent = ({
 					</div>
 				</ProseWrapper>
 			)}
+			{(chatMessage as any).tokenUsage ? (
+				<TokenUsageInline usage={(chatMessage as any).tokenUsage as LLMTokenUsage} />
+			) : null}
 		</div>
 	);
 };
@@ -423,12 +459,12 @@ export const Checkpoint = ({ message, threadId, messageIdx, isCheckpointGhost, t
 	return <div className={`flex items-center justify-center px-2 `}>
 		<div
 			className={`
-                    text-xs
-                    text-void-fg-3
-                    select-none
-                    ${isCheckpointGhost ? 'opacity-50' : 'opacity-100'}
-					${isDisabled ? 'cursor-default' : 'cursor-pointer'}
-                `}
+				text-xs
+				text-void-fg-3
+				select-none
+				${isCheckpointGhost ? 'opacity-50' : 'opacity-100'}
+				${isDisabled ? 'cursor-default' : 'cursor-pointer'}
+			`}
 			style={{ position: 'relative', display: 'inline-block' }} // allow absolute icon
 			onClick={() => {
 				if (threadIsRunning) return;
@@ -478,12 +514,12 @@ const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, me
 	const isCheckpointGhost =
 		messageIdx > (currCheckpointIdx ?? Infinity) && !chatIsRunning; // whether to show as gray
 
-	
+
 	const turnInfo = getAssistantTurnInfo(thread.messages, messageIdx);
 	const showCopyFooter =
 		!!turnInfo &&
 		turnInfo.lastNonCheckpointIdx === messageIdx &&
-		!chatIsRunning; 
+		!chatIsRunning;
 
 	const copyMarkdown = showCopyFooter ? getAssistantTurnMarkdown(thread.messages, messageIdx) : '';
 

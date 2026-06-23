@@ -260,6 +260,86 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		return { models: out, caps: newCaps };
 	}
 
+	private buildModelIdVariants(slug: string, modelId: string): string[] {
+		const out = new Set<string>();
+		const id = String(modelId ?? '').trim();
+		if (!id) return [];
+
+		out.add(id);
+		out.add(this.toShortName(id));
+
+		if (!id.includes('/')) {
+			out.add(`${slug}/${id}`);
+		}
+
+		return Array.from(out);
+	}
+
+	private parseWhitelistRegex(pattern: string): RegExp {
+		const p = String(pattern ?? '').trim();
+		if (!p) {
+			throw new Error('Empty pattern');
+		}
+
+		// /.../flags
+		if (p.startsWith('/') && p.lastIndexOf('/') > 0) {
+			const last = p.lastIndexOf('/');
+			const body = p.slice(1, last);
+			const flags = p.slice(last + 1);
+			return new RegExp(body, flags);
+		}
+
+		// raw regex (no default flags)
+		return new RegExp(p);
+	}
+
+	private applyModelsWhitelist(slug: string, modelIds: string[], cfg?: IUserProviderSettings): string[] {
+		const rules = cfg?.modelsWhitelist;
+		if (!Array.isArray(rules) || rules.length === 0) return modelIds;
+
+		const useRegex = cfg?.modelsWhitelistUseRegex === true;
+
+		if (useRegex) {
+			const regexes: RegExp[] = [];
+			for (const raw of rules) {
+				const s = String(raw ?? '').trim();
+				if (!s) continue;
+				try {
+					regexes.push(this.parseWhitelistRegex(s));
+				} catch {
+					// invalid rule is ignored (UI already validates)
+				}
+			}
+			if (regexes.length === 0) return modelIds;
+
+			return modelIds.filter(id => {
+				const variants = this.buildModelIdVariants(slug, id);
+				for (const v of variants) {
+					for (const re of regexes) {
+						if (re.test(v)) return true;
+					}
+				}
+				return false;
+			});
+		}
+
+		// exact match
+		const exact = new Set<string>();
+		for (const raw of rules) {
+			const s = String(raw ?? '').trim();
+			if (s) exact.add(s);
+		}
+		if (exact.size === 0) return modelIds;
+
+		return modelIds.filter(id => {
+			const variants = this.buildModelIdVariants(slug, id);
+			for (const v of variants) {
+				if (exact.has(v)) return true;
+			}
+			return false;
+		});
+	}
+
 	private static readonly NAME_QUALIFIERS = new Set([
 		'pro', 'mini', 'search', 'lite', 'high', 'low', 'medium', 'large', 'xl', 'xlarge', 'turbo', 'fast', 'slow',
 		'instruct', 'chat', 'reasoning', 'flash', 'dev', 'beta', 'latest', 'preview', 'free'
@@ -507,10 +587,12 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		if (this.isLocalEndpoint(cfg?.endpoint)) {
 			const remoteIds = await this.refreshModelsViaProviderEndpoint(slug, cfg!.endpoint!);
 
-			const inferredCaps = await this.inferCapabilitiesForRemoteModels(remoteIds);
+			const filteredIds = this.applyModelsWhitelist(slug, remoteIds, cfg);
+
+			const inferredCaps = await this.inferCapabilitiesForRemoteModels(filteredIds);
 
 
-			const { models, caps } = this.sanitizeModelsAndCaps(remoteIds, inferredCaps, {
+			const { models, caps } = this.sanitizeModelsAndCaps(filteredIds, inferredCaps, {
 				keepFullIds: true,
 				dropFree: false
 			});
@@ -527,8 +609,11 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 			const allCaps = this.dynamicModelService.getAllDynamicCapabilities();
 			const entries = Object.entries(allCaps);
 			const fullIds = entries.map(([id]) => id);
+			const filteredIds = this.applyModelsWhitelist(slug, fullIds, cfg);
+			const allowed = new Set(filteredIds);
 			const capsFull: Record<string, Partial<VoidStaticModelInfo>> = {};
 			for (const [id, info] of entries) {
+				if (!allowed.has(id)) continue;
 				capsFull[id] = {
 					contextWindow: info.contextWindow,
 					reservedOutputTokenSpace: info.reservedOutputTokenSpace,
@@ -542,7 +627,7 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 					supportsParallelToolCalls: info.supportsParallelToolCalls,
 				};
 			}
-			const { models, caps } = this.sanitizeModelsAndCaps(fullIds, capsFull, { keepFullIds: true, dropFree: false });
+			const { models, caps } = this.sanitizeModelsAndCaps(filteredIds, capsFull, { keepFullIds: true, dropFree: false });
 			await this.setProviderModels(slug, models, caps);
 			await this.publishAllConfiguredToChat();
 			return;
@@ -557,9 +642,11 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		if (bySlug.length === 0 && cfg?.endpoint) {
 			try {
 				const remoteIds = await this.refreshModelsViaProviderEndpoint(slug, cfg.endpoint);
-				const inferredCaps = await this.inferCapabilitiesForRemoteModels(remoteIds);
+				const filteredRemoteIds = this.applyModelsWhitelist(slug, remoteIds, cfg);
 
-				const norm = this.sanitizeModelsAndCaps(remoteIds, inferredCaps, { keepFullIds: true, dropFree: false });
+				const inferredCaps = await this.inferCapabilitiesForRemoteModels(filteredRemoteIds);
+
+				const norm = this.sanitizeModelsAndCaps(filteredRemoteIds, inferredCaps, { keepFullIds: true, dropFree: false });
 				await this.setProviderModels(slug, norm.models, norm.caps);
 				await this.publishAllConfiguredToChat();
 				return;
@@ -569,8 +656,11 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		}
 
 		const ids = bySlug.map(([id]) => id);
+		const filteredIds = this.applyModelsWhitelist(slug, ids, cfg);
+		const allowed = new Set(filteredIds);
 		const caps: Record<string, Partial<VoidStaticModelInfo>> = {};
 		for (const [id, info] of bySlug) {
+			if (!allowed.has(id)) continue;
 			caps[id] = {
 				contextWindow: info.contextWindow,
 				reservedOutputTokenSpace: info.reservedOutputTokenSpace,
@@ -584,7 +674,7 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 				supportsParallelToolCalls: (info as any).supportsParallelToolCalls,
 			};
 		}
-		const norm = this.sanitizeModelsAndCaps(ids, caps, { keepFullIds: true, dropFree: false });
+		const norm = this.sanitizeModelsAndCaps(filteredIds, caps, { keepFullIds: true, dropFree: false });
 		await this.setProviderModels(slug, norm.models, norm.caps);
 		await this.publishAllConfiguredToChat();
 	}

@@ -298,6 +298,7 @@ export interface IThreadStateAccess {
 	getStreamState(threadId: string): any;
 	setStreamState(threadId: string, state: any): void;
 	addMessageToThread(threadId: string, message: ChatMessage): void;
+	editMessageInThread(threadId: string, idx: number, message: ChatMessage): void;
 	updateLatestTool(threadId: string, tool: any): void;
 	setThreadState(threadId: string, state: any): void;
 	markSkillActive(threadId: string, name: string, metadata: AgentSkillActiveMetadata): void;
@@ -460,33 +461,36 @@ export class ChatAcpHandler extends Disposable {
 			return mergeWithOverlap(prev, incoming);
 		};
 
-		const flushAssistantIfAny = () => {
-			const info = access.getStreamState(threadId)?.llmInfo;
-			if (!info) return;
-			const text = info.displayContentSoFar ?? '';
-			const reasoning = info.reasoningSoFar ?? '';
-			if (!text && !reasoning) return;
+		let done = false;
 
+		const assistantMsgIdxsThisPrompt: number[] = [];
+		let flushedThisTurn = false;
+
+		const addAssistantMessageAndRemember = (text: string, reasoning: string) => {
+			const idx = (access.getThreadMessages(threadId) ?? []).length;
 			access.addMessageToThread(threadId, {
 				role: 'assistant',
-				displayContent: text,
-				reasoning,
+				displayContent: text ?? '',
+				reasoning: reasoning ?? '',
 				anthropicReasoning: null
 			});
-
-			access.setStreamState(threadId, {
-				isRunning: 'LLM',
-				llmInfo: {
-					displayContentSoFar: '',
-					reasoningSoFar: '',
-					toolCallSoFar: null,
-					planSoFar: info.planSoFar
-				},
-				interrupt: interruptP
-			});
+			assistantMsgIdxsThisPrompt.push(idx);
 		};
 
-		let done = false;
+		const applyTokenUsageTurns = (turns: any) => {
+			if (!Array.isArray(turns) || turns.length === 0) return;
+
+			const msgs = access.getThreadMessages(threadId) ?? [];
+			const n = Math.min(turns.length, assistantMsgIdxsThisPrompt.length);
+
+			for (let i = 0; i < n; i++) {
+				const idx = assistantMsgIdxsThisPrompt[i];
+				const usage = turns[i];
+				const prev: any = msgs[idx];
+				if (!prev || prev.role !== 'assistant') continue;
+				access.editMessageInThread(threadId, idx, { ...prev, tokenUsage: usage } as any);
+			}
+		};
 
 		this.clearAcpState(threadId);
 
@@ -639,6 +643,7 @@ export class ChatAcpHandler extends Disposable {
 			if (done) return;
 
 			if (chunk.type === 'text') {
+				flushedThisTurn = false;
 				let incoming = chunk.text ?? '';
 				const prevInfo = access.getStreamState(threadId)?.llmInfo;
 				const prev = prevInfo?.displayContentSoFar ?? '';
@@ -659,6 +664,7 @@ export class ChatAcpHandler extends Disposable {
 			}
 
 			if (chunk.type === 'reasoning') {
+				flushedThisTurn = false;
 				const incoming = chunk.reasoning ?? '';
 				const prevInfo = access.getStreamState(threadId)?.llmInfo;
 				const prev = prevInfo?.reasoningSoFar ?? '';
@@ -701,7 +707,26 @@ export class ChatAcpHandler extends Disposable {
 			}
 
 			if (chunk.type === 'tool_call' && chunk.toolCall) {
-				flushAssistantIfAny();
+				if (!flushedThisTurn) {
+					const info = access.getStreamState(threadId)?.llmInfo;
+					const text = info?.displayContentSoFar ?? '';
+					const reasoning = info?.reasoningSoFar ?? '';
+
+					addAssistantMessageAndRemember(text, reasoning);
+
+					access.setStreamState(threadId, {
+						isRunning: 'LLM',
+						llmInfo: {
+							displayContentSoFar: '',
+							reasoningSoFar: '',
+							toolCallSoFar: null,
+							planSoFar: info?.planSoFar
+						},
+						interrupt: interruptP
+					});
+
+					flushedThisTurn = true;
+				}
 				const { id, name, args } = chunk.toolCall;
 
 				const normName = normalizeAcpToolName(String(name));
@@ -1108,17 +1133,22 @@ export class ChatAcpHandler extends Disposable {
 
 			if (chunk.type === 'error' || chunk.type === 'done') {
 				const info = access.getStreamState(threadId)?.llmInfo;
-				if (info?.displayContentSoFar || info?.reasoningSoFar) {
-					access.addMessageToThread(threadId, {
-						role: 'assistant',
-						displayContent: info.displayContentSoFar,
-						reasoning: info.reasoningSoFar,
-						anthropicReasoning: null
-					});
+
+
+				if (!flushedThisTurn) {
+					addAssistantMessageAndRemember(info?.displayContentSoFar ?? '', info?.reasoningSoFar ?? '');
+					flushedThisTurn = true;
 				}
 
-				if (chunk.type === 'done' && chunk.tokenUsageSnapshot) {
-					access.accumulateTokenUsage(threadId, chunk.tokenUsageSnapshot);
+				// apply per-turn usage to assistant messages
+				if (chunk.type === 'done' && (chunk as any).tokenUsageTurns) {
+					applyTokenUsageTurns((chunk as any).tokenUsageTurns);
+				}
+
+
+				const usage = (chunk as any).tokenUsageSnapshot;
+				if (usage) {
+					access.accumulateTokenUsage(threadId, usage);
 				}
 
 				if (chunk.type === 'error') {

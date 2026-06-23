@@ -359,12 +359,40 @@ const getCurrentMaxTokens = (opts: any) => {
 
 const mapOpenAIUsageToLLMTokenUsage = (usage: any): LLMTokenUsage | undefined => {
 	if (!usage || typeof usage !== 'object') return undefined;
+
+	const promptTokens = Number((usage as any).prompt_tokens ?? (usage as any).input_tokens ?? 0) || 0;
+	const completionTokens = Number((usage as any).completion_tokens ?? (usage as any).output_tokens ?? 0) || 0;
+
 	const promptDetails = (usage as any).prompt_tokens_details ?? (usage as any).promptTokensDetails ?? {};
+
+
+	// cached_tokens = cache READ
+	// cache_write_tokens = cache WRITE
+	const cacheRead = Number(
+		promptDetails.cached_tokens ??
+		promptDetails.cached_read_tokens ??
+		(usage as any).cached_tokens ??
+		0
+	) || 0;
+
+	const cacheCreation = Number(
+		promptDetails.cache_write_tokens ??
+		promptDetails.cached_creation_tokens ??
+		promptDetails.cache_creation_tokens ??
+		(usage as any).cache_write_tokens ??
+		(usage as any).cache_creation_tokens ??
+		0
+	) || 0;
+
+
+
+	const uncachedInput = Math.max(0, promptTokens - cacheRead - cacheCreation);
+
 	return {
-		input: Number((usage as any).prompt_tokens ?? (usage as any).input_tokens ?? 0) || 0,
-		cacheCreation: Number(promptDetails.cached_creation_tokens ?? promptDetails.cached_tokens ?? 0) || 0,
-		cacheRead: Number(promptDetails.cached_read_tokens ?? 0) || 0,
-		output: Number((usage as any).completion_tokens ?? (usage as any).output_tokens ?? 0) || 0,
+		input: uncachedInput,
+		cacheCreation,
+		cacheRead,
+		output: completionTokens,
 	};
 };
 
@@ -873,7 +901,6 @@ export interface RunStreamParams {
 	notifyOnTruncation?: boolean
 }
 
-
 export async function runStream({
 	openai,
 	options,
@@ -958,9 +985,6 @@ export async function runStream({
 
 	const __TOOL_TAG_RE: RegExp = (() => {
 		const names = __toolNames.map(__escapeRe).filter(Boolean);
-
-		// - <tool_call ...> / </tool_call>
-
 		const alts = names.length ? `|${names.join('|')}` : '';
 		return new RegExp(`<\\s*(?:\\/\\s*)?(?:tool_call\\b${alts})`, 'i');
 	})();
@@ -1134,6 +1158,10 @@ export async function runStream({
 		let chunkCount = 0;
 		let hasReceivedToolCall = false;
 
+
+
+		let stopProcessingDeltasAfterToolFinish = false;
+
 		let reasoningSource: 'details' | 'deltaField' | null = null;
 		let sawAnyReasoningDelta = false;
 		let sawAnyTextDelta = false;
@@ -1150,6 +1178,7 @@ export async function runStream({
 		const toolAccByIdx = new Map<number, ToolAcc>();
 		const idxOfToolCallId = new Map<string, number>();
 		let currentImplicitToolIdx = 0;
+
 		const getAcc = (idx: number): ToolAcc => {
 			let acc = toolAccByIdx.get(idx);
 			if (!acc) {
@@ -1158,10 +1187,12 @@ export async function runStream({
 			}
 			return acc;
 		};
+
 		const nextToolIdx = (): number => {
 			const indexes = Array.from(toolAccByIdx.keys());
 			return indexes.length ? Math.max(...indexes) + 1 : 0;
 		};
+
 		const resolveStreamingToolIdx = (tool: any): number => {
 			const rawIdx = tool?.index;
 			if (rawIdx !== undefined && rawIdx !== null) {
@@ -1354,12 +1385,20 @@ export async function runStream({
 			for await (const chunk of resp as any) {
 				chunkCount++;
 
+
+				{
+					const rawUsage = (chunk as any)?.usage;
+					const usage = validateLLMTokenUsage(mapOpenAIUsageToLLMTokenUsage(rawUsage), logService);
+					if (usage) lastTokenUsage = usage;
+				}
+
+
+				if (stopProcessingDeltasAfterToolFinish) {
+					continue;
+				}
+
 				const choice = chunk?.choices?.[0];
 				if (!choice) continue;
-
-				const rawUsage = chunk?.usage;
-				const usage = validateLLMTokenUsage(mapOpenAIUsageToLLMTokenUsage(rawUsage), logService);
-				if (usage) lastTokenUsage = usage;
 
 				if (choice.finish_reason) {
 					lastFinishReason = choice.finish_reason;
@@ -1504,25 +1543,6 @@ export async function runStream({
 					if (functionArgs) {
 						acc.args += functionArgs;
 						everHadAnyData = true;
-
-						if (stopOnFirstToolCall && controller && acc.name) {
-							const parsed = tryParseJsonWhenComplete(acc.args);
-							if (parsed.ok) {
-								abortedByUsForCompletedTool = true;
-
-								if (__isHeavyDebugEnabled) {
-									__dbg('Aborting stream: tool args JSON complete (stopOnFirstToolCall)', {
-										attempt,
-										chunkCount,
-										toolName: acc.name,
-										toolId: acc.id,
-										argsLen: acc.args.length,
-									});
-								}
-
-								try { controller.abort(); } catch { }
-							}
-						}
 					}
 				}
 
@@ -1551,25 +1571,6 @@ export async function runStream({
 					if (fcArgs) {
 						acc.args += fcArgs;
 						everHadAnyData = true;
-
-						if (stopOnFirstToolCall && controller && acc.name) {
-							const parsed = tryParseJsonWhenComplete(acc.args);
-							if (parsed.ok) {
-								abortedByUsForCompletedTool = true;
-
-								if (__isHeavyDebugEnabled) {
-									__dbg('Aborting stream: legacy function_call args JSON complete (stopOnFirstToolCall)', {
-										attempt,
-										chunkCount,
-										toolName: acc.name,
-										toolId: acc.id,
-										argsLen: acc.args.length,
-									});
-								}
-
-								try { controller.abort(); } catch { }
-							}
-						}
 					}
 				}
 
@@ -1596,8 +1597,10 @@ export async function runStream({
 					});
 				}
 
+
 				if (hasReceivedToolCall && (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'function_call')) {
-					break;
+					stopProcessingDeltasAfterToolFinish = true;
+					continue;
 				}
 			}
 
@@ -1626,6 +1629,7 @@ export async function runStream({
 				sawXmlToolTagInReasoning,
 				hasFinalToolCall: !!toolCall,
 				finalToolName: (toolCall as any)?.name ?? null,
+				hasUsage: !!lastTokenUsage,
 			});
 
 			// IMPORTANT: retry on length/timeout EVEN IF we already got partial output,
@@ -1647,12 +1651,10 @@ export async function runStream({
 					reasoningLen: fullReasoningSoFar.length,
 				});
 
-				// give provider a tiny breather
 				await sleep(150 * attempt);
 				continue;
 			}
 
-			//No more retries → notify (best-effort) if truncated
 			if (!toolCall && (hitLimit || hitTimeout)) {
 				notifyTruncationOnce({
 					kind: hitTimeout ? 'timeout' : 'length',

@@ -64,6 +64,8 @@ export type CustomProviderSettings = {
 	modelsCapabilities?: Record<string, Partial<VoidStaticModelInfo>>;
 	modelCapabilityOverrides?: Record<string, ModelCapabilityOverride>;
 	modelsLastRefreshedAt?: number;
+	modelsWhitelist?: string[];
+	modelsWhitelistUseRegex?: boolean;
 };
 
 // Narrowed overloads to avoid ambiguous intersection types for `models`

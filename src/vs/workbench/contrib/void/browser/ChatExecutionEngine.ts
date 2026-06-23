@@ -335,7 +335,13 @@ export class ChatExecutionEngine {
 					} else {
 						const { error } = llmRes;
 						const info = access.getStreamState(threadId).llmInfo;
-						access.addMessageToThread(threadId, { role: 'assistant', displayContent: info.displayContentSoFar, reasoning: info.reasoningSoFar, anthropicReasoning: null });
+						access.addMessageToThread(threadId, {
+							role: 'assistant',
+							displayContent: info.displayContentSoFar,
+							reasoning: info.reasoningSoFar,
+							anthropicReasoning: null,
+							...(lastUsageForTurn ? { tokenUsage: lastUsageForTurn } : {}),
+						});
 						if (info.toolCallSoFar) access.addMessageToThread(threadId, { role: 'interrupted_streaming_tool', name: info.toolCallSoFar.name });
 
 						access.setStreamState(threadId, { isRunning: undefined, error });
@@ -349,7 +355,13 @@ export class ChatExecutionEngine {
 				const effectiveUsage = tokenUsage ?? lastUsageForTurn;
 				if (effectiveUsage) access.accumulateTokenUsage(threadId, effectiveUsage);
 
-				access.addMessageToThread(threadId, { role: 'assistant', displayContent: info.fullText, reasoning: info.fullReasoning, anthropicReasoning: info.anthropicReasoning });
+				access.addMessageToThread(threadId, {
+					role: 'assistant',
+					displayContent: info.fullText,
+					reasoning: info.fullReasoning,
+					anthropicReasoning: info.anthropicReasoning,
+					...(effectiveUsage ? { tokenUsage: effectiveUsage } : {}),
+				});
 
 				// Loop Detection (Assistant)
 				const loopAfterAssistant = loopDetector.registerAssistantTurn(info.fullText);

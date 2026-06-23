@@ -226,8 +226,11 @@ export const DynamicProviderSettings = () => {
 		apiStyle: 'openai-compatible',
 		supportsSystemMessage: 'system-role',
 		specialToolFormat: 'disabled',
-		additionalHeadersText: '{\n}'
+		additionalHeadersText: '{\n}',
+		modelsWhitelistText: '',
+		modelsWhitelistUseRegex: false,
 	});
+	const [showApiKey, setShowApiKey] = useState(false);
 
 	const snapshot = useCallback(() => {
 		try {
@@ -271,6 +274,31 @@ export const DynamicProviderSettings = () => {
 		return {};
 	};
 
+	const parseWhitelistText = (text: string): string[] => {
+		return (text || '')
+			.split(/[\n,]/g)
+			.map(s => s.trim())
+			.filter(Boolean);
+	};
+
+	const compileWhitelistRegex = (pattern: string): RegExp => {
+		const p = String(pattern ?? '').trim();
+		if (!p) {
+			throw new Error('Empty pattern');
+		}
+
+		// /.../flags
+		if (p.startsWith('/') && p.lastIndexOf('/') > 0) {
+			const last = p.lastIndexOf('/');
+			const body = p.slice(1, last);
+			const flags = p.slice(last + 1);
+			return new RegExp(body, flags);
+		}
+
+		// raw regex (no default flags)
+		return new RegExp(p);
+	};
+
 	const loadProviderToForm = useCallback((slug: string) => {
 		const cur = registry.getUserProviderSettings(slug) || {};
 		const defaultEndpoint =
@@ -291,6 +319,8 @@ export const DynamicProviderSettings = () => {
 			supportsSystemMessage: cur.supportsSystemMessage ?? 'system-role',
 			specialToolFormat: cur.specialToolFormat ?? 'disabled',
 			additionalHeadersText: JSON.stringify(mergedHeaders, null, 2),
+			modelsWhitelistText: Array.isArray(cur.modelsWhitelist) ? cur.modelsWhitelist.join('\n') : '',
+			modelsWhitelistUseRegex: !!cur.modelsWhitelistUseRegex,
 		});
 		setErrorMsg(null);
 		setStatus('idle');
@@ -327,6 +357,20 @@ export const DynamicProviderSettings = () => {
 			return;
 		}
 
+		const whitelist = parseWhitelistText(form.modelsWhitelistText);
+
+		if (form.modelsWhitelistUseRegex && whitelist.length > 0) {
+			try {
+				for (const p of whitelist) {
+					compileWhitelistRegex(p);
+				}
+			} catch (e) {
+				setStatus('error');
+				setErrorMsg(`Invalid regex in Whitelist models: ${String(e)}`);
+				return;
+			}
+		}
+
 		try {
 			await registry.setUserProviderSettings(form.slug, {
 				endpoint: form.endpoint || undefined,
@@ -335,7 +379,9 @@ export const DynamicProviderSettings = () => {
 				supportsSystemMessage: form.supportsSystemMessage,
 				specialToolFormat: form.specialToolFormat,
 				auth: { header: 'Authorization', format: 'Bearer' },
-				additionalHeaders: headers
+				additionalHeaders: headers,
+				modelsWhitelist: whitelist.length ? whitelist : undefined,
+				modelsWhitelistUseRegex: whitelist.length ? form.modelsWhitelistUseRegex : undefined,
 			});
 			setStatus('saved');
 			setTimeout(() => setStatus('idle'), 1500);
@@ -351,7 +397,14 @@ export const DynamicProviderSettings = () => {
 		if (!form.slug) return;
 		try {
 			await registry.deleteUserProviderSettings(form.slug);
-			setForm(f => ({ ...f, endpoint: '', apiKey: '', additionalHeadersText: '{\n}' }));
+			setForm(f => ({
+				...f,
+				endpoint: '',
+				apiKey: '',
+				additionalHeadersText: '{\n}',
+				modelsWhitelistText: '',
+				modelsWhitelistUseRegex: false,
+			}));
 			setStatus('saved');
 			setTimeout(() => setStatus('idle'), 1500);
 			snapshot();
@@ -412,13 +465,23 @@ export const DynamicProviderSettings = () => {
 					data-tooltip-place="right"
 					data-tooltip-content="Basic API URL. OpenAI-compatible - usually /v1; Anthropic - /v1 (but need anthropic-version header); Gemini - generativelanguage.googleapis.com/v1."
 				/>
-				<VoidSimpleInputBox
-					value={form.apiKey}
-					onChangeValue={(v) => setForm(f => ({ ...f, apiKey: v }))}
-					placeholder="API Key (stored locally)"
-					passwordBlur
-					compact
-				/>
+				<div className="flex items-center gap-2">
+					<VoidSimpleInputBox
+						value={form.apiKey}
+						onChangeValue={(v) => setForm(f => ({ ...f, apiKey: v }))}
+						placeholder="API Key (stored locally)"
+						passwordBlur={!showApiKey}
+						compact
+					/>
+
+					<button
+						type="button"
+						className="text-xs underline"
+						onClick={() => setShowApiKey(v => !v)}
+					>
+						{showApiKey ? 'Hide' : 'Show'}
+					</button>
+				</div>
 				<div className="flex gap-2">
 					<VoidCustomDropdownBox
 						options={['openai-compatible', 'anthropic-style', 'gemini-style']}
@@ -456,6 +519,39 @@ export const DynamicProviderSettings = () => {
 						data-tooltip-place="right"
 						data-tooltip-content="Special formatting for tools (if model doesn't support native tools)."
 					/>
+				</div>
+				<div>
+					<div className="flex items-center justify-between mb-1">
+						<div className="text-xs text-void-fg-1">Whitelist models</div>
+						<div className="flex items-center gap-2">
+							<span className="text-xs text-void-fg-3">Regexp</span>
+							<VoidSwitch
+								size="xs"
+								value={form.modelsWhitelistUseRegex}
+								onChange={(v) => setForm(f => ({ ...f, modelsWhitelistUseRegex: v }))}
+							/>
+						</div>
+					</div>
+					<textarea
+						className="w-full min-h-[90px] p-2 rounded-sm border border-void-border-2 bg-void-bg-2 resize-none font-mono text-xs"
+						value={form.modelsWhitelistText}
+						onChange={(e) => setForm(f => ({ ...f, modelsWhitelistText: e.target.value }))}
+						placeholder={
+							form.modelsWhitelistUseRegex
+								? `:free\n^moonshotai/kimi-k2\\.7-code$`
+								: `moonshotai/kimi-k2.7-code\nkimi-k2.7-code`
+						}
+						data-tooltip-id="void-tooltip"
+						data-tooltip-place="right"
+						data-tooltip-content={
+							`Only affects "Refresh models".
+Regexp OFF: exact match only (full id or short name).
+Regexp ON: each line is a RegExp (use ^...$ for exact).`
+						}
+					/>
+					<div className="text-[11px] text-void-fg-3 mt-1">
+						Only affects Refresh models. When Regexp is OFF: exact match only. When ON: regex match.
+					</div>
 				</div>
 				<div>
 					<div className="text-xs text-void-fg-1 mb-1">Additional Headers (JSON)</div>
@@ -544,7 +640,7 @@ const DynamicModelSettingsDialog = ({
 		'supportCacheControl',
 	] as const;
 
-	const isOpenRouter = (slug ?? '').toLowerCase() === 'openrouter';
+	const isOpenRouter = (slug ?? '').toLowerCase().includes('openrouter');
 
 	const providerTitle = useMemo(() => {
 		try {

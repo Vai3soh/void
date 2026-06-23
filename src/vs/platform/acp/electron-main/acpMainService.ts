@@ -937,10 +937,19 @@ export class AcpMainService implements IAcpMainServiceForChannel {
 		this.conn.prompt({ sessionId, prompt, _meta: promptMeta } as any)
 			.then((resp: any) => {
 				const usageFromMeta: LLMTokenUsage | undefined = resp?._meta?.llmTokenUsage;
+				const turnsFromMeta: LLMTokenUsage[] | undefined = Array.isArray(resp?._meta?.llmTokenUsageTurns)
+					? resp._meta.llmTokenUsageTurns
+					: undefined;
+
 				const usageFromSession = this.tokenUsageBySession.get(sessionId);
 				const usage = usageFromMeta ?? usageFromSession;
 				this.tokenUsageBySession.delete(sessionId);
-				emitter?.fire({ type: 'done', ...(usage ? { tokenUsageSnapshot: usage } : {}) });
+
+				emitter?.fire({
+					type: 'done',
+					...(usage ? { tokenUsageSnapshot: usage } : {}),
+					...(turnsFromMeta?.length ? { tokenUsageTurns: turnsFromMeta } : {}),
+				} as any);
 			})
 			.catch((err: any) => {
 				const baseMsg = typeof err?.message === 'string' ? err.message : String(err);

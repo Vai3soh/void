@@ -862,7 +862,15 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 		const findIndex = (arr: any[], item: any) => {
 			for (let i = 0; i < arr.length; i++) {
-				if (arr[i].uri.fsPath === item.uri.fsPath && arr[i].type === item.type) return i;
+				if (arr[i].uri.fsPath === item.uri.fsPath && arr[i].type === item.type) {
+					if (item.type === 'CodeSelection') {
+						const r1 = arr[i].range;
+						const r2 = item.range;
+						if (r1 && r2 && r1[0] === r2[0] && r1[1] === r2[1]) return i;
+						continue;
+					}
+					return i;
+				}
 			}
 			return -1;
 		};

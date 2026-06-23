@@ -536,6 +536,7 @@ class VoidPipelineAcpAgent implements Agent {
 
 
 		let usageForThisPrompt: LLMTokenUsage | undefined = undefined;
+		const usageTurnsForThisPrompt: LLMTokenUsage[] = [];
 
 		// refresh cfg
 		try {
@@ -758,6 +759,7 @@ class VoidPipelineAcpAgent implements Agent {
 				}
 
 				if (state.llmTokenUsageLast) {
+					usageTurnsForThisPrompt.push({ ...state.llmTokenUsageLast });
 					usageForThisPrompt = accumulateUsage(usageForThisPrompt, state.llmTokenUsageLast);
 					state.llmTokenUsageLast = undefined;
 				}
@@ -783,7 +785,13 @@ class VoidPipelineAcpAgent implements Agent {
 					stopReason: 'end_turn',
 				});
 				const resp: any = { stopReason: 'end_turn' as const };
-				if (usageForThisPrompt) resp._meta = { ...(resp._meta || {}), llmTokenUsage: usageForThisPrompt };
+				if (usageForThisPrompt || usageTurnsForThisPrompt.length) {
+					resp._meta = {
+						...(resp._meta || {}),
+						...(usageForThisPrompt ? { llmTokenUsage: usageForThisPrompt } : {}),
+						...(usageTurnsForThisPrompt.length ? { llmTokenUsageTurns: usageTurnsForThisPrompt } : {}),
+					};
+				}
 				return resp as PromptResponse;
 			}
 
