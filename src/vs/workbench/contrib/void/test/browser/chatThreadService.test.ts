@@ -10,7 +10,9 @@ import type { ModelSelection, ModelSelectionOptions } from '../../../../../platf
 import { URI } from '../../../../../base/common/uri.js';
 import { NullLogService } from '../../../../../platform/log/common/log.js';
 import {
+	ChatThreadService,
 	normalizeSelectionRelativePath,
+	__test as chatThreadServiceTest,
 	type ThreadStreamState,
 	type ThreadsState,
 } from '../../browser/chatThreadService.js';
@@ -35,6 +37,27 @@ function isRelativeToolOutputPath(p: string): boolean {
 		p.startsWith('.void\\tool_outputs\\')
 	);
 }
+
+type ToolDecision = { threadId: string; toolCallId: string; decision: string };
+
+type ChatThreadServiceHarness = {
+	state: ThreadsState;
+	streamState: ThreadStreamState;
+	_threadAccess?: unknown;
+	_settingsService: unknown;
+	_notificationManager?: { wrapRunAgentToNotify(promise: Promise<unknown>): void };
+	_executionEngine?: { runChatAgent(opts?: { callThisToolFirst?: { id: string } }): Promise<void> };
+	_onExternalToolDecision: { fire(event: ToolDecision): void };
+	_updateLatestTool(threadId: string, tool: ChatMessage): void;
+	_setStreamState(threadId: string, state: unknown): void;
+	_addMessageToThread(threadId: string, message: ChatMessage): void;
+	_currentModelSelectionProps(): Record<string, unknown>;
+	_getLastUserMessageContent(threadId: string): string;
+	switchToThread(threadId: string): void;
+	rejectLatestToolRequest(threadId: string): void;
+	skipLatestToolRequest(threadId: string): void;
+	approveLatestToolRequest(threadId: string): void;
+};
 
 /**
  * Some refactors moved logic into separate classes; signatures can differ a bit.
@@ -203,6 +226,297 @@ suite('ChatThreadService - reasoning propagation', () => {
 		const lastMessage = threadAfter.messages[threadAfter.messages.length - 1] as any;
 		assert.strictEqual(lastMessage.role, 'assistant');
 		assert.strictEqual(lastMessage.reasoning, 'step1');
+	});
+});
+
+suite('ChatThreadService - latest tool request lookup', () => {
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('finds pending request behind skipped parallel-call tool results', () => {
+		const messages: ChatMessage[] = [
+			{
+				role: 'tool',
+				type: 'tool_request',
+				content: '(Awaiting user permission...)',
+				result: null,
+				name: 'run_command',
+				params: { command: 'echo a' },
+				id: 'tool-a',
+				rawParams: { command: 'echo a' },
+			},
+			{
+				role: 'tool',
+				type: 'tool_error',
+				content: 'Tool call was skipped because another tool call in the same assistant turn is awaiting user approval.',
+				displayContent: 'Tool call was skipped because another tool call in the same assistant turn is awaiting user approval.',
+				result: 'Tool call was skipped because another tool call in the same assistant turn is awaiting user approval.',
+				name: 'read_file',
+				params: { uri: 'b.ts' },
+				id: 'tool-b',
+				rawParams: { uri: 'b.ts' },
+			},
+			{
+				role: 'tool',
+				type: 'tool_error',
+				content: 'Tool call was skipped because another tool call in the same assistant turn is awaiting user approval.',
+				displayContent: 'Tool call was skipped because another tool call in the same assistant turn is awaiting user approval.',
+				result: 'Tool call was skipped because another tool call in the same assistant turn is awaiting user approval.',
+				name: 'read_file',
+				params: { uri: 'c.ts' },
+				id: 'tool-c',
+				rawParams: { uri: 'c.ts' },
+			},
+		];
+
+		const latestToolRequest = chatThreadServiceTest.findLatestToolRequestMessage(messages);
+
+		assert.ok(latestToolRequest);
+		assert.strictEqual(latestToolRequest.index, 0);
+		assert.strictEqual(latestToolRequest.message.id, 'tool-a');
+	});
+
+	test('uses the last pending request and ignores later non-request tool messages', () => {
+		const messages: ChatMessage[] = [
+			{
+				role: 'tool',
+				type: 'tool_request',
+				content: '(Awaiting user permission...)',
+				result: null,
+				name: 'run_command',
+				params: { command: 'echo a' },
+				id: 'tool-a',
+				rawParams: { command: 'echo a' },
+			},
+			{
+				role: 'tool',
+				type: 'tool_request',
+				content: '(Awaiting user permission...)',
+				result: null,
+				name: 'run_command',
+				params: { command: 'echo b' },
+				id: 'tool-b',
+				rawParams: { command: 'echo b' },
+			},
+			{
+				role: 'tool',
+				type: 'tool_error',
+				content: 'skipped',
+				displayContent: 'skipped',
+				result: 'skipped',
+				name: 'read_file',
+				params: { uri: 'c.ts' },
+				id: 'tool-c',
+				rawParams: { uri: 'c.ts' },
+			},
+		];
+
+		const latestToolRequest = chatThreadServiceTest.findLatestToolRequestMessage(messages);
+
+		assert.ok(latestToolRequest);
+		assert.strictEqual(latestToolRequest.index, 1);
+		assert.strictEqual(latestToolRequest.message.id, 'tool-b');
+	});
+
+	test('rejectLatestToolRequest rejects the pending request, not the trailing skipped result', () => {
+		const threadId = 'thread-reject-latest-request';
+		const messages: ChatMessage[] = [
+			{
+				role: 'tool',
+				type: 'tool_request',
+				content: '(Awaiting user permission...)',
+				result: null,
+				name: 'run_command',
+				params: { command: 'echo a' },
+				id: 'tool-a',
+				rawParams: { command: 'echo a' },
+			},
+			{
+				role: 'tool',
+				type: 'tool_error',
+				content: 'skipped',
+				displayContent: 'skipped',
+				result: 'skipped',
+				name: 'read_file',
+				params: { uri: 'b.ts' },
+				id: 'tool-b',
+				rawParams: { uri: 'b.ts' },
+			},
+		];
+		const decisions: ToolDecision[] = [];
+		const service = Object.create(ChatThreadService.prototype) as ChatThreadServiceHarness;
+		service.state = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages,
+					state: {
+						currCheckpointIdx: null,
+						stagingSelections: [],
+						focusedMessageIdx: undefined,
+						linksOfMessageIdx: {},
+					},
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		service.streamState = {};
+		service._settingsService = { state: { globalSettings: { useAcp: false } } };
+		service._onExternalToolDecision = { fire: event => decisions.push(event) };
+		service._updateLatestTool = (tid: string, tool: ChatMessage) => {
+			const thread = service.state.allThreads[tid];
+			assert.ok(thread);
+			const idx = thread.messages.findIndex(message => message.role === 'tool' && message.id === (tool as any).id);
+			assert.notStrictEqual(idx, -1);
+			thread.messages[idx] = tool;
+		};
+		service._setStreamState = (tid: string, state: unknown) => { service.streamState[tid] = state as any; };
+
+		service.rejectLatestToolRequest(threadId);
+
+		assert.strictEqual((service.state.allThreads[threadId]!.messages[0] as any).type, 'rejected');
+		assert.strictEqual((service.state.allThreads[threadId]!.messages[1] as any).type, 'tool_error');
+		assert.deepStrictEqual(decisions, [{ threadId, toolCallId: 'tool-a', decision: 'rejected' }]);
+	});
+
+	test('skipLatestToolRequest skips the pending request, not the trailing skipped result', () => {
+		const threadId = 'thread-skip-latest-request';
+		const messages: ChatMessage[] = [
+			{
+				role: 'tool',
+				type: 'tool_request',
+				content: '(Awaiting user permission...)',
+				result: null,
+				name: 'run_command',
+				params: { command: 'echo a' },
+				id: 'tool-a',
+				rawParams: { command: 'echo a' },
+			},
+			{
+				role: 'tool',
+				type: 'tool_error',
+				content: 'skipped',
+				displayContent: 'skipped',
+				result: 'skipped',
+				name: 'read_file',
+				params: { uri: 'b.ts' },
+				id: 'tool-b',
+				rawParams: { uri: 'b.ts' },
+			},
+		];
+		const decisions: ToolDecision[] = [];
+		let resumed = false;
+		const service = Object.create(ChatThreadService.prototype) as ChatThreadServiceHarness;
+		service.state = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages,
+					state: {
+						currCheckpointIdx: null,
+						stagingSelections: [],
+						focusedMessageIdx: undefined,
+						linksOfMessageIdx: {},
+					},
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		service.streamState = {};
+		service._settingsService = { state: { globalSettings: { useAcp: false } } };
+		service._notificationManager = { wrapRunAgentToNotify: () => { resumed = true; } };
+		service._executionEngine = { runChatAgent: async () => { } };
+		service._onExternalToolDecision = { fire: event => decisions.push(event) };
+		service._updateLatestTool = (tid: string, tool: ChatMessage) => {
+			const thread = service.state.allThreads[tid];
+			assert.ok(thread);
+			const idx = thread.messages.findIndex(message => message.role === 'tool' && message.id === (tool as any).id);
+			assert.notStrictEqual(idx, -1);
+			thread.messages[idx] = tool;
+		};
+		service._addMessageToThread = (tid: string, message: ChatMessage) => {
+			const thread = service.state.allThreads[tid];
+			assert.ok(thread);
+			thread.messages.push(message);
+		};
+		service._currentModelSelectionProps = () => ({});
+		service._getLastUserMessageContent = () => '';
+		service.switchToThread = () => { };
+
+		service.skipLatestToolRequest(threadId);
+
+		assert.strictEqual((service.state.allThreads[threadId]!.messages[0] as any).type, 'skipped');
+		assert.strictEqual((service.state.allThreads[threadId]!.messages[1] as any).type, 'tool_error');
+		assert.strictEqual((service.state.allThreads[threadId]!.messages[2] as any).role, 'user');
+		assert.deepStrictEqual(decisions, [{ threadId, toolCallId: 'tool-a', decision: 'skipped' }]);
+		assert.strictEqual(resumed, true);
+	});
+
+	test('approveLatestToolRequest resumes the pending request behind trailing skipped results', () => {
+		const threadId = 'thread-approve-latest-request';
+		const messages: ChatMessage[] = [
+			{
+				role: 'tool',
+				type: 'tool_request',
+				content: '(Awaiting user permission...)',
+				result: null,
+				name: 'run_command',
+				params: { command: 'echo a' },
+				id: 'tool-a',
+				rawParams: { command: 'echo a' },
+			},
+			{
+				role: 'tool',
+				type: 'tool_error',
+				content: 'skipped',
+				displayContent: 'skipped',
+				result: 'skipped',
+				name: 'read_file',
+				params: { uri: 'b.ts' },
+				id: 'tool-b',
+				rawParams: { uri: 'b.ts' },
+			},
+		];
+		const decisions: ToolDecision[] = [];
+		let approvedToolId: string | undefined;
+		const service = Object.create(ChatThreadService.prototype) as ChatThreadServiceHarness;
+		service.state = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages,
+					state: {
+						currCheckpointIdx: null,
+						stagingSelections: [],
+						focusedMessageIdx: undefined,
+						linksOfMessageIdx: {},
+					},
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		service.streamState = {};
+		service._threadAccess = {};
+		service._settingsService = { state: { globalSettings: { useAcp: false } } };
+		service._notificationManager = { wrapRunAgentToNotify: () => { } };
+		service._executionEngine = { runChatAgent: async opts => { approvedToolId = opts?.callThisToolFirst?.id; } };
+		service._onExternalToolDecision = { fire: event => decisions.push(event) };
+		service._currentModelSelectionProps = () => ({});
+		service._getLastUserMessageContent = () => '';
+		service.switchToThread = () => { };
+
+		service.approveLatestToolRequest(threadId);
+
+		assert.strictEqual(approvedToolId, 'tool-a');
+		assert.deepStrictEqual(decisions, [{ threadId, toolCallId: 'tool-a', decision: 'approved' }]);
 	});
 });
 
@@ -1126,6 +1440,284 @@ suite('ChatThreadService - history compression', () => {
 
 		assert.strictEqual(summaryText, null);
 		assert.strictEqual(compressionInfo, undefined);
+	});
+
+	test('non-ACP sends compressed summary plus tail only when compression is effective', async () => {
+		const threadId = 'thread-compress-non-acp-payload';
+		const oldUser: ChatMessage = {
+			role: 'user',
+			content: 'older original user text that should be summarized away',
+			displayContent: 'older original user text that should be summarized away',
+			selections: null,
+			state: { stagingSelections: [], isBeingEdited: false },
+		};
+		const oldAssistant: ChatMessage = {
+			role: 'assistant',
+			displayContent: 'older original assistant text that should be summarized away',
+			reasoning: '',
+			anthropicReasoning: null,
+		};
+		const tailUser: ChatMessage = {
+			role: 'user',
+			content: 'retained recent user text',
+			displayContent: 'retained recent user text',
+			selections: null,
+			state: { stagingSelections: [], isBeingEdited: false },
+		};
+		const tailAssistant: ChatMessage = {
+			role: 'assistant',
+			displayContent: 'retained recent assistant text',
+			reasoning: '',
+			anthropicReasoning: null,
+		};
+		const messages = [oldUser, oldAssistant, tailUser, tailAssistant];
+		const threadsState: ThreadsState = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages,
+					state: {
+						currCheckpointIdx: null,
+						stagingSelections: [],
+						focusedMessageIdx: undefined,
+						linksOfMessageIdx: {},
+					},
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		const streamState: ThreadStreamState = {};
+		const compactedMessages: ChatMessage[] = [{
+			role: 'assistant',
+			displayContent: 'deterministic summary',
+			reasoning: '',
+			anthropicReasoning: null,
+		}, tailUser, tailAssistant];
+		let capturedPayload: ChatMessage[] | null = null;
+		const threadAccess: any = {
+			getThreadMessages: (tid: string) => threadsState.allThreads[tid]?.messages || [],
+			getThreadState: (tid: string) => threadsState.allThreads[tid]?.state || { currCheckpointIdx: null },
+			getStreamState: (tid: string) => streamState[tid],
+			setStreamState: (tid: string, s: any) => { streamState[tid] = s; },
+			setThreadState: (tid: string, s: any) => {
+				const t = threadsState.allThreads[tid];
+				if (!t) return;
+				t.state = { ...t.state, ...s };
+			},
+			addMessageToThread: (tid: string, msg: ChatMessage) => {
+				const t = threadsState.allThreads[tid];
+				if (!t) return;
+				t.messages = [...t.messages, msg];
+			},
+			editMessageInThread: () => { },
+			updateLatestTool: () => { },
+			accumulateTokenUsage: () => { },
+			addUserCheckpoint: () => { },
+			currentModelSelectionProps: () => ({ modelSelection: undefined, modelSelectionOptions: undefined }),
+			isStreaming: (tid: string) => !!streamState[tid]?.isRunning,
+		};
+		const engine = new ChatExecutionEngine(
+			{
+				abort: () => { },
+				sendLLMMessage: (params: any) => {
+					capturedPayload = params.messages;
+					queueMicrotask(() => params.onFinalMessage?.({
+						fullText: 'done',
+						fullReasoning: '',
+						toolCall: undefined,
+						anthropicReasoning: null,
+					}));
+					return 'req-compressed-non-acp';
+				},
+			} as any,
+			{} as any,
+			{ state: { globalSettings: { chatMode: 'normal', mcpAutoApprove: false, useAcp: false, chatRetries: 0, retryDelay: 0 }, overridesOfModel: {} } } as any,
+			{} as any,
+			{ capture: () => { } } as any,
+			{ prepareLLMChatMessages: async ({ chatMessages }: { chatMessages: ChatMessage[] }) => ({ messages: chatMessages, separateSystemMessage: undefined }) } as any,
+			{} as any,
+			{} as any,
+			{
+				maybeSummarizeHistoryBeforeLLM: async () => ({
+					summaryText: 'deterministic summary',
+					compressionInfo: { hasCompressed: true, summarizedMessageCount: 2, approxTokensBefore: 1000, approxTokensAfter: 100 },
+					compactedMessages,
+				}),
+			} as any,
+			{} as any,
+		);
+
+		await engine.runChatAgent({ threadId, modelSelection: { providerName: 'openrouter', modelName: 'test-model' }, modelSelectionOptions: {} }, threadAccess);
+
+		assert.ok(capturedPayload, 'LLM payload should be captured');
+		const payload = capturedPayload as ChatMessage[];
+		assert.deepStrictEqual(payload, compactedMessages);
+		assert.ok(!payload.some((m: ChatMessage) => (m as any).displayContent === oldUser.displayContent));
+		assert.ok(threadsState.allThreads[threadId]?.state.historyCompression?.hasCompressed);
+	});
+
+	test('non-ACP short history does not set compact state or substitute payload', async () => {
+		const threadId = 'thread-compress-non-acp-short';
+		const shortMsg: ChatMessage = {
+			role: 'user',
+			content: 'short user text',
+			displayContent: 'short user text',
+			selections: null,
+			state: { stagingSelections: [], isBeingEdited: false },
+		};
+		const threadsState: ThreadsState = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages: [shortMsg],
+					state: { currCheckpointIdx: null, stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {} },
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		const streamState: ThreadStreamState = {};
+		let capturedPayload: ChatMessage[] | null = null;
+		const threadAccess: any = {
+			getThreadMessages: (tid: string) => threadsState.allThreads[tid]?.messages || [],
+			getThreadState: (tid: string) => threadsState.allThreads[tid]?.state || { currCheckpointIdx: null },
+			getStreamState: (tid: string) => streamState[tid],
+			setStreamState: (tid: string, s: any) => { streamState[tid] = s; },
+			setThreadState: (tid: string, s: any) => {
+				const t = threadsState.allThreads[tid];
+				if (!t) return;
+				t.state = { ...t.state, ...s };
+			},
+			addMessageToThread: (tid: string, msg: ChatMessage) => {
+				const t = threadsState.allThreads[tid];
+				if (!t) return;
+				t.messages = [...t.messages, msg];
+			},
+			editMessageInThread: () => { },
+			updateLatestTool: () => { },
+			accumulateTokenUsage: () => { },
+			addUserCheckpoint: () => { },
+			currentModelSelectionProps: () => ({ modelSelection: undefined, modelSelectionOptions: undefined }),
+			isStreaming: (tid: string) => !!streamState[tid]?.isRunning,
+		};
+		const engine = new ChatExecutionEngine(
+			{
+				abort: () => { },
+				sendLLMMessage: (params: any) => {
+					capturedPayload = params.messages;
+					queueMicrotask(() => params.onFinalMessage?.({ fullText: 'done', fullReasoning: '', toolCall: undefined, anthropicReasoning: null }));
+					return 'req-short-non-acp';
+				},
+			} as any,
+			{} as any,
+			{ state: { globalSettings: { chatMode: 'normal', mcpAutoApprove: false, useAcp: false, chatRetries: 0, retryDelay: 0 }, overridesOfModel: {} } } as any,
+			{} as any,
+			{ capture: () => { } } as any,
+			{ prepareLLMChatMessages: async ({ chatMessages }: { chatMessages: ChatMessage[] }) => ({ messages: chatMessages, separateSystemMessage: undefined }) } as any,
+			{} as any,
+			{} as any,
+			{ maybeSummarizeHistoryBeforeLLM: async () => ({ summaryText: null }) } as any,
+			{} as any,
+		);
+
+		await engine.runChatAgent({ threadId, modelSelection: { providerName: 'openrouter', modelName: 'test-model' }, modelSelectionOptions: {} }, threadAccess);
+
+		assert.deepStrictEqual(capturedPayload, [shortMsg]);
+		assert.strictEqual(threadsState.allThreads[threadId]?.state.historyCompression, undefined);
+	});
+
+	test('ACP sends compressed summary plus tail only and records outgoing metrics', async () => {
+		const threadId = 'thread-compress-acp-payload';
+		const messages: ChatMessage[] = [
+			{ role: 'user', content: 'older acp user text', displayContent: 'older acp user text', selections: null, state: { stagingSelections: [], isBeingEdited: false } },
+			{ role: 'tool', type: 'success', name: 'read_file', id: 'tool-old', params: { uri: 'a.ts' } as any, rawParams: { uri: 'a.ts' }, result: {} as any, content: 'tool output skipped from ACP history' },
+			{ role: 'assistant', displayContent: 'older acp assistant text', reasoning: '', anthropicReasoning: null },
+			{ role: 'user', content: 'retained acp user text', displayContent: 'retained acp user text', selections: null, state: { stagingSelections: [], isBeingEdited: false } },
+		];
+		let capturedHistory: any[] | null = null;
+		const threadsState: ThreadsState = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages,
+					state: { currCheckpointIdx: null, stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {} },
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		const streamState: ThreadStreamState = {};
+		const handler = new ChatAcpHandler(
+			{
+				sendChatMessage: async (_tid: string, history: any[]) => {
+					capturedHistory = history;
+					return { onData: () => ({ dispose: () => { } }), cancel: () => { } };
+				},
+			} as any,
+			{ getWorkspace: () => ({ folders: [{ uri: URI.file('/workspace/root') }] }) } as any,
+			{ state: { globalSettings: { useAcp: true, acpMode: 'process', acpProcessCommand: 'agent', acpProcessArgs: [], acpProcessEnv: {}, acpModel: null, chatRetries: 0, retryDelay: 0, maxToolOutputLength: 40000, enableAgentSkills: false } } } as any,
+			{ readFile: async () => ({ value: { toString: () => '' } }) } as any,
+			{ getDirectoryString: async () => '' } as any,
+			{} as any,
+			{} as any,
+			new NullLogService(),
+			{
+				estimateTokensForMessages: (msgs: ChatMessage[]) => msgs.reduce((total, msg) => total + String((msg as any).displayContent ?? (msg as any).content ?? '').length, 0),
+				maybeSummarizeHistoryBeforeLLM: async ({ messages: outgoingMessages }: { messages: ChatMessage[] }) => {
+					assert.ok(!outgoingMessages.some(m => m.role === 'tool'), 'ACP compression decision should use outgoing ACP history shape');
+					return {
+						summaryText: 'deterministic acp summary',
+						compressionInfo: { hasCompressed: true, summarizedMessageCount: 1, approxTokensBefore: 100, approxTokensAfter: 30 },
+						compactedMessages: [{ role: 'assistant', displayContent: 'deterministic acp summary', reasoning: '', anthropicReasoning: null }, outgoingMessages[outgoingMessages.length - 1]],
+					};
+				},
+			} as any,
+			{} as any,
+		);
+		const threadAccess: any = {
+			getThreadMessages: (tid: string) => threadsState.allThreads[tid]?.messages || [],
+			getThreadState: (tid: string) => threadsState.allThreads[tid]?.state || { currCheckpointIdx: null },
+			getStreamState: (tid: string) => streamState[tid],
+			setStreamState: (tid: string, s: any) => { streamState[tid] = s; },
+			setThreadState: (tid: string, s: any) => {
+				const t = threadsState.allThreads[tid];
+				if (!t) return;
+				t.state = { ...t.state, ...s };
+			},
+			addMessageToThread: () => { },
+			editMessageInThread: () => { },
+			updateLatestTool: () => { },
+			markSkillActive: () => { },
+			accumulateTokenUsage: () => { },
+			addUserCheckpoint: () => { },
+			currentModelSelectionProps: () => ({ modelSelection: { providerName: 'openrouter', modelName: 'test-model' }, modelSelectionOptions: {} }),
+			isStreaming: (tid: string) => !!streamState[tid]?.isRunning,
+		};
+
+		try {
+			await handler.runAcp({ threadId, userMessage: 'retained acp user text' }, threadAccess);
+		} finally {
+			handler.dispose();
+		}
+
+		assert.deepStrictEqual(capturedHistory, [
+			{ role: 'assistant', content: 'deterministic acp summary' },
+			{ role: 'assistant', content: 'older acp assistant text' },
+		]);
+		const history = capturedHistory as Array<{ content: string }>;
+		assert.ok(!history.some(entry => entry.content === 'older acp user text'));
+		assert.ok(!history.some(entry => entry.content === 'tool output skipped from ACP history'));
+		const compression = threadsState.allThreads[threadId]?.state.historyCompression;
+		assert.ok(compression?.hasCompressed);
+		assert.strictEqual(compression?.outgoingApproxTokensBefore, 100);
+		assert.ok((compression?.sourceApproxTokensBefore ?? 0) > (compression?.outgoingApproxTokensBefore ?? 0));
 	});
 });
 

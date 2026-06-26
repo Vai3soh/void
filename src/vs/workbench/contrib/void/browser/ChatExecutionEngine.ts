@@ -23,7 +23,7 @@ import { getModelCapabilities } from '../../../../platform/void/common/modelInfe
 import { type JsonObject, type JsonValue, isJsonObject, stringifyUnknown, toJsonObject } from '../../../../platform/void/common/jsonTypes.js';
 import { classifyToolCall, duplicateWriteTargetError } from '../../../../platform/void/common/toolExecutionPolicy.js';
 
-import { ChatHistoryCompressor } from './ChatHistoryCompressor.js';
+import { ChatHistoryCompressor, ThreadHistoryCompressionInfo } from './ChatHistoryCompressor.js';
 import { ChatToolOutputManager } from './ChatToolOutputManager.js';
 import { IThreadStateAccess } from './ChatAcpHandler.js';
 import { IMCPService } from '../common/mcpService.js';
@@ -206,31 +206,34 @@ export class ChatExecutionEngine {
 
 
 			const baseChatMessages = access.getThreadMessages(threadId);
-			let historySummaryForTurn: string | null = null;
+			let compressionInfoForSentPayload: ThreadHistoryCompressionInfo | undefined;
+			let compressedChatMessages: ChatMessage[] | undefined;
 
 			if (nMessagesSent === 1) {
 				try {
-					const { summaryText, compressionInfo } = await this._historyCompressor.maybeSummarizeHistoryBeforeLLM({
+					const lastUsage = access.getThreadState?.(threadId)?.tokenUsageLastRequest as (LLMTokenUsage | undefined);
+					const lastProviderPromptTokens = lastUsage
+						? (lastUsage.input + lastUsage.cacheCreation + lastUsage.cacheRead)
+						: undefined;
+
+					const compressionResult = await this._historyCompressor.maybeSummarizeHistoryBeforeLLM({
 						threadId,
 						messages: baseChatMessages,
 						modelSelection,
 						modelSelectionOptions,
+						lastProviderPromptTokens,
 					});
-					historySummaryForTurn = summaryText;
-					if (compressionInfo) {
-						access.setThreadState(threadId, { historyCompression: compressionInfo });
+					if (compressionResult.summaryText && compressionResult.compressionInfo && compressionResult.compactedMessages?.length) {
+						compressedChatMessages = compressionResult.compactedMessages;
+						compressionInfoForSentPayload = compressionResult.compressionInfo;
 					}
 				} catch { /* fail open */ }
 			}
 
-			const chatMessages: ChatMessage[] = historySummaryForTurn
-				? ([{
-					role: 'assistant',
-					displayContent: historySummaryForTurn,
-					reasoning: '',
-					anthropicReasoning: null,
-				} as ChatMessage, ...baseChatMessages])
-				: baseChatMessages;
+			const chatMessages: ChatMessage[] = compressedChatMessages ?? baseChatMessages;
+			if (compressionInfoForSentPayload) {
+				access.setThreadState(threadId, { historyCompression: compressionInfoForSentPayload });
+			}
 
 			const { messages, separateSystemMessage } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages,

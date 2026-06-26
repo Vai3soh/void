@@ -22,6 +22,15 @@ export type ThreadHistoryCompressionInfo = {
 	summarizedMessageCount: number;
 	approxTokensBefore: number;
 	approxTokensAfter: number;
+	sourceApproxTokensBefore?: number;
+	outgoingApproxTokensBefore?: number;
+};
+
+export type ChatHistoryCompressionResult = {
+	summaryText: string | null;
+	compressionInfo?: ThreadHistoryCompressionInfo;
+	compactedMessages?: ChatMessage[];
+	tailMessages?: ChatMessage[];
 };
 
 export class ChatHistoryCompressor {
@@ -53,7 +62,8 @@ export class ChatHistoryCompressor {
 		messages: ChatMessage[];
 		modelSelection: ModelSelection | null;
 		modelSelectionOptions: ModelSelectionOptions | undefined;
-	}): Promise<{ summaryText: string | null; compressionInfo?: ThreadHistoryCompressionInfo }> {
+		lastProviderPromptTokens?: number;
+	}): Promise<ChatHistoryCompressionResult> {
 		const { threadId, messages: chatMessages, modelSelection, modelSelectionOptions } = opts;
 
 		if (!modelSelection || !chatMessages.length) {
@@ -85,7 +95,13 @@ export class ChatHistoryCompressor {
 
 		if (maxInputTokens <= 0) return { summaryText: null };
 
-		const approxTokensBefore = this.estimateTokensForMessages(chatMessages);
+		const approxTokensBeforeLocal = this.estimateTokensForMessages(chatMessages);
+
+
+		const approxTokensBefore = Math.max(
+			approxTokensBeforeLocal,
+			opts.lastProviderPromptTokens ?? 0,
+		);
 
 		if (approxTokensBefore <= maxInputTokens) {
 			return { summaryText: null };
@@ -101,7 +117,6 @@ export class ChatHistoryCompressor {
 		if (!prefixMessages.length) return { summaryText: null };
 
 		const tailMessages = chatMessages.slice(prefixMessages.length);
-		const approxTailTokens = this.estimateTokensForMessages(tailMessages);
 
 		const rawTarget = Math.floor(maxInputTokens * 0.2);
 		const targetTokensApprox = Math.max(128, Math.min(rawTarget, 1024));
@@ -116,15 +131,13 @@ export class ChatHistoryCompressor {
 				'Protected active skill instructions:',
 				...protectedSkillContent.map(entry => entry.content.trim()),
 			].join('\n\n');
-			return {
+			return this._buildCompressionResult({
 				summaryText: protectedText,
-				compressionInfo: {
-					hasCompressed: true,
-					summarizedMessageCount: prefixMessages.length,
-					approxTokensBefore,
-					approxTokensAfter: approxTailTokens + Math.ceil(protectedText.length / CHARS_PER_TOKEN_ESTIMATE),
-				},
-			};
+				messages: chatMessages,
+				prefixMessages,
+				tailMessages,
+				approxTokensBefore,
+			});
 		}
 
 		const systemMessage = CHAT_HISTORY_COMPRESSION_SYSTEM_PROMPT;
@@ -202,17 +215,45 @@ export class ChatHistoryCompressor {
 			.filter(Boolean)
 			.join('\n\n');
 
-		const approxSummaryTokens = Math.ceil(finalSummary.length / CHARS_PER_TOKEN_ESTIMATE);
-		const approxTokensAfter = approxTailTokens + approxSummaryTokens;
+		return this._buildCompressionResult({
+			summaryText: finalSummary,
+			messages: chatMessages,
+			prefixMessages,
+			tailMessages,
+			approxTokensBefore,
+		});
+	}
 
+	public buildCompressedMessages(summaryText: string, tailMessages: ChatMessage[]): ChatMessage[] {
+		return [{
+			role: 'assistant',
+			displayContent: summaryText,
+			reasoning: '',
+			anthropicReasoning: null,
+		}, ...tailMessages];
+	}
+
+	private _buildCompressionResult(opts: {
+		summaryText: string;
+		messages: ChatMessage[];
+		prefixMessages: ChatMessage[];
+		tailMessages: ChatMessage[];
+		approxTokensBefore: number;
+	}): ChatHistoryCompressionResult {
+		const compactedMessages = this.buildCompressedMessages(opts.summaryText, opts.tailMessages);
+		const approxTokensAfter = this.estimateTokensForMessages(compactedMessages);
 		const compressionInfo: ThreadHistoryCompressionInfo = {
 			hasCompressed: true,
-			summarizedMessageCount: prefixMessages.length,
-			approxTokensBefore,
+			summarizedMessageCount: opts.prefixMessages.length,
+			approxTokensBefore: opts.approxTokensBefore,
 			approxTokensAfter,
 		};
-
-		return { summaryText: finalSummary, compressionInfo };
+		return {
+			summaryText: opts.summaryText,
+			compressionInfo,
+			compactedMessages,
+			tailMessages: opts.tailMessages,
+		};
 	}
 
 	private _buildHistoryTextForCompression(messages: ChatMessage[]): string {

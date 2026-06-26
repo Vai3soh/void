@@ -473,7 +473,6 @@ export const DynamicProviderSettings = () => {
 						passwordBlur={!showApiKey}
 						compact
 					/>
-
 					<button
 						type="button"
 						className="text-xs underline"

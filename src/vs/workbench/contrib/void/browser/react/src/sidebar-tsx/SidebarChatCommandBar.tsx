@@ -28,9 +28,9 @@ export const HistoryCompressionIndicator = () => {
 	return (
 		<div className='mb-1'>
 			<div className='flex items-center justify-between rounded bg-void-bg-3 text-void-fg-3 text-xs border border-void-border-3 px-2 py-1'>
-				<span className='font-semibold'>History compressed</span>
+				<span className='font-semibold'>Context compact:</span>
 				<span className='opacity-80'>
-					{info.summarizedMessageCount} msg → ~{format(after)} tokens{ratio !== null ? ` (${ratio}% of original)` : ''}
+					{info.summarizedMessageCount} msg, ~{format(before)} → ~{format(after)} local tokens{ratio !== null ? ` (${ratio}% of original)` : ''}
 				</span>
 			</div>
 		</div>
@@ -44,7 +44,8 @@ export const TokenUsageSpoiler = () => {
 	const usage = thread?.state?.tokenUsageSession;
 	const last = (thread?.state as any)?.tokenUsageLastRequest as (LLMTokenUsage | undefined);
 	const limits = (thread?.state as any)?.tokenUsageLastRequestLimits as ({ maxInputTokens: number } | undefined);
-	
+	const compressionInfo = thread?.state?.historyCompression;
+
 	const promptTotal = usage ? (usage.input + usage.cacheCreation + usage.cacheRead) : 0;
 	const total = usage ? (promptTotal + usage.output) : 0;
 	const hasUsage = !!usage && total > 0;
@@ -63,6 +64,7 @@ export const TokenUsageSpoiler = () => {
 	const lastPct = (last && limits && limits.maxInputTokens > 0)
 		? (lastPromptTotal / limits.maxInputTokens) * 100
 		: null;
+	const hasWindowInfo = lastPct !== null;
 
 	return (
 		<div className='mb-1'>
@@ -88,26 +90,45 @@ export const TokenUsageSpoiler = () => {
 						<polyline points='18 15 12 9 6 15'></polyline>
 					</svg>
 					<span className='font-semibold'>Token usage</span>
-					<span className='opacity-80 ml-1'>Total {format(total)}</span>
+					<span className='opacity-80 ml-1'>Session {format(total)}</span>
+					{hasWindowInfo && (
+						<span className='opacity-80 ml-2'>
+							· window ~{formatPct(lastPct!)} used
+						</span>
+					)}
 				</div>
 			</button>
 			{isOpen && (
 				<div className='mt-1 text-xs text-void-fg-3 bg-void-bg-3 border border-void-border-3 rounded px-2 py-1 space-y-0.5'>
+					{hasWindowInfo && (
+						<div className='flex justify-between'>
+							<span>Context window pressure (last request)</span>
+							<span>
+								~{formatPct(lastPct!)} · {format(lastPromptTotal)}/{format(limits!.maxInputTokens)}
+							</span>
+						</div>
+					)}
 					{last && (
 						<div className='flex justify-between'>
-							<span>Last request</span>
+							<span>Provider last request</span>
 							<span>
 								prompt {format(lastPromptTotal)}
 								{limits?.maxInputTokens && lastPct !== null
-									? ` (~${formatPct(lastPct)} of ${format(limits.maxInputTokens)})`
+									? ` (~${formatPct(lastPct)} of ${format(limits.maxInputTokens)} context window)`
 									: ''}
 							</span>
 						</div>
 					)}
-					<div className='flex justify-between'><span>Prompt (total)</span><span>{format(promptTotal)}</span></div>
-					<div className='flex justify-between'><span>Uncached prompt</span><span>{format(usage!.input)}</span></div>
-					<div className='flex justify-between'><span>Cache write</span><span>{format(usage!.cacheCreation)}</span></div>
-					<div className='flex justify-between'><span>Cache read</span><span>{format(usage!.cacheRead)}</span></div>
+					{compressionInfo?.hasCompressed && (
+						<div className='flex justify-between'>
+							<span>Local compact estimate</span>
+							<span>~{format(compressionInfo.approxTokensAfter)} prompt tokens</span>
+						</div>
+					)}
+					<div className='flex justify-between'><span>Provider prompt (total, cumulative)</span><span>{format(promptTotal)}</span></div>
+					<div className='flex justify-between'><span>Provider uncached prompt</span><span>{format(usage!.input)}</span></div>
+					<div className='flex justify-between'><span>Provider cache write</span><span>{format(usage!.cacheCreation)}</span></div>
+					<div className='flex justify-between'><span>Provider cache read</span><span>{format(usage!.cacheRead)}</span></div>
 					<div className='flex justify-between'><span>Output</span><span>{format(usage!.output)}</span></div>
 				</div>
 			)}

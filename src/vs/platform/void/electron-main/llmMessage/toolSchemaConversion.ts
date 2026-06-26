@@ -114,14 +114,6 @@ const warn = (logService: ILogService | undefined, msg: string, data?: unknown) 
 	logService.warn(`[toolSchemaConversion] ${msg}`, data);
 };
 
-const safeJson = (obj: any) => {
-	try {
-		return JSON.stringify(obj, null, 2);
-	} catch {
-		return String(obj);
-	}
-};
-
 const isOptionalParam = (paramInfo: any): boolean => {
 	if (paramInfo?.required === false) return true;
 	const desc = String(paramInfo?.description || '').toLowerCase();

@@ -333,9 +333,6 @@ const prepareXMLToolsMessages = (messages: SimpleLLMMessage[], supportsAnthropic
 	return llmChatMessages
 }
 
-
-// --- CHAT ---
-
 const prepareOpenAIOrAnthropicMessages = ({
 	messages: messages_,
 	systemMessage,
@@ -356,10 +353,9 @@ const prepareOpenAIOrAnthropicMessages = ({
 	reservedOutputTokenSpace: number | null | undefined,
 }): { messages: AnthropicOrOpenAILLMMessage[], separateSystemMessage: string | undefined } => {
 
-	reservedOutputTokenSpace = Math.max(
-		contextWindow * 1 / 2, // reserve at least 1/4 of the token window length
-		reservedOutputTokenSpace ?? 4_096 // defaults to 4096
-	)
+	if (reservedOutputTokenSpace === null || reservedOutputTokenSpace === undefined) {
+		reservedOutputTokenSpace = Math.min(4_096, Math.floor(contextWindow * 0.1))
+	}
 	let messages: (SimpleLLMMessage | { role: 'system', content: string })[] = deepClone(messages_)
 
 	// ================ system message ================

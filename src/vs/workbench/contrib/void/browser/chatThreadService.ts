@@ -31,7 +31,7 @@ import { deepClone } from '../../../../base/common/objects.js';
 import { IMCPService } from '../common/mcpService.js';
 import {
 	ChatMessage, StagingSelectionItem, ChatAttachment, CodespanLocationLink,
-	AnyToolName
+	AnyToolName, ToolMessage
 } from '../../../../platform/void/common/chatThreadServiceTypes.js';
 
 import { chat_userMessageContent } from '../common/prompt/prompts.js';
@@ -54,6 +54,8 @@ export type ThreadHistoryCompressionInfo = {
 	summarizedMessageCount: number;
 	approxTokensBefore: number;
 	approxTokensAfter: number;
+	sourceApproxTokensBefore?: number;
+	outgoingApproxTokensBefore?: number;
 };
 
 export type ThreadType = {
@@ -218,6 +220,24 @@ const newThreadObject = () => {
 	} satisfies ThreadType
 }
 
+type LatestToolRequest = {
+	message: Extract<ToolMessage<AnyToolName>, { type: 'tool_request' }>;
+	index: number;
+};
+
+function findLatestToolRequestMessage(messages: readonly ChatMessage[]): LatestToolRequest | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role === 'tool' && message.type === 'tool_request') {
+			return { message, index: i };
+		}
+	}
+	return undefined;
+}
+
+export const __test = {
+	findLatestToolRequestMessage,
+};
 
 // --- MAIN CLASS ---
 
@@ -523,8 +543,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	approveLatestToolRequest(threadId: string) {
 		const thread = this.state.allThreads[threadId];
-		const lastMsg = thread?.messages[thread.messages.length - 1];
-		if (!(lastMsg?.role === 'tool' && lastMsg.type === 'tool_request')) return;
+		if (!thread) return;
+
+		const latestToolRequest = findLatestToolRequestMessage(thread.messages);
+		if (!latestToolRequest) return;
+		const lastMsg = latestToolRequest.message;
 
 		this._onExternalToolDecision.fire({ threadId, toolCallId: lastMsg.id, decision: 'approved' });
 
@@ -574,10 +597,13 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	rejectLatestToolRequest(threadId: string) {
 		const thread = this.state.allThreads[threadId];
-		const lastMsg = thread?.messages[thread.messages.length - 1];
-		if (!lastMsg || lastMsg.role !== 'tool') return;
+		if (!thread) return;
 
-		const params = (lastMsg as any).params;
+		const latestToolRequest = findLatestToolRequestMessage(thread.messages);
+		if (!latestToolRequest) return;
+		const lastMsg = latestToolRequest.message;
+
+		const params = lastMsg.params;
 
 		this._updateLatestTool(threadId, {
 			role: 'tool', type: 'rejected', params: params, name: lastMsg.name,
@@ -590,19 +616,23 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	skipLatestToolRequest(threadId: string) {
 		const thread = this.state.allThreads[threadId];
-		const lastMsg: any = thread?.messages[thread.messages.length - 1];
-		if (!lastMsg || lastMsg.role !== 'tool') return;
+		if (!thread) return;
+
+		const messages = thread.messages;
+		const trueLast = messages[messages.length - 1];
 
 		// after Approve the tool becomes "running_now".
 		// In that case, "Skip" should behave like skipping a running tool.
-		if (lastMsg.type === 'running_now') {
+		if (trueLast?.role === 'tool' && trueLast.type === 'running_now') {
 			this.skipRunningTool(threadId);
 			return;
 		}
 
-		if (lastMsg.type !== 'tool_request') return;
+		const latestToolRequest = findLatestToolRequestMessage(messages);
+		if (!latestToolRequest) return;
+		const lastMsg = latestToolRequest.message;
 
-		const params = (lastMsg as any).params;
+		const params = lastMsg.params;
 
 		this._updateLatestTool(threadId, {
 			role: 'tool',
@@ -850,7 +880,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	addNewStagingSelection(newSelection: StagingSelectionItem) {
 		const focusedIdx = this.getCurrentFocusedMessageIdx();
 		let selections: StagingSelectionItem[] = [];
-		let setSelections = (s: StagingSelectionItem[]) => { };
+		let setSelections = (_s: StagingSelectionItem[]) => { };
 
 		if (focusedIdx === undefined) {
 			selections = this.getCurrentThreadState().stagingSelections;
@@ -885,7 +915,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	popStagingSelections(numPops: number = 1) {
 		const focusedIdx = this.getCurrentFocusedMessageIdx();
 		let selections: StagingSelectionItem[] = [];
-		let setSelections = (s: StagingSelectionItem[]) => { };
+		let setSelections = (_s: StagingSelectionItem[]) => { };
 
 		if (focusedIdx === undefined) {
 			selections = this.getCurrentThreadState().stagingSelections;
@@ -1128,7 +1158,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private _readAllThreads(): ChatThreads | null {
 		const s = this._storageService.get(THREAD_STORAGE_KEY, StorageScope.APPLICATION);
 		if (!s) return null;
-		return JSON.parse(s, (k, v) => (v && typeof v === 'object' && v.$mid === 1) ? URI.from(v) : v);
+		return JSON.parse(s, (_k, v) => (v && typeof v === 'object' && v.$mid === 1) ? URI.from(v) : v);
 	}
 
 	private _storeAllThreads(threads: ChatThreads) {

@@ -55,8 +55,17 @@ export const ReasoningSpoiler = ({ reasoning, anthropicReasoning }: { reasoning:
 					{open ? 'Hide reasoning' : 'Show reasoning'}
 					{!open && preview && <span className="opacity-70"> - {preview}</span>}
 				</span>
-				// allow-any-unicode-next-line
-				<span className="ml-2 text-[10px]">{open ? '▲' : '▼'}</span>
+				<span className="ml-2">
+					{open ? (
+						<svg className="w-3 h-3" viewBox="0 0 20 20" fill="currentColor">
+							<path d="M5 12l5-5 5 5" />
+						</svg>
+					) : (
+						<svg className="w-3 h-3" viewBox="0 0 20 20" fill="currentColor">
+							<path d="M5 8l5 5 5-5" />
+						</svg>
+					)}
+				</span>
 			</button>
 			{open && (
 				<div className="px-2 pb-2 pt-1 max-h-48 overflow-y-auto text-void-fg-3 whitespace-pre-wrap">

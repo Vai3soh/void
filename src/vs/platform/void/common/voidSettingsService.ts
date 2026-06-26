@@ -281,11 +281,17 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 	}
 
 	setCustomProviderSettings = async (slug: string, settings: CustomProviderSettings | undefined) => {
+
+		const normalizedSlug = (slug ?? '').trim().toLowerCase();
+		if (!normalizedSlug) {
+			throw new Error('Provider slug cannot be empty');
+		}
+
 		const newMap = { ...this.state.customProviders };
 		if (settings === undefined) {
-			delete newMap[slug];
+			delete newMap[normalizedSlug];
 		} else {
-			newMap[slug] = settings;
+			newMap[normalizedSlug] = settings;
 		}
 
 		const newState: VoidSettingsState = {
@@ -297,7 +303,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 		await this._storeState();
 		this._onDidChangeState.fire();
 
-		this._metricsService.capture('Update Custom Provider', { slug, hasSettings: settings !== undefined });
+		this._metricsService.capture('Update Custom Provider', { normalizedSlug, hasSettings: settings !== undefined });
 	};
 
 

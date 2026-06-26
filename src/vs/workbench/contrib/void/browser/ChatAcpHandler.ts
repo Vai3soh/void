@@ -13,7 +13,7 @@ import { IVoidSettingsService } from '../../../../platform/void/common/voidSetti
 import { IVoidModelService } from '../common/voidModelService.js';
 import { IDirectoryStrService } from '../../../../platform/void/common/directoryStrService.js';
 import { IAcpService, IAcpUserMessage, IAcpChatMessage, IAcpMessageChunk } from '../../../../platform/acp/common/iAcpService.js';
-import { getErrorMessage, RawToolCallObj } from '../../../../platform/void/common/sendLLMMessageTypes.js';
+import { getErrorMessage, RawToolCallObj, LLMTokenUsage } from '../../../../platform/void/common/sendLLMMessageTypes.js';
 import { chat_userMessageContent, isAToolName, ToolName } from '../common/prompt/prompts.js';
 import { AnyToolName, ChatAttachment, StagingSelectionItem, ChatMessage } from '../../../../platform/void/common/chatThreadServiceTypes.js';
 import { IEditCodeService } from './editCodeServiceInterface.js';
@@ -568,21 +568,28 @@ export class ChatAcpHandler extends Disposable {
 		try {
 			const { modelSelection, modelSelectionOptions } = access.currentModelSelectionProps();
 			if (modelSelection) {
-				const { summaryText, compressionInfo } = await this._historyCompressor.maybeSummarizeHistoryBeforeLLM({
+				const outgoingHistoryMessages = this._acpHistoryToChatMessages(history);
+				const lastUsage = access.getThreadState(threadId)?.tokenUsageLastRequest as (LLMTokenUsage | undefined);
+				const lastProviderPromptTokens = lastUsage
+					? (lastUsage.input + lastUsage.cacheCreation + lastUsage.cacheRead)
+					: undefined;
+
+				const compressionResult = await this._historyCompressor.maybeSummarizeHistoryBeforeLLM({
 					threadId,
-					messages: access.getThreadMessages(threadId),
+					messages: outgoingHistoryMessages,
 					modelSelection,
 					modelSelectionOptions,
+					lastProviderPromptTokens,
 				});
-				if (compressionInfo) {
-					access.setThreadState(threadId, { historyCompression: compressionInfo });
-				}
-				if (summaryText && summaryText.trim()) {
-					const tail = history.slice(-8);
-					history = [
-						{ role: 'assistant', content: summaryText.trim() } as IAcpChatMessage,
-						...tail,
-					];
+				if (compressionResult.summaryText && compressionResult.compressionInfo && compressionResult.compactedMessages?.length) {
+					history = this._chatMessagesToAcpHistory(compressionResult.compactedMessages);
+					access.setThreadState(threadId, {
+						historyCompression: {
+							...compressionResult.compressionInfo,
+							sourceApproxTokensBefore: this._historyCompressor.estimateTokensForMessages(access.getThreadMessages(threadId)),
+							outgoingApproxTokensBefore: compressionResult.compressionInfo.approxTokensBefore,
+						}
+					});
 				}
 			}
 		} catch { /* fail open */ }
@@ -1181,6 +1188,44 @@ export class ChatAcpHandler extends Disposable {
 				}
 			} catch { /* noop */ }
 		}
+	}
+
+	private _acpHistoryToChatMessages(history: IAcpChatMessage[]): ChatMessage[] {
+		return history.map((m): ChatMessage => {
+			if (m.role === 'user') {
+				return {
+					role: 'user',
+					content: m.content,
+					displayContent: m.content,
+					selections: null,
+					state: { stagingSelections: [], isBeingEdited: false },
+				};
+			}
+			return {
+				role: 'assistant',
+				displayContent: m.content,
+				reasoning: '',
+				anthropicReasoning: null,
+			};
+		});
+	}
+
+	private _chatMessagesToAcpHistory(messages: ChatMessage[]): IAcpChatMessage[] {
+		const history: IAcpChatMessage[] = [];
+		for (const m of messages) {
+			if (m.role === 'user') {
+				const display = typeof m.displayContent === 'string' ? m.displayContent : '';
+				const fallback = typeof m.content === 'string' ? m.content : '';
+				const content = (display && display.trim().length > 0) ? display : fallback;
+				if (!content.trim()) continue;
+				history.push({ role: 'user', content });
+			} else if (m.role === 'assistant') {
+				const content = m.displayContent ?? '';
+				if (!String(content).trim()) continue;
+				history.push({ role: 'assistant', content: String(content) });
+			}
+		}
+		return history;
 	}
 
 	private _buildAcpHistory(threadId: string, access: IThreadStateAccess): IAcpChatMessage[] {

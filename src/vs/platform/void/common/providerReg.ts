@@ -589,7 +589,7 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 
 			const filteredIds = this.applyModelsWhitelist(slug, remoteIds, cfg);
 
-			const inferredCaps = await this.inferCapabilitiesForRemoteModels(filteredIds);
+			const inferredCaps = await this.inferCapabilitiesForRemoteModels(remoteIds);
 
 
 			const { models, caps } = this.sanitizeModelsAndCaps(filteredIds, inferredCaps, {
@@ -602,18 +602,15 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 			return;
 		}
 
-
-
 		if (isOpenRouterSlug) {
 			await this.dynamicModelService.initialize();
 			const allCaps = this.dynamicModelService.getAllDynamicCapabilities();
 			const entries = Object.entries(allCaps);
 			const fullIds = entries.map(([id]) => id);
 			const filteredIds = this.applyModelsWhitelist(slug, fullIds, cfg);
-			const allowed = new Set(filteredIds);
+
 			const capsFull: Record<string, Partial<VoidStaticModelInfo>> = {};
 			for (const [id, info] of entries) {
-				if (!allowed.has(id)) continue;
 				capsFull[id] = {
 					contextWindow: info.contextWindow,
 					reservedOutputTokenSpace: info.reservedOutputTokenSpace,
@@ -644,7 +641,7 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 				const remoteIds = await this.refreshModelsViaProviderEndpoint(slug, cfg.endpoint);
 				const filteredRemoteIds = this.applyModelsWhitelist(slug, remoteIds, cfg);
 
-				const inferredCaps = await this.inferCapabilitiesForRemoteModels(filteredRemoteIds);
+				const inferredCaps = await this.inferCapabilitiesForRemoteModels(remoteIds);
 
 				const norm = this.sanitizeModelsAndCaps(filteredRemoteIds, inferredCaps, { keepFullIds: true, dropFree: false });
 				await this.setProviderModels(slug, norm.models, norm.caps);
@@ -657,10 +654,9 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 
 		const ids = bySlug.map(([id]) => id);
 		const filteredIds = this.applyModelsWhitelist(slug, ids, cfg);
-		const allowed = new Set(filteredIds);
+
 		const caps: Record<string, Partial<VoidStaticModelInfo>> = {};
 		for (const [id, info] of bySlug) {
-			if (!allowed.has(id)) continue;
 			caps[id] = {
 				contextWindow: info.contextWindow,
 				reservedOutputTokenSpace: info.reservedOutputTokenSpace,
@@ -717,8 +713,6 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		const perModelCfg = cp?.perModel?.[modelId] ?? cp?.perModel?.[fullId];
 
 		const minimal: Partial<VoidStaticModelInfo> = base ?? saved ?? {
-			contextWindow: 4096,
-			reservedOutputTokenSpace: 4096,
 			cost: { input: 0, output: 0 },
 			supportsSystemMessage: 'system-role',
 			specialToolFormat: 'openai-style',
@@ -758,9 +752,9 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		}
 
 
-		for (const m of norm.models) {
-			if (!(m in nextCaps) && (m in prevCaps)) {
-				nextCaps[m] = prevCaps[m];
+		for (const [m, prevCap] of Object.entries(prevCaps)) {
+			if (!(m in nextCaps)) {
+				nextCaps[m] = prevCap;
 			}
 		}
 
