@@ -308,7 +308,12 @@ export const SidebarChat = () => {
 	const isResolved = chatThreadsState.allThreads[threadId]?.state.mountedInfo?.mountedIsResolvedRef.current
 	useEffect(() => {
 		if (isResolved) return
-		chatThreadsState.allThreads[threadId]?.state.mountedInfo?._whenMountedResolver?.({
+		const mountedInfo = chatThreadsState.allThreads[threadId]?.state.mountedInfo
+		if (!mountedInfo) return
+		// Protection against duplicate calls: if the promise has already resolved (including
+		// via timeout), we don't call the resolver again.
+		if (mountedInfo.mountedIsResolvedRef.current) return
+		mountedInfo._whenMountedResolver?.({
 			textAreaRef: textAreaRef,
 			scrollToBottom: () => scrollToBottom(scrollContainerRef),
 		})

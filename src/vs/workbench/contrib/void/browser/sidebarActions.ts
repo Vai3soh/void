@@ -169,7 +169,7 @@ registerAction2(class extends Action2 {
 		const oldThreadId = chatThreadsService.state.currentThreadId
 		const oldThread = chatThreadsService.state.allThreads[oldThreadId]
 
-		const oldUI = await oldThread?.state.mountedInfo?.whenMounted
+		const oldUI = oldThread ? await chatThreadsService.awaitMountWithTimeout(oldThread.id) : null
 
 		const oldSelns = oldThread?.state.stagingSelections
 		const oldVal = oldUI?.textAreaRef?.current?.value
@@ -183,7 +183,7 @@ registerAction2(class extends Action2 {
 		const newThreadId = chatThreadsService.state.currentThreadId
 		const newThread = chatThreadsService.state.allThreads[newThreadId]
 
-		const newUI = await newThread?.state.mountedInfo?.whenMounted
+		const newUI = newThread ? await chatThreadsService.awaitMountWithTimeout(newThread.id) : null
 		chatThreadsService.setCurrentThreadState({ stagingSelections: oldSelns, })
 		if (newUI?.textAreaRef?.current && oldVal) newUI.textAreaRef.current.value = oldVal
 

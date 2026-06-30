@@ -59,6 +59,13 @@ import { IMCPService } from '../../../../common/mcpService.js'
 let chatThreadsState: ThreadsState
 const chatThreadsStateListeners: Set<(s: ThreadsState) => void> = new Set()
 
+// Fine-grained subscriptions - so components receive only what they need.
+let currentThreadId: string
+const currentThreadIdListeners: Set<(id: string) => void> = new Set()
+
+let allThreads: ThreadsState['allThreads']
+const allThreadsListeners: Set<(t: ThreadsState['allThreads']) => void> = new Set()
+
 let chatThreadsStreamState: ThreadStreamState
 const chatThreadsStreamStateListeners: Set<(threadId: string) => void> = new Set()
 
@@ -95,6 +102,22 @@ export const _registerServices = (accessor: ServicesAccessor) => {
 		chatThreadsStateService.onDidChangeCurrentThread(() => {
 			chatThreadsState = chatThreadsStateService.state
 			chatThreadsStateListeners.forEach(l => l(chatThreadsState))
+		})
+	)
+
+	currentThreadId = chatThreadsStateService.state.currentThreadId
+	disposables.push(
+		chatThreadsStateService.onDidChangeCurrentThreadId((id: string) => {
+			currentThreadId = id
+			currentThreadIdListeners.forEach(l => l(id))
+		})
+	)
+
+	allThreads = chatThreadsStateService.state.allThreads
+	disposables.push(
+		chatThreadsStateService.onDidChangeAllThreads(() => {
+			allThreads = chatThreadsStateService.state.allThreads
+			allThreadsListeners.forEach(l => l(allThreads))
 		})
 	)
 
@@ -199,7 +222,7 @@ const getReactAccessor = (accessor: ServicesAccessor) => {
 		IExtensionManagementService: accessor.get(IExtensionManagementService),
 		IExtensionTransferService: accessor.get(IExtensionTransferService),
 		IRemoteModelsService: accessor.get(IRemoteModelsService),
-        IDynamicModelService: accessor.get(IDynamicModelService),
+		IDynamicModelService: accessor.get(IDynamicModelService),
 		IDynamicProviderRegistryService: accessor.get(IDynamicProviderRegistryService),
 		IMCPService: accessor.get(IMCPService),
 	} as const
@@ -257,35 +280,35 @@ const _registerAccessor = (accessor: ServicesAccessor) => {
 		[IExtensionManagementService, reactAccessor.IExtensionManagementService],
 		[IExtensionTransferService, reactAccessor.IExtensionTransferService],
 		[IRemoteModelsService, reactAccessor.IRemoteModelsService],
-        [IDynamicModelService, reactAccessor.IDynamicModelService],
+		[IDynamicModelService, reactAccessor.IDynamicModelService],
 	])
 }
 
 // -- services --
 export const useAccessor = () => {
-    if (!reactAccessor_) {
-        throw new Error(`Void useAccessor was called before _registerServices!`)
-    }
+	if (!reactAccessor_) {
+		throw new Error(`Void useAccessor was called before _registerServices!`)
+	}
 
-    const getter = (service: keyof ReactAccessor | Function) => {
-        if (typeof service === 'string') {
-            return (reactAccessor_ as any)[service as keyof ReactAccessor]
-        }
-        if (reactAccessorById) {
-            const v = reactAccessorById.get(service as Function)
-            if (v !== undefined) return v
-        }
-        throw new Error(`Void useAccessor couldn't find service: ${service && (service as any).toString ? (service as any).toString() : String(service)}`)
-    }
+	const getter = (service: keyof ReactAccessor | Function) => {
+		if (typeof service === 'string') {
+			return (reactAccessor_ as any)[service as keyof ReactAccessor]
+		}
+		if (reactAccessorById) {
+			const v = reactAccessorById.get(service as Function)
+			if (v !== undefined) return v
+		}
+		throw new Error(`Void useAccessor couldn't find service: ${service && (service as any).toString ? (service as any).toString() : String(service)}`)
+	}
 
-    return {
-        // Overloads: call with a key of ReactAccessor to get strongly-typed result,
-        // or call with a ServiceIdentifier function to get a T inferred by the caller.
-        get: getter as {
-            <S extends keyof ReactAccessor>(service: S): ReactAccessor[S]
-            <T>(service: Function): T
-        }
-    }
+	return {
+		// Overloads: call with a key of ReactAccessor to get strongly-typed result,
+		// or call with a ServiceIdentifier function to get a T inferred by the caller.
+		get: getter as {
+			<S extends keyof ReactAccessor>(service: S): ReactAccessor[S]
+			<T>(service: Function): T
+		}
+	}
 }
 
 export const useSettingsState = () => {
@@ -304,6 +327,30 @@ export const useChatThreadsState = () => {
 		ss(chatThreadsState)
 		chatThreadsStateListeners.add(ss)
 		return () => { chatThreadsStateListeners.delete(ss) }
+	}, [ss])
+	return s
+}
+
+// Only for components that need the current thread ID.
+// Does not trigger on message changes in threads.
+export const useCurrentThreadId = () => {
+	const [s, ss] = useState(currentThreadId)
+	useEffect(() => {
+		ss(currentThreadId)
+		currentThreadIdListeners.add(ss)
+		return () => { currentThreadIdListeners.delete(ss) }
+	}, [ss])
+	return s
+}
+
+// Only for components that need the list of all threads (PastThreadsList, etc.).
+// Does not trigger on currentThreadId changes.
+export const useAllThreads = () => {
+	const [s, ss] = useState(allThreads)
+	useEffect(() => {
+		ss(allThreads)
+		allThreadsListeners.add(ss)
+		return () => { allThreadsListeners.delete(ss) }
 	}, [ss])
 	return s
 }

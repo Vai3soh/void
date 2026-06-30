@@ -196,12 +196,13 @@ suite('ChatThreadService - switch non-ACP -> ACP builtin', () => {
 			/* label */ { getUriLabel: () => './x' } as any,
 			/* log */ logService as any,
 			/* agentSkills */ { getActiveSkills: () => [], activateSkill: async () => { throw new Error('not used in this test'); } } as any,
+			/* lifecycle */ undefined as any,
 		);
 
 		const realAcp = (svc as any)._acpHandler;
 		try { realAcp?.dispose?.(); } catch { }
 		(svc as any)._acpHandler = {
-			runAcp: async (args: any) => { /* ... */ },
+			runAcp: async (_args: any) => { /* ... */ },
 			clearAcpState: () => { },
 			enqueueToolRequestFromAcp: () => { },
 			dispose: () => { },

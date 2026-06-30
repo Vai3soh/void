@@ -184,6 +184,7 @@ suite('ChatThreadService -> LLMMessageService: model config does not leak across
 			/* label */ { getUriLabel: () => './x' } as any,
 			/* log */ logService as any,
 			/* agentSkills */ { getActiveSkills: () => [], activateSkill: async () => { throw new Error('not used in this test'); } } as any,
+			/* lifecycle */ undefined as any,
 		);
 
 		const realAcp = (svc as any)._acpHandler;

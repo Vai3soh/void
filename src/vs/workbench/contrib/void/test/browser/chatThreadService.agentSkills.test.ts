@@ -104,6 +104,7 @@ suite('ChatThreadService - Agent Skills explicit activation', () => {
 			{ getUriLabel: () => './x' } as any,
 			new NullLogService(),
 			agentSkillsService,
+			undefined as any,
 		);
 		disposables.add(service);
 

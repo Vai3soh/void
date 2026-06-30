@@ -41,20 +41,65 @@ export class ChatHistoryCompressor {
 		@IVoidSettingsService private readonly _settingsService: IVoidSettingsService
 	) { }
 
+	// Overhead per message in LLM payload - role marker, JSON structure, separators.
+	// Empirically 3-5 tokens per message in OpenAI/Anthropic format.
+	private static readonly PER_MESSAGE_OVERHEAD_TOKENS = 4;
+
+	// Safety margin coefficient - accounts for system prompt, tool definitions and other
+	// payload components not visible in ChatMessage[]. Real provider payload is typically
+	// 5-15% larger than sum of message lengths due to tool schemas, cache_control markers.
+	private static readonly PAYLOAD_SAFETY_MARGIN = 1.15;
+
 	public estimateTokensForMessages(messages: ChatMessage[]): number {
 		let totalChars = 0;
+		let messageCount = 0;
 		for (const m of messages) {
 			if (m.role === 'checkpoint' || m.role === 'interrupted_streaming_tool') continue;
+			messageCount += 1;
 			if (m.role === 'user') {
 				totalChars += (m.content ?? '').length;
 			} else if (m.role === 'assistant') {
 				totalChars += (m.displayContent ?? '').length;
+				// Reasoning is usually sent back to the provider as part of the assistant message.
+				// Was not counted before - significantly underestimated for reasoning models.
+				totalChars += (m.reasoning ?? '').length;
+				// Anthropic encrypted reasoning also takes space in payload.
+				if (m.anthropicReasoning) {
+					for (const block of m.anthropicReasoning) {
+						if (block?.type === 'redacted_thinking' && block?.data) {
+							totalChars += JSON.stringify(block.data).length;
+						}
+					}
+				}
 			} else if (m.role === 'tool') {
 				totalChars += (m.content ?? '').length;
+				// Tool call parameters (JSON args) - often the largest unaccounted component.
+				// One edit_file with original_snippet/updated_snippet over 200 lines
+				// is ~3-5K tokens that were previously not counted at all.
+				const params = (m as any).params;
+				if (params && typeof params === 'object') {
+					try {
+						totalChars += JSON.stringify(params).length;
+					} catch { /* ignore */ }
+				}
+				// rawParams - string representation of params, may be present alongside params
+				const rawParams = (m as any).rawParams;
+				if (typeof rawParams === 'object' && rawParams) {
+					try {
+						totalChars += JSON.stringify(rawParams).length;
+					} catch { /* ignore */ }
+				} else if (typeof rawParams === 'string') {
+					totalChars += rawParams.length;
+				}
+				// Tool name - each tool_call in payload contains name + id
+				totalChars += ((m as any).name ?? '').length + 16;
 			}
 		}
 		if (totalChars <= 0) return 0;
-		return Math.ceil(totalChars / CHARS_PER_TOKEN_ESTIMATE);
+		const baseTokens = Math.ceil(totalChars / CHARS_PER_TOKEN_ESTIMATE);
+		const overheadTokens = messageCount * ChatHistoryCompressor.PER_MESSAGE_OVERHEAD_TOKENS;
+		// Safety margin - accounts for system prompt, tool definitions, cache_control markers.
+		return Math.ceil((baseTokens + overheadTokens) * ChatHistoryCompressor.PAYLOAD_SAFETY_MARGIN);
 	}
 
 	public async maybeSummarizeHistoryBeforeLLM(opts: {

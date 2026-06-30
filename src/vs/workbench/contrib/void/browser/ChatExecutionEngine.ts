@@ -261,7 +261,29 @@ export class ChatExecutionEngine {
 					if (modelSelection) {
 						const { providerName, modelName } = modelSelection;
 						const caps = getModelCapabilities(providerName as any, modelName, overridesOfModel);
-						const reserved = caps.reservedOutputTokenSpace ?? 0;
+						const reservedFromCaps = caps.reservedOutputTokenSpace ?? 0;
+
+						// If per-model requestParams has max_tokens - this is a more accurate
+						// output reserve than caps.reservedOutputTokenSpace. Take the minimum
+						// so maxInputTokens is as close as possible to the real provider limit.
+						let reservedFromRequestParams = Number.POSITIVE_INFINITY;
+						try {
+							const customProviders = this._settingsService.state.customProviders || {};
+							// Find custom provider config by providerName (supports custom slug)
+							const slug = Object.keys(customProviders).find(s => s.toLowerCase() === String(providerName).toLowerCase());
+							const cp = slug ? customProviders[slug] : undefined;
+							const perModel = (cp?.perModel || {}) as Record<string, any>;
+							const cfg = perModel?.[modelName] ?? perModel?.[`${providerName}/${modelName}`];
+							const rp = cfg?.requestParams as { mode: 'default' | 'override'; params?: Record<string, any> } | undefined;
+							if (rp && (rp.mode === 'default' || rp.mode === 'override') && rp.params && typeof rp.params === 'object') {
+								const mt = rp.params.max_tokens ?? rp.params.max_completion_tokens;
+								if (typeof mt === 'number' && mt > 0) {
+									reservedFromRequestParams = mt;
+								}
+							}
+						} catch { /* ignore */ }
+
+						const reserved = Math.min(reservedFromCaps, reservedFromRequestParams);
 						const maxInputTokens = Math.max(0, caps.contextWindow - reserved);
 						access.setThreadState(threadId, { tokenUsageLastRequestLimits: { maxInputTokens } });
 					}

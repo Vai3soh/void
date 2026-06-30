@@ -5,7 +5,7 @@
 
 import { CancellationToken } from '../../../../base/common/cancellation.js'
 import { URI } from '../../../../base/common/uri.js'
-import { IFileService } from '../../../../platform/files/common/files.js'
+import { IFileService, FileOperationResult } from '../../../../platform/files/common/files.js'
 import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js'
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js'
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js'
@@ -595,6 +595,20 @@ export class ToolsService implements IToolsService {
 			},
 
 			rewrite_file: async ({ uri, newContent }) => {
+				try {
+					const stat = await fileService.resolve(uri)
+					if (!stat.isFile) {
+						throw new Error(`Path is a directory, not a file: ${uri.toString()}`)
+					}
+				} catch (e: any) {
+					const isNotFound = e?.name === 'FileOperationError' && e?.fileOperationResult === 1
+						|| /not found|does not exist|ENOENT/i.test(String(e?.message ?? e ?? ''))
+					if (!isNotFound) {
+						throw e
+					}
+					await fileService.createFile(uri, undefined, { overwrite: false })
+				}
+
 				await voidModelService.initializeModel(uri)
 				if (this.commandBarService.getStreamState(uri) === 'streaming') {
 					throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)

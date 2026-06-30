@@ -599,7 +599,7 @@ function buildNativePromptBase(ctx: BuildContext, mode: ChatMode): string {
 
 	const EDITS_SECTION_AGENT_NATIVE = `Edits:
 - Use edit_file for single, local replacement
-- Use rewrite_file when replacing entire file OR multiple unrelated edits
+- Use rewrite_file when replacing entire file OR multiple unrelated edits. Creates the file if it doesn't exist.
 - For edit_file:
 	• Provide smallest unique original_snippet
 	• No diff markers or code fences in arguments

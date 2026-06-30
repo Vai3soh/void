@@ -3,9 +3,9 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
-import { useAccessor, useChatThreadsState, useFullChatThreadsStreamState } from '../util/services.js';
+import { useAccessor, useAllThreads, useFullChatThreadsStreamState } from '../util/services.js';
 import { Check, Copy, LoaderCircle, MessageCircleQuestion, Trash2, X } from 'lucide-react';
 import { IsRunningType } from '../../../ChatExecutionEngine.js';
 import { ThreadType } from '../../../chatThreadService.js';
@@ -18,25 +18,34 @@ export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 
 	const [hoveredIdx, setHoveredIdx] = useState<number | null>(null)
 
-	const threadsState = useChatThreadsState()
-	const { allThreads } = threadsState
+	// Subscribe only to allThreads, not to current thread changes.
+	// This prevents unnecessary re-renders of PastThreadsList on every new message
+	// in the active thread.
+	const allThreads = useAllThreads()
 
 	const streamState = useFullChatThreadsStreamState()
 
-	const runningThreadIds: { [threadId: string]: IsRunningType | undefined } = {}
-	for (const threadId in streamState) {
-		const isRunning = streamState[threadId]?.isRunning
-		if (isRunning) { runningThreadIds[threadId] = isRunning }
-	}
+	const runningThreadIds = useMemo(() => {
+		const out: { [threadId: string]: IsRunningType | undefined } = {}
+		for (const threadId in streamState) {
+			const isRunning = streamState[threadId]?.isRunning
+			if (isRunning) { out[threadId] = isRunning }
+		}
+		return out;
+	}, [streamState]);
 
 	if (!allThreads) {
 		return <div key="error" className="p-1">{`Error accessing chat history.`}</div>;
 	}
 
-	// sorted by most recent to least recent
-	const sortedThreadIds = Object.keys(allThreads ?? {})
-		.sort((threadId1, threadId2) => (allThreads[threadId1]?.lastModified ?? 0) > (allThreads[threadId2]?.lastModified ?? 0) ? -1 : 1)
-		.filter(threadId => (allThreads![threadId]?.messages.length ?? 0) !== 0)
+
+	const sortedThreadIds = useMemo(() => {
+		return Object.keys(allThreads ?? {})
+			.sort((threadId1, threadId2) =>
+				(allThreads![threadId1]?.lastModified ?? 0) > (allThreads![threadId2]?.lastModified ?? 0) ? -1 : 1
+			)
+			.filter(threadId => (allThreads![threadId]?.messages.length ?? 0) !== 0);
+	}, [allThreads]);
 
 	// Get only first 5 threads if not showing all
 	const hasMoreThreads = sortedThreadIds.length > numInitialThreads;

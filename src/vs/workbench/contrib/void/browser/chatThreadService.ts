@@ -27,17 +27,15 @@ import { IFileService } from '../../../../platform/files/common/files.js';
 import { ILabelService } from '../../../../platform/label/common/label.js';
 import { IAcpService } from '../../../../platform/acp/common/iAcpService.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
+import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { IMCPService } from '../common/mcpService.js';
 import {
 	ChatMessage, StagingSelectionItem, ChatAttachment, CodespanLocationLink,
 	AnyToolName, ToolMessage
 } from '../../../../platform/void/common/chatThreadServiceTypes.js';
-
 import { chat_userMessageContent } from '../common/prompt/prompts.js';
 import { LLMTokenUsage, RawToolCallObj, RawToolParamsObj } from '../../../../platform/void/common/sendLLMMessageTypes.js';
-import { THREAD_STORAGE_KEY } from '../../../../platform/void/common/storageKeys.js';
-
 import { ChatNotificationManager } from './ChatNotificationManager.js';
 import { ChatHistoryCompressor } from './ChatHistoryCompressor.js';
 import { ChatToolOutputManager } from './ChatToolOutputManager.js';
@@ -48,6 +46,11 @@ import { ChatExecutionEngine } from './ChatExecutionEngine.js';
 import { getModelCapabilities } from '../../../../platform/void/common/modelInference.js';
 import { IAgentSkillsService } from '../common/skills/agentSkillsService.js';
 import { AgentSkillActiveMetadata } from '../common/skills/agentSkillsTypes.js';
+
+const THREAD_INDEX_STORAGE_KEY = 'void.chat.threads.index';
+const THREAD_STORAGE_KEY_PREFIX = 'void.chat.thread.';
+const STORE_DEBOUNCE_MS = 1000;
+const STORE_FLUSH_TIMEOUT_MS = 2000;
 
 export type ThreadHistoryCompressionInfo = {
 	hasCompressed: boolean;
@@ -153,6 +156,8 @@ export interface IChatThreadService {
 	readonly state: ThreadsState;
 	readonly streamState: ThreadStreamState;
 	onDidChangeCurrentThread: Event<void>;
+	onDidChangeCurrentThreadId: Event<string>;
+	onDidChangeAllThreads: Event<void>;
 	onDidChangeStreamState: Event<{ threadId: string }>;
 	getCurrentThread(): ThreadType;
 	openNewThread(): void;
@@ -183,6 +188,7 @@ export interface IChatThreadService {
 	skipLatestToolRequest(threadId: string): void;
 	skipRunningTool(threadId: string): void;
 	jumpToCheckpointBeforeMessageIdx(opts: { threadId: string, messageIdx: number, jumpToUserModified: boolean }): void;
+	awaitMountWithTimeout(threadId: string): Promise<{ textAreaRef: { current: HTMLTextAreaElement | null }; scrollToBottom: () => void } | null>;
 	focusCurrentChat: () => Promise<void>;
 	blurCurrentChat: () => Promise<void>;
 	enqueueToolRequestFromAcp(threadId: string, req: { id: string; name: AnyToolName | string; rawParams: Record<string, any>; params?: Record<string, any> }): void;
@@ -250,6 +256,12 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private readonly _onDidChangeCurrentThread = new Emitter<void>();
 	readonly onDidChangeCurrentThread: Event<void> = this._onDidChangeCurrentThread.event;
 
+	private readonly _onDidChangeCurrentThreadId = new Emitter<string>();
+	readonly onDidChangeCurrentThreadId: Event<string> = this._onDidChangeCurrentThreadId.event;
+
+	private readonly _onDidChangeAllThreads = new Emitter<void>();
+	readonly onDidChangeAllThreads: Event<void> = this._onDidChangeAllThreads.event;
+
 	private readonly _onDidChangeStreamState = new Emitter<{ threadId: string }>();
 	readonly onDidChangeStreamState: Event<{ threadId: string }> = this._onDidChangeStreamState.event;
 
@@ -259,6 +271,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	// State
 	readonly streamState: ThreadStreamState = {};
 	state: ThreadsState;
+
+	// Storage: per-thread debounce timers
+	private _perThreadStoreTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private _indexStoreTimer: ReturnType<typeof setTimeout> | null = null;
+	private _indexDirty = false;
 
 	// Sub-Services
 	private readonly _notificationManager: ChatNotificationManager;
@@ -292,6 +309,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		@ILabelService private readonly _labelService: ILabelService,
 		@ILogService private readonly _logService: ILogService,
 		@IAgentSkillsService private readonly _agentSkillsService: IAgentSkillsService,
+		@ILifecycleService private readonly _lifecycleService: ILifecycleService | undefined,
 	) {
 		super();
 
@@ -302,6 +320,14 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			currentThreadId: null as unknown as string,
 		};
 		this.openNewThread();
+
+		if (this._lifecycleService?.onWillShutdown) {
+			this._register(
+				this._lifecycleService.onWillShutdown(async () => {
+					await this.flushPendingStores();
+				})
+			);
+		}
 
 		// 2. Init Access Bridge
 		this._threadAccess = {
@@ -430,7 +456,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				...this.state.allThreads,
 				[threadId]: { ...thread, lastModified: new Date().toISOString(), messages: newMessages }
 			};
-			this._storeAllThreads(newThreads);
+			this._scheduleStoreSingleThread(threadId);
 			this._setState({ allThreads: newThreads });
 		}
 
@@ -788,14 +814,15 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 		const newThread = newThreadObject();
 		const newThreads = { ...this.state.allThreads, [newThread.id]: newThread };
-		this._storeAllThreads(newThreads);
+		this._scheduleStoreSingleThread(newThread.id);
+		this._scheduleStoreIndex();
 		this._setState({ allThreads: newThreads, currentThreadId: newThread.id });
 	}
 
 	deleteThread(threadId: string): void {
 		const newThreads = { ...this.state.allThreads };
 		delete newThreads[threadId];
-		this._storeAllThreads(newThreads);
+		this._removeThreadFromStorage(threadId);
 		this._setState({ ...this.state, allThreads: newThreads });
 	}
 
@@ -812,7 +839,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const clonedMsg = deepClone(firstUser);
 		const newThread = { ...newThreadObject(), id: generateUuid(), messages: [clonedMsg] };
 		const newThreads = { ...this.state.allThreads, [newThread.id]: newThread };
-		this._storeAllThreads(newThreads);
+		this._scheduleStoreSingleThread(newThread.id);
+		this._scheduleStoreIndex();
 		this._setState({ allThreads: newThreads });
 	}
 
@@ -822,6 +850,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	markSkillActive(threadId: string, name: string, metadata: AgentSkillActiveMetadata): void {
 		this._markSkillActive(threadId, name, metadata);
+	}
+
+	async awaitMountWithTimeout(threadId: string) {
+		return this._awaitMountWithTimeout(threadId);
 	}
 
 	// --- Helpers ---
@@ -856,8 +888,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	async focusCurrentChat() {
 		const t = this.getCurrentThread();
-		const s = await t.state.mountedInfo?.whenMounted;
-		if (!this.isCurrentlyFocusingMessage()) s?.textAreaRef.current?.focus();
+		const s = await this._awaitMountWithTimeout(t.id);
+		if (s && !this.isCurrentlyFocusingMessage()) {
+			s.textAreaRef.current?.focus();
+		}
 	}
 	async blurCurrentChat() {
 		const t = this.getCurrentThread();
@@ -952,6 +986,33 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	// --- Private ---
 
+	/**
+		 * Waits for the UI thread to mount, but no longer than MOUNT_TIMEOUT_MS.
+		 * Returns mounted info or null if a timeout occurs. Prevents
+		 * actions (View Past Chats, New Chat, etc.) from hanging indefinitely
+		 * if React has not mounted the component for some reason.
+	 */
+	private static readonly MOUNT_TIMEOUT_MS = 2000;
+
+	private async _awaitMountWithTimeout(threadId: string): Promise<{ textAreaRef: { current: HTMLTextAreaElement | null }; scrollToBottom: () => void } | null> {
+		const thread = this.state.allThreads[threadId];
+		if (!thread?.state.mountedInfo) return null;
+
+		const timeoutPromise = new Promise<null>(r =>
+			setTimeout(() => r(null), ChatThreadService.MOUNT_TIMEOUT_MS)
+		);
+
+		try {
+			const result = await Promise.race([
+				thread.state.mountedInfo.whenMounted,
+				timeoutPromise
+			]);
+			return result as any ?? null;
+		} catch {
+			return null;
+		}
+	}
+
 	private _getLastUserMessageContent(threadId: string) {
 		const m = this.state.allThreads[threadId]?.messages;
 		if (!m) return undefined;
@@ -962,9 +1023,21 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 
 	private _setState(state: Partial<ThreadsState>, doNotRefreshMountInfo?: boolean) {
+		const oldState = this.state;
 		const newState = { ...this.state, ...state };
 		this.state = newState;
+
+		const currentThreadIdChanged = state.currentThreadId !== undefined && state.currentThreadId !== oldState.currentThreadId;
+		const allThreadsChanged = state.allThreads !== undefined && state.allThreads !== oldState.allThreads;
+
 		this._onDidChangeCurrentThread.fire();
+
+		if (currentThreadIdChanged) {
+			this._onDidChangeCurrentThreadId.fire(newState.currentThreadId);
+		}
+		if (allThreadsChanged) {
+			this._onDidChangeAllThreads.fire();
+		}
 
 		const tid = newState.currentThreadId;
 		const st = this.streamState[tid];
@@ -1014,7 +1087,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const t = this.state.allThreads[threadId];
 		if (!t) return;
 		const newThreads = { ...this.state.allThreads, [t.id]: { ...t, lastModified: new Date().toISOString(), messages: [...t.messages, message] } };
-		this._storeAllThreads(newThreads);
+		this._scheduleStoreSingleThread(t.id);
 		this._setState({ allThreads: newThreads });
 	}
 
@@ -1026,7 +1099,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				...t, lastModified: new Date().toISOString(), messages: [...t.messages.slice(0, idx), msg, ...t.messages.slice(idx + 1)]
 			}
 		};
-		this._storeAllThreads(newThreads);
+		this._scheduleStoreSingleThread(t.id);
 		this._setState({ allThreads: newThreads });
 	}
 
@@ -1142,7 +1215,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				},
 			},
 		};
-		this._storeAllThreads(newThreads);
+		this._scheduleStoreSingleThread(t.id);
 		this._setState({ allThreads: newThreads }, true);
 	}
 
@@ -1156,13 +1229,139 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 
 	private _readAllThreads(): ChatThreads | null {
-		const s = this._storageService.get(THREAD_STORAGE_KEY, StorageScope.APPLICATION);
-		if (!s) return null;
-		return JSON.parse(s, (_k, v) => (v && typeof v === 'object' && v.$mid === 1) ? URI.from(v) : v);
+		const indexJson = this._storageService.get(THREAD_INDEX_STORAGE_KEY, StorageScope.APPLICATION);
+		if (!indexJson) return null;
+
+		let index: Array<{ id: string; lastModified: string }>;
+		try {
+			index = JSON.parse(indexJson);
+		} catch (e) {
+			this._logService.warn('[ChatThreadService] Failed to parse threads index:', e);
+			return null;
+		}
+
+		const threads: ChatThreads = {};
+		const uriReviver = (_k: string, v: any) => (v && typeof v === 'object' && v.$mid === 1) ? URI.from(v) : v;
+		for (const entry of index) {
+			const threadJson = this._storageService.get(THREAD_STORAGE_KEY_PREFIX + entry.id, StorageScope.APPLICATION);
+			if (!threadJson) continue;
+			try {
+				threads[entry.id] = JSON.parse(threadJson, uriReviver);
+			} catch (e) {
+				this._logService.warn(`[ChatThreadService] Failed to parse thread ${entry.id}, skipping:`, e);
+			}
+		}
+		return threads;
 	}
 
-	private _storeAllThreads(threads: ChatThreads) {
-		this._storageService.store(THREAD_STORAGE_KEY, JSON.stringify(threads), StorageScope.APPLICATION, StorageTarget.USER);
+	private _scheduleStoreSingleThread(threadId: string): void {
+		const existing = this._perThreadStoreTimers.get(threadId);
+		if (existing) clearTimeout(existing);
+
+		const timer = setTimeout(() => {
+			this._perThreadStoreTimers.delete(threadId);
+			this._flushSingleThreadToStorage(threadId);
+		}, STORE_DEBOUNCE_MS);
+		this._perThreadStoreTimers.set(threadId, timer);
+	}
+
+	private _flushSingleThreadToStorage(threadId: string): void {
+		const thread = this.state.allThreads[threadId];
+		if (!thread) return;
+
+		const snapshot = thread;
+		const doSerialize = () => {
+			let serialized: string;
+			try {
+				serialized = JSON.stringify(snapshot);
+			} catch (e) {
+				this._logService.error(`[ChatThreadService] Failed to serialize thread ${threadId}:`, e);
+				return;
+			}
+			this._storageService.store(
+				THREAD_STORAGE_KEY_PREFIX + threadId,
+				serialized,
+				StorageScope.APPLICATION,
+				StorageTarget.USER
+			);
+		};
+
+		type IdleShim = {
+			requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => void;
+			setTimeout?: (cb: () => void, ms: number) => void;
+		};
+		const g = globalThis as unknown as IdleShim;
+
+		if (typeof g.requestIdleCallback === 'function') {
+			g.requestIdleCallback(doSerialize, { timeout: STORE_FLUSH_TIMEOUT_MS });
+		} else if (typeof g.setTimeout === 'function') {
+			g.setTimeout(doSerialize, 0);
+		} else {
+			doSerialize();
+		}
+	}
+
+	private _scheduleStoreIndex(): void {
+		this._indexDirty = true;
+		if (this._indexStoreTimer) clearTimeout(this._indexStoreTimer);
+
+		this._indexStoreTimer = setTimeout(() => {
+			this._indexStoreTimer = null;
+			this._flushThreadsIndex();
+		}, STORE_DEBOUNCE_MS);
+	}
+
+	private _flushThreadsIndex(): void {
+		if (!this._indexDirty) return;
+		this._indexDirty = false;
+
+		// The index is a lightweight list of {id, lastModified}. Even with 1,000 threads, it's about 50 KB.
+		const index = Object.values(this.state.allThreads)
+			.filter((t): t is ThreadType => !!t)
+			.map(t => ({
+				id: t.id,
+				lastModified: t.lastModified,
+			}));
+
+		try {
+			this._storageService.store(
+				THREAD_INDEX_STORAGE_KEY,
+				JSON.stringify(index),
+				StorageScope.APPLICATION,
+				StorageTarget.USER
+			);
+		} catch (e) {
+			this._logService.error('[ChatThreadService] Failed to store threads index:', e);
+		}
+	}
+
+	private _removeThreadFromStorage(threadId: string): void {
+		const timer = this._perThreadStoreTimers.get(threadId);
+		if (timer) {
+			clearTimeout(timer);
+			this._perThreadStoreTimers.delete(threadId);
+		}
+		this._storageService.remove(
+			THREAD_STORAGE_KEY_PREFIX + threadId,
+			StorageScope.APPLICATION
+		);
+		this._scheduleStoreIndex();
+	}
+
+	async flushPendingStores(): Promise<void> {
+		const pendingIds = Array.from(this._perThreadStoreTimers.keys());
+		for (const id of pendingIds) {
+			const timer = this._perThreadStoreTimers.get(id)!;
+			clearTimeout(timer);
+			this._perThreadStoreTimers.delete(id);
+			this._flushSingleThreadToStorage(id);
+		}
+		if (this._indexStoreTimer) {
+			clearTimeout(this._indexStoreTimer);
+			this._indexStoreTimer = null;
+		}
+		this._flushThreadsIndex();
+		await new Promise<void>(r => setTimeout(r, 100));
 	}
 }
 
