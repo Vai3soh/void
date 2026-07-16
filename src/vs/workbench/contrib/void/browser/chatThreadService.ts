@@ -607,7 +607,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			return;
 		}
 
-		// non-ACP unchanged
+		// non-ACP: start execution engine with callThisToolFirst.
+		// If there are pending tool calls - runChatAgent will return immediately
+		// (without starting LLM loop), and we advance the queue further.
 		this._notificationManager.wrapRunAgentToNotify(
 			this._executionEngine.runChatAgent({
 				threadId,
@@ -619,6 +621,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			() => this._getLastUserMessageContent(threadId),
 			(id: string) => this.switchToThread(id)
 		);
+
+		// Advance the next pending tool call, if any.
+		// Sets it as tool_request, NOT starting LLM loop.
+		this._advancePendingToolCall(threadId);
 	}
 
 	rejectLatestToolRequest(threadId: string) {
@@ -636,8 +642,18 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			content: 'Tool call was rejected by the user.', displayContent: 'Tool call was rejected by the user.',
 			result: null, id: lastMsg.id, rawParams: lastMsg.rawParams
 		});
-		this._setStreamState(threadId, undefined);
 		this._onExternalToolDecision.fire({ threadId, toolCallId: lastMsg.id, decision: 'rejected' });
+
+		// If there are pending tool calls - advance the next one and keep
+		// stream state in awaiting_user. Otherwise - finish (as before).
+		const pendingMap = (this._executionEngine as any)?._pendingToolCallsByThread as Map<string, RawToolCallObj[]> | undefined;
+		const hasPending = !!pendingMap?.get(threadId)?.length;
+		if (hasPending) {
+			this._advancePendingToolCall(threadId);
+			this._setStreamState(threadId, { isRunning: 'awaiting_user' });
+		} else {
+			this._setStreamState(threadId, undefined);
+		}
 	}
 
 	skipLatestToolRequest(threadId: string) {
@@ -695,23 +711,35 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			return;
 		}
 
-		// non-ACP: old behavior
-		this._addMessageToThread(threadId, {
-			role: 'user',
-			content: `Skip ${lastMsg.name}. Continue with next steps.`,
-			displayContent: '',
-			selections: [],
-			state: { stagingSelections: [], isBeingEdited: false },
-			hidden: true
-		});
+		// non-ACP: if there are pending tool calls - advance the queue, NOT starting LLM loop.
+		// If pending is empty - start LLM loop with skip-message (as before).
+		const pendingMap = (this._executionEngine as any)?._pendingToolCallsByThread as Map<string, RawToolCallObj[]> | undefined;
+		const hasPending = !!pendingMap?.get(threadId)?.length;
 
-		this._notificationManager.wrapRunAgentToNotify(
-			this._executionEngine.runChatAgent({ threadId, ...this._currentModelSelectionProps() }, this._threadAccess),
-			threadId,
-			() => this.state.currentThreadId,
-			() => this._getLastUserMessageContent(threadId),
-			(id: string) => this.switchToThread(id)
-		);
+		if (hasPending) {
+			// Just advance the queue. Skip-message is not needed because
+			// LLM loop is not started, and the model doesn't see the hidden user message.
+			this._advancePendingToolCall(threadId);
+			this._setStreamState(threadId, { isRunning: 'awaiting_user' });
+		} else {
+			// Queue is empty - start LLM loop with skip-message.
+			this._addMessageToThread(threadId, {
+				role: 'user',
+				content: `Skip ${lastMsg.name}. Continue with next steps.`,
+				displayContent: '',
+				selections: [],
+				state: { stagingSelections: [], isBeingEdited: false },
+				hidden: true
+			});
+
+			this._notificationManager.wrapRunAgentToNotify(
+				this._executionEngine.runChatAgent({ threadId, ...this._currentModelSelectionProps() }, this._threadAccess),
+				threadId,
+				() => this.state.currentThreadId,
+				() => this._getLastUserMessageContent(threadId),
+				(id: string) => this.switchToThread(id)
+			);
+		}
 	}
 
 	skipRunningTool(threadId: string): void {
@@ -823,6 +851,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const newThreads = { ...this.state.allThreads };
 		delete newThreads[threadId];
 		this._removeThreadFromStorage(threadId);
+		// Clear pending tool calls to prevent leaks into the next thread.
+		(this._executionEngine as any)._pendingToolCallsByThread?.delete(threadId);
 		this._setState({ ...this.state, allThreads: newThreads });
 	}
 
@@ -982,7 +1012,12 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	dismissStreamError(threadId: string) { this._setStreamState(threadId, undefined); }
 	dangerousSetState = (newState: ThreadsState) => { this.state = newState; this._onDidChangeCurrentThread.fire(); }
-	resetState = () => { this.state = { allThreads: {}, currentThreadId: null as unknown as string }; this.openNewThread(); this._onDidChangeCurrentThread.fire(); }
+	resetState = () => {
+		this.state = { allThreads: {}, currentThreadId: null as unknown as string };
+		(this._executionEngine as any)._pendingToolCallsByThread?.clear();
+		this.openNewThread();
+		this._onDidChangeCurrentThread.fire();
+	}
 
 	// --- Private ---
 
@@ -1020,6 +1055,40 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			if (m[i].role === 'user') return (m[i] as any).displayContent;
 		}
 		return undefined;
+	}
+
+	/**
+	 * Advances the pending tool calls queue in ChatExecutionEngine.
+	 * If there is another tool call in the queue - sets it as tool_request
+	 * (NOT starting LLM loop). If the queue is empty - does nothing;
+	 * LLM loop is already started via runChatAgent.
+	 *
+	 * Used only in non-ACP mode. In ACP mode tool calls come
+	 * one at a time from the ACP agent, and there is no pending queue.
+	 */
+	private _advancePendingToolCall(threadId: string): void {
+		if (this._settingsService.state.globalSettings.useAcp === true) return; // ACP does not use pending
+
+		const pendingMap = (this._executionEngine as any)?._pendingToolCallsByThread as Map<string, RawToolCallObj[]> | undefined;
+		if (!pendingMap) return;
+		const pending = pendingMap.get(threadId);
+		if (!pending || pending.length === 0) return;
+
+		const next = pending.shift()!;
+		if (pending.length === 0) pendingMap.delete(threadId);
+
+		// Set the next tool call as tool_request, NOT starting LLM loop.
+		// chatThreadService._setStreamState keeps isRunning: 'awaiting_user'.
+		this._addMessageToThread(threadId, {
+			role: 'tool',
+			type: 'tool_request',
+			content: '(Awaiting user permission...)',
+			result: null,
+			name: next.name as any,
+			params: next.rawParams as any,
+			id: next.id,
+			rawParams: next.rawParams
+		});
 	}
 
 	private _setState(state: Partial<ThreadsState>, doNotRefreshMountInfo?: boolean) {

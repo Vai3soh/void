@@ -2044,7 +2044,23 @@ export class EditCodeService extends Disposable implements IEditCodeService {
 		return result
 	}
 
-	public instantlyRewriteFile({ uri, newContent }: { uri: URI, newContent: string }) {
+	public async instantlyRewriteFile({ uri, newContent }: { uri: URI, newContent: string }) {
+		// Read the file content from disk to use as the diff's "originalCode".
+		// This ensures the diff shows: old file content (red/removed) → new content
+		// (green/added). For a newly created file, disk content is "" and the diff
+		// shows only the new content in green.
+		// Without this, originalCode was set to the model's current editor content
+		// (which may include uncommitted changes from a previous edit_file), causing
+		// the diff to show the wrong color (new text shown as red/removed).
+		let diskContent = '';
+		try {
+			const content = await this._fileService.readFile(uri, { atomic: true });
+			diskContent = content.value.toString();
+		} catch {
+			// File doesn't exist (or read error) - treat as new file, originalCode = "".
+			diskContent = '';
+		}
+
 		// start diffzone
 		const res = this._startStreamingDiffZone({
 			uri,
@@ -2057,6 +2073,8 @@ export class EditCodeService extends Disposable implements IEditCodeService {
 		if (!res) return
 		const { diffZone, onFinishEdit } = res
 
+		// Override originalCode with the actual disk content. This is the key fix.
+		diffZone.originalCode = diskContent
 
 		const onDone = () => {
 			diffZone._streamState = { isStreaming: false, }

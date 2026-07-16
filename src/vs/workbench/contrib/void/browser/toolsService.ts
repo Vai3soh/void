@@ -593,20 +593,20 @@ export class ToolsService implements IToolsService {
 				await fileService.del(uri, { recursive: isRecursive })
 				return { result: {} }
 			},
-
 			rewrite_file: async ({ uri, newContent }) => {
-				try {
+				const exists = await fileService.exists(uri)
+				if (exists) {
 					const stat = await fileService.resolve(uri)
 					if (!stat.isFile) {
 						throw new Error(`Path is a directory, not a file: ${uri.toString()}`)
 					}
-				} catch (e: any) {
-					const isNotFound = e?.name === 'FileOperationError' && e?.fileOperationResult === 1
-						|| /not found|does not exist|ENOENT/i.test(String(e?.message ?? e ?? ''))
-					if (!isNotFound) {
-						throw e
-					}
+				} else {
 					await fileService.createFile(uri, undefined, { overwrite: false })
+					const { model } = await voidModelService.getModelSafe(uri)
+					if (model && model.getValue().length > 0) {
+						model.setValue('')
+						await voidModelService.saveModel(uri, { ignoreModifiedSince: true })
+					}
 				}
 
 				await voidModelService.initializeModel(uri)
@@ -614,7 +614,7 @@ export class ToolsService implements IToolsService {
 					throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
 				}
 				await editCodeService.callBeforeApplyOrEdit(uri)
-				editCodeService.instantlyRewriteFile({ uri, newContent })
+				await editCodeService.instantlyRewriteFile({ uri, newContent })
 
 				// at end, get lint errors
 				const lintErrorsPromise = Promise.resolve().then(async () => {

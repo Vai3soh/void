@@ -28,7 +28,7 @@ suite('LLMLoopDetector', () => {
 		}
 	});
 
-	test('detects assistant_repeat by first-line prefix', () => {
+	test('assistant_repeat is a soft signal (not a loop alone)', () => {
 		const detector = new LLMLoopDetector({ maxTurnsPerPrompt: 10, maxSameAssistantPrefix: 2, maxSameToolCall: 10 });
 
 		let res = detector.registerAssistantTurn('Repeat me\nwith some extra details');
@@ -37,10 +37,32 @@ suite('LLMLoopDetector', () => {
 		res = detector.registerAssistantTurn('Repeat me  \nslightly different body');
 		assert.strictEqual(res.isLoop, false);
 
+		// Third repeat - still not a loop (soft signal only)
 		res = detector.registerAssistantTurn('Repeat me   again');
+		assert.strictEqual(res.isLoop, false);
+	});
+
+	test('assistant_repeat + tool_repeat together triggers loop', () => {
+		const detector = new LLMLoopDetector({
+			maxTurnsPerPrompt: 10,
+			maxSameAssistantPrefix: 2,
+			maxSameToolCall: 2,
+			maxSameReadOnlyToolCall: 2,
+		});
+
+		detector.registerAssistantTurn('Repeat me\nfoo');
+		detector.registerAssistantTurn('Repeat me\nbar');
+		detector.registerAssistantTurn('Repeat me\nbaz');
+
+		const args = { uri: '/file.ts' };
+		let res = detector.registerToolCall('read_file', args);
+		assert.strictEqual(res.isLoop, false);
+		res = detector.registerToolCall('read_file', args);
+		assert.strictEqual(res.isLoop, false);
+		res = detector.registerToolCall('read_file', args);
 		assert.strictEqual(res.isLoop, true);
 		if (res.isLoop) {
-			assert.strictEqual(res.reason, 'assistant_repeat');
+			assert.strictEqual(res.reason, 'tool_repeat');
 		}
 	});
 

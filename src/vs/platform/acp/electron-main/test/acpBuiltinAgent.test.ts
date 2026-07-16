@@ -274,6 +274,67 @@ suite('acpBuiltinAgent read_file truncation', () => {
 		try { __test?.reset?.(); } catch { /* ignore */ }
 	});
 
+	test('forwards effective effort slider capabilities to the shared OpenAI-compatible sender', async () => {
+		const reasoningCapabilities = {
+			supportsReasoning: true,
+			canTurnOffReasoning: true,
+			canIOReasoning: true,
+			reasoningSlider: {
+				type: 'effort_slider',
+				values: ['low', 'medium', 'high'],
+				default: 'low',
+			},
+		};
+		let capturedDynamicRequestConfig: DynamicRequestConfig | undefined;
+
+		__test.setSendChatRouter((opts: any) => {
+			capturedDynamicRequestConfig = opts.dynamicRequestConfig;
+			opts.onFinalMessage({ fullText: 'done' });
+		});
+
+		const fakeConn: any = {
+			extMethod: async (method: string) => {
+				if (method === 'void/settings/getLLMConfig') {
+					return {
+						providerName: 'custom',
+						modelName: 'custom/reasoning-model',
+						settingsOfProvider: { custom: {} },
+						modelSelectionOptions: {},
+						overridesOfModel: {},
+						separateSystemMessage: null,
+						chatMode: null,
+						requestParams: null,
+						dynamicRequestConfig: {
+							endpoint: 'https://example.com/v1',
+							apiStyle: 'openai-compatible',
+							supportsSystemMessage: 'system-role',
+							specialToolFormat: 'openai-style',
+							reasoningCapabilities,
+							headers: {},
+						},
+						providerRouting: null,
+						additionalTools: null,
+					};
+				}
+				throw new Error(`unexpected extMethod: ${method}`);
+			},
+			requestPermission: async () => ({
+				outcome: { outcome: 'selected', optionId: 'allow_once' }
+			}),
+			sessionUpdate: async () => { },
+		};
+
+		const agent = new __test.VoidPipelineAcpAgent(fakeConn, new NullLogService() as any, undefined);
+		const { sessionId } = await agent.newSession({ _meta: {} } as any);
+		const resp = await agent.prompt({
+			sessionId,
+			prompt: [{ type: 'text', text: 'go' }],
+		} as any);
+
+		assert.strictEqual(resp.stopReason, 'end_turn');
+		assert.deepStrictEqual(capturedDynamicRequestConfig?.reasoningCapabilities, reasoningCapabilities);
+	});
+
 	test('read_file truncation uses uri + nextStartLine and does NOT emit logFilePath', async () => {
 		const maxToolOutputLength = 200;
 

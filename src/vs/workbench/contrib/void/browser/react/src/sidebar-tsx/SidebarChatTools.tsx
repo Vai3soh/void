@@ -20,7 +20,7 @@ import { ChatMessage, ToolMessage, } from '../../../../../../../platform/void/co
 import { URI } from '../../../../../../../base/common/uri.js';
 import { getBasename, getRelative, getFolderName, voidOpenFileFn } from './SidebarChatShared.js';
 import { IconLoading, ToolChildrenWrapper, CodeChildren, ListableToolItem } from './SidebarChatUI.js';
-import { LintErrorItem, ToolCallParams, ShallowDirectoryItem } from '../../../../../../../platform/void/common/toolsServiceTypes.js';
+import { LintErrorItem, ToolCallParams, ShallowDirectoryItem, ToolParamName } from '../../../../../../../platform/void/common/toolsServiceTypes.js';
 import { ChatMarkdownRender, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
 import { RawToolCallObj } from '../../../../../../../platform/void/common/sendLLMMessageTypes.js';
 import { BlockCode } from '../util/inputs.js';
@@ -82,7 +82,7 @@ export const titleOfToolName = {
 	'search_for_files': { done: 'Searched', proposed: 'Search', running: loadingTitleWrapper('Searching') },
 	'create_file_or_folder': { done: `Created`, proposed: `Create`, running: loadingTitleWrapper(`Creating`) },
 	'delete_file_or_folder': { done: `Deleted`, proposed: `Delete`, running: loadingTitleWrapper(`Deleting`) },
-	'rewrite_file': { done: `Wrote file`, proposed: 'Write file', running: loadingTitleWrapper('Writing file') },
+	'rewrite_file': { done: `Re-write file`, proposed: 'Re-write file', running: loadingTitleWrapper('Re-writing file') },
 	'run_command': {
 		done: 'Run terminal',
 		proposed: 'Run terminal',
@@ -494,18 +494,17 @@ export const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolNam
 		try {
 			const threadId = chatThreadsService.state.currentThreadId;
 
-			// Always mark tool as rejected so it is struck-through in UI
+			// Mark tool as rejected. In ACP mode this fires onExternalToolDecision
+			// which resolves the permission request with reject_once - the ACP agent
+			// will skip this tool call and continue with the remaining ones in the
+			// same turn. We do NOT call abortRunning here, because that would cancel
+			// the entire ACP session and discard the remaining parallel tool calls.
 			chatThreadsService.rejectLatestToolRequest(threadId);
-
-			// ACP: additionally abort the run (old behavior)
-			if (isAcp) {
-				void chatThreadsService.abortRunning(threadId);
-			}
 		} catch (e) {
 			console.error('Error while rejecting tool request:', e);
 		}
 		metricsService.capture('Tool Request Rejected', {});
-	}, [chatThreadsService, metricsService, isAcp]);
+	}, [chatThreadsService, metricsService]);
 
 	const onSkip = useCallback(() => {
 		try {
@@ -800,6 +799,97 @@ export const EditToolChildren = ({ uri, code }: { uri: URI | undefined, code: st
 	</div>;
 };
 
+export const EditToolStreamingProgress = ({ toolCallSoFar }: { toolCallSoFar: RawToolCallObj }) => {
+	const accessor = useAccessor();
+	const uri = getUriFromToolParams(toolCallSoFar.rawParams, accessor);
+	const raw = toolCallSoFar.rawParams as any;
+
+	const knownParams = ['uri', 'new_content', 'updated_snippet', 'original_snippet'] as const;
+	const streamingParam = knownParams.find(p => raw?.[p] && !toolCallSoFar.doneParams.includes(p as ToolParamName));
+
+	const streamingLen = streamingParam && typeof raw[streamingParam] === 'string'
+		? raw[streamingParam].length
+		: 0;
+
+	let totalLen = 0;
+	for (const p of knownParams) {
+		if (typeof raw?.[p] === 'string') totalLen += raw[p].length;
+	}
+
+	const [elapsed, setElapsed] = useState(0);
+	const [pulse, setPulse] = useState(0);
+	useEffect(() => {
+		const start = Date.now();
+		const timer = setInterval(() => {
+			setElapsed(Math.floor((Date.now() - start) / 1000));
+			setPulse(p => (p + 1) % 3);
+		}, 1000);
+		return () => clearInterval(timer);
+	}, []);
+
+	const formatTime = (s: number) => {
+		if (s < 60) return `${s}s`;
+		const m = Math.floor(s / 60);
+		const sec = s % 60;
+		return `${m}m ${sec}s`;
+	};
+
+	const formatLen = (n: number) => {
+		if (n < 1000) return `${n} chars`;
+		if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K chars`;
+		return `${(n / 1_000_000).toFixed(1)}M chars`;
+	};
+
+	if (!uri) {
+		return <div className='!select-text cursor-auto text-void-fg-3 text-xs px-2 py-1'>
+			<div className='flex items-center gap-2'>
+				<IconLoading />
+				<span>Waiting for LLM response{'.'.repeat(pulse + 1)}</span>
+				<span className='opacity-60'>·</span>
+				<span className='opacity-80'>{formatTime(elapsed)}</span>
+			</div>
+		</div>;
+	}
+
+	return <div className='!select-text cursor-auto text-void-fg-3 text-xs px-2 py-1 space-y-1'>
+		<div className='flex items-center gap-2'>
+			<IconLoading />
+			<span>
+				{streamingParam
+					? `Streaming ${streamingParam}${'.'.repeat(pulse + 1)}`
+					: `Generating${'.'.repeat(pulse + 1)}`}
+			</span>
+			<span className='opacity-60'>·</span>
+			<span className='opacity-80'>{formatTime(elapsed)}</span>
+		</div>
+		<div className='flex items-center gap-3 opacity-80'>
+			{streamingParam && streamingLen > 0 && (
+				<span>{formatLen(streamingLen)} received</span>
+			)}
+			{totalLen > 0 && (
+				<span>· total: {formatLen(totalLen)}</span>
+			)}
+		</div>
+		{(() => {
+			const previewParams = ['new_content', 'updated_snippet', 'original_snippet'];
+			if (!streamingParam || !previewParams.includes(streamingParam)) return null;
+			const content = raw?.[streamingParam];
+			if (typeof content !== 'string' || content.length === 0) return null;
+			return (
+				<div className='mt-1 max-h-32 overflow-auto border border-void-border-3 rounded px-1 py-0.5'>
+					<ProseWrapper>
+						<ChatMarkdownRender
+							string={content.slice(-500)}
+							codeURI={uri}
+							chatMessageLocation={undefined}
+						/>
+					</ProseWrapper>
+				</div>
+			);
+		})()}
+	</div>;
+};
+
 export const EditToolHeaderButtons = ({ applyBoxId, uri, codeStr, toolName, threadId }: { threadId: string, applyBoxId: string, uri: URI | undefined, codeStr: string, toolName: 'edit_file' | 'rewrite_file' }) => {
 	const { streamState } = uri ? useEditToolStreamState({ applyBoxId, uri }) : { streamState: 'idle-no-changes' };
 	return <div className='flex items-center gap-1'>
@@ -821,14 +911,9 @@ export const EditToolSoFar = ({ toolCallSoFar, }: { toolCallSoFar: RawToolCallOb
 	</span>;
 	const desc1OnClick = () => { uri && voidOpenFileFn(uri, accessor); };
 	return <ToolHeaderWrapper title={title} desc1={desc1} desc1OnClick={desc1OnClick}>
-		<EditToolChildren uri={uri} code={(() => {
-			const raw = toolCallSoFar.rawParams as any;
-			return raw?.updated_snippet ?? raw?.original_snippet ?? raw?.new_content ?? '';
-		})()} />
-		<IconLoading />
+		<EditToolStreamingProgress toolCallSoFar={toolCallSoFar} />
 	</ToolHeaderWrapper>;
 };
-
 
 export const CommandTool = ({ toolMessage, threadId }: { threadId: string; toolMessage: Exclude<ToolMessage<'run_command'>, { type: 'invalid_params' }> }) => {
 	const accessor = useAccessor();

@@ -22,7 +22,7 @@ export interface IVoidModelService {
 	getModel(uri: URI): VoidModelType;
 	getModelFromFsPath(fsPath: string): VoidModelType;
 	getModelSafe(uri: URI): Promise<VoidModelType>;
-	saveModel(uri: URI): Promise<void>;
+	saveModel(uri: URI, opts?: { ignoreModifiedSince?: boolean }): Promise<void>;
 
 }
 
@@ -40,9 +40,10 @@ class VoidModelService extends Disposable implements IVoidModelService {
 		super();
 	}
 
-	saveModel = async (uri: URI) => {
+	saveModel = async (uri: URI, opts?: { ignoreModifiedSince?: boolean }) => {
 		await this._textFileService.save(uri, {
-			skipSaveParticipants: true
+			skipSaveParticipants: true,
+			ignoreModifiedSince: opts?.ignoreModifiedSince === true,
 		})
 	}
 

@@ -795,6 +795,13 @@ class VoidPipelineAcpAgent implements Agent {
 				return resp as PromptResponse;
 			}
 
+			// Track whether any tool call in this turn was approved by the user.
+			// If ALL tool calls were rejected/skipped, we end the turn without
+			// another LLM call - otherwise the model would re-try the rejected
+			// tool, creating an annoying "flicker" (thread appears to finish,
+			// then resumes with the same or a new tool call).
+			let anyApproved = false;
+
 			const pendingReadOnlyToolExecutions: Promise<void>[] = [];
 			const isAcpReadOnlyToolCall = (toolCall: OAIFunctionCall): boolean => {
 				return toolCall.name === 'read_file'
@@ -945,6 +952,9 @@ class VoidPipelineAcpAgent implements Agent {
 					if (state.pendingToolCallsById) delete state.pendingToolCallsById[String(toolCall.id)];
 					return;
 				}
+
+				// Mark that at least one tool call was approved - see anyApproved check after the loop.
+				anyApproved = true;
 
 				// in_progress
 				await this.conn.sessionUpdate({
@@ -1190,16 +1200,70 @@ class VoidPipelineAcpAgent implements Agent {
 				});
 			};
 
-			for (const toolCall of toolCalls) {
+			for (let _i = 0; _i < toolCalls.length; _i++) {
+				const toolCall = toolCalls[_i];
+				this.log?.debug?.('[ACP Agent][prompt] processing toolCall', {
+					sessionId: sid,
+					turn: turnCount,
+					index: _i,
+					total: toolCalls.length,
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					state_cancelled: state.cancelled,
+				});
+				if (state.cancelled) {
+					this.log?.debug?.('[ACP Agent][prompt] CANCELLED before toolCall', { sessionId: sid, index: _i });
+					break;
+				}
 				if (isAcpReadOnlyToolCall(toolCall)) {
 					pendingReadOnlyToolExecutions.push(processToolCall(toolCall));
 					continue;
 				}
-
 				await drainPendingReadOnlyToolExecutions();
 				await processToolCall(toolCall);
+				this.log?.debug?.('[ACP Agent][prompt] toolCall processed', {
+					sessionId: sid,
+					turn: turnCount,
+					index: _i,
+					state_cancelled: state.cancelled,
+				});
 			}
 			await drainPendingReadOnlyToolExecutions();
+
+			// If ALL tool calls in this turn were rejected/skipped (none approved),
+			// end the turn without another LLM call. This prevents the model from
+			// re-trying the rejected tool, which caused the thread to "flicker"
+			// (appear to finish, then resume with the same or a new tool call).
+			if (!anyApproved) {
+				this.log?.debug?.('[ACP Agent][prompt] ALL TOOL CALLS REJECTED - ending turn', {
+					sessionId: sid,
+					turn: turnCount,
+					toolCallsCount: toolCalls.length,
+				});
+
+				const syntheticLoopCheck = loopDetector.registerAssistantTurn('');
+				if (syntheticLoopCheck.isLoop) {
+					this.log?.debug?.('[ACP Agent][prompt] LOOP DETECTED after all-rejected turn', {
+						sessionId: sid,
+						turn: turnCount,
+						reason: syntheticLoopCheck.reason,
+					});
+					if (toolCall?.id) {
+						rollbackDanglingToolCall(String(toolCall.id), assistantText);
+					}
+					this.emitError(LOOP_DETECTED_MESSAGE);
+				}
+
+				const resp: any = { stopReason: 'end_turn' as const };
+				if (usageForThisPrompt || usageTurnsForThisPrompt.length) {
+					resp._meta = {
+						...(resp._meta || {}),
+						...(usageForThisPrompt ? { llmTokenUsage: usageForThisPrompt } : {}),
+						...(usageTurnsForThisPrompt.length ? { llmTokenUsageTurns: usageTurnsForThisPrompt } : {}),
+					};
+				}
+				return resp as PromptResponse;
+			}
 		}
 
 		// safeguard exhausted

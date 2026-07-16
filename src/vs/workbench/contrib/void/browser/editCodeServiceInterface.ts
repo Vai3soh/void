@@ -49,7 +49,7 @@ export interface IEditCodeService {
 	callBeforeApplyOrEdit(uri: URI | 'current' | CallBeforeStartApplyingOpts): Promise<void>;
 	startApplying(opts: StartApplyingOpts): [URI, Promise<void>] | null;
 	//instantlyApplySearchReplaceBlocks(opts: { uri: URI; searchReplaceBlocks: string }): void;
-	instantlyRewriteFile(opts: { uri: URI; newContent: string }): void;
+	instantlyRewriteFile(opts: { uri: URI; newContent: string }): Promise<void>;
 	getLastFallbackMessage(uri: URI): string | null;
 
 	recordFallbackMessage(uri: URI, message: string): void;

@@ -26,20 +26,54 @@ export interface LoopDetectorOptions {
 	maxSameToolCall: number;
 	/** Prefix length (in chars) used for assistant repetition fingerprinting. */
 	assistantPrefixLength: number;
+	/** How many words of the assistant first-line to use for fingerprinting.
+	 *  Higher = more conservative (fewer false positives). */
+	assistantPrefixWords: number;
+	/** Limit for read-only tools (read_file, search_*, ls_dir, get_dir_tree).
+	 *  Read-only repeats are harmless, so we allow more of them. */
+	maxSameReadOnlyToolCall: number;
+	/** Whether tool_repeat only triggers on CONSECUTIVE identical calls
+	 *  (not total across the whole prompt). Consecutive repeats = real loop,
+	 *  scattered repeats = normal agent behaviour. */
+	consecutiveToolRepeatOnly: boolean;
 }
 
 const DEFAULT_OPTIONS: LoopDetectorOptions = {
-	maxTurnsPerPrompt: 12,
+	maxTurnsPerPrompt: 25,
 	maxSameAssistantPrefix: 3,
 	maxSameToolCall: 3,
 	assistantPrefixLength: 120,
+	assistantPrefixWords: 5,
+	maxSameReadOnlyToolCall: 8,
+	consecutiveToolRepeatOnly: true,
 };
+
+// Read-only tools: repeats are harmless (re-reading a file after edit, etc).
+const READ_ONLY_TOOLS = new Set([
+	'read_file',
+	'ls_dir',
+	'get_dir_tree',
+	'search_pathnames_only',
+	'search_for_files',
+	'search_in_file',
+	'read_lint_errors',
+]);
 
 export class LLMLoopDetector {
 	private readonly opts: LoopDetectorOptions;
 	private assistantTurns = 0;
 	private readonly assistantPrefixCounts = new Map<string, number>();
 	private readonly toolSignatureCounts = new Map<string, number>();
+	// Track of the last tool signature, for consecutive-repeat detection.
+	// If a different tool was called in between, the counter resets.
+	private lastToolSignature: string | null = null;
+	// Track of mutating write-targets (file URIs that were edited). When a
+	// read_file hits a previously-edited URI, we reset its repeat counter -
+	// re-reading a file after an edit is normal, not a loop.
+	private readonly mutatedTargets = new Set<string>();
+	// Soft signals - used to escalate to a real loop only when multiple
+	// heuristics fire together (assistant repeat + tool repeat = real loop).
+	private assistantRepeatSignal: { prefix: string; count: number } | null = null;
 
 	constructor(options?: Partial<LoopDetectorOptions>) {
 		this.opts = { ...DEFAULT_OPTIONS, ...(options ?? {}) };
@@ -74,12 +108,12 @@ export class LLMLoopDetector {
 		const next = prev + 1;
 		this.assistantPrefixCounts.set(prefix, next);
 
+		// Assistant prefix repetition alone is NOT a loop - the model may legitimately
+		// start multiple responses with "I'll", "Let me", "Now I", etc.
+		// We store it as a soft signal; it only escalates to a real loop if a
+		// tool_repeat signal also fires (see registerToolCall).
 		if (next > this.opts.maxSameAssistantPrefix) {
-			return {
-				isLoop: true,
-				reason: 'assistant_repeat',
-				details: `assistant first-line prefix repeated ${next} times`,
-			};
+			this.assistantRepeatSignal = { prefix, count: next };
 		}
 
 		return { isLoop: false };
@@ -96,19 +130,89 @@ export class LLMLoopDetector {
 		}
 
 		const sig = this._signatureForTool(n, args);
+		const isReadOnly = READ_ONLY_TOOLS.has(n.toLowerCase());
+
+		// If the tool writes to a target, remember it. Subsequent read_file on the
+		// same URI should reset its counter (re-reading after edit is normal).
+		if (!isReadOnly) {
+			const target = this._extractWriteTarget(n, args);
+			if (target) this.mutatedTargets.add(target);
+		} else if (n.toLowerCase() === 'read_file') {
+			const target = this._extractReadTarget(args);
+			if (target && this.mutatedTargets.has(target)) {
+				// File was edited since last read - reset its counter.
+				for (const k of Array.from(this.toolSignatureCounts.keys())) {
+					if (k.includes(`"uri":"${target}"`) || k.includes(`"uri": "${target}"`)) {
+						this.toolSignatureCounts.delete(k);
+					}
+				}
+			}
+		}
+
+		// Consecutive-only mode: if the previous tool call was DIFFERENT, reset
+		// the counter for this signature. This means 3 identical calls in a row
+		// = loop, but 3 identical calls scattered across other calls = normal.
+		if (this.opts.consecutiveToolRepeatOnly && this.lastToolSignature !== null && this.lastToolSignature !== sig) {
+			// Different tool was called in between - reset all counters, because
+			// the agent is making progress (different actions).
+			this.toolSignatureCounts.clear();
+			this.assistantRepeatSignal = null;
+		}
+		this.lastToolSignature = sig;
+
 		const prev = this.toolSignatureCounts.get(sig) ?? 0;
 		const next = prev + 1;
 		this.toolSignatureCounts.set(sig, next);
 
-		if (next > this.opts.maxSameToolCall) {
-			return {
-				isLoop: true,
-				reason: 'tool_repeat',
-				details: `tool ${n} with same arguments called ${next} times`,
-			};
+		// Higher threshold for read-only tools - repeats are harmless.
+		const limit = isReadOnly
+			? Math.max(this.opts.maxSameToolCall, this.opts.maxSameReadOnlyToolCall)
+			: this.opts.maxSameToolCall;
+
+		if (next > limit) {
+			// For mutating tools, this is a real loop - stop immediately.
+			if (!isReadOnly) {
+				return {
+					isLoop: true,
+					reason: 'tool_repeat',
+					details: `tool ${n} with same arguments called ${next} times consecutively`,
+				};
+			}
+			// For read-only tools, only escalate to a real loop if the assistant
+			// is also repeating its text - that combination is a real loop.
+			// Otherwise just continue (re-reading files is harmless).
+			if (this.assistantRepeatSignal) {
+				return {
+					isLoop: true,
+					reason: 'tool_repeat',
+					details: `read-only tool ${n} repeated ${next} times AND assistant prefix "${this.assistantRepeatSignal.prefix}" repeated ${this.assistantRepeatSignal.count} times`,
+				};
+			}
 		}
 
 		return { isLoop: false };
+	}
+
+	/** Extract the write target URI from a mutating tool call, for tracking. */
+	private _extractWriteTarget(_toolName: string, args: unknown): string | null {
+		try {
+			const a = args as any;
+			const uri = a?.uri ?? a?.filePath ?? a?.path;
+			return typeof uri === 'string' ? uri : null;
+		} catch {
+			return null;
+		}
+	}
+
+	/** Extract the read target URI from a read_file call. */
+	private _extractReadTarget(args: unknown): string | null {
+		try {
+			const a = args as any;
+			const uri = a?.uri ?? a?.filePath ?? a?.path;
+			return typeof uri === 'string' ? uri : null;
+		} catch {
+			return null;
+		}
 	}
 
 	private _normalizedAssistantPrefix(text: string): string | null {
@@ -123,11 +227,11 @@ export class LLMLoopDetector {
 
 		if (!normalized) return null;
 
-		// Use only the first couple of words as the canonical "prefix" so that
-		// small trailing variations like "Repeat me again" vs "Repeat me" still
-		// map to the same fingerprint.
+		// Use the first N words as the canonical "prefix". Higher N = fewer false
+		// positives - common phrases like "I'll", "Let me", "Now I" alone match
+		// too many legitimate responses. 5 words gives enough specificity.
 		const words = normalized.split(' ');
-		const maxWords = 2;
+		const maxWords = this.opts.assistantPrefixWords;
 		normalized = words.slice(0, maxWords).join(' ');
 
 		// Still cap by assistantPrefixLength to avoid overly long keys.

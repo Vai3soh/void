@@ -1897,9 +1897,13 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 	let includeInPayload = providerReasoningIOSettings?.input?.includeInPayload?.(reasoningInfo) || {};
 
 	if (Object.keys(includeInPayload).length === 0) {
-		const isReasoningEnabledState = !!reasoningInfo;
-		if (isReasoningEnabledState && canIOReasoning && Array.isArray(openSourceThinkTags)) {
-			includeInPayload = { reasoning: { enabled: true } };
+		if (reasoningInfo?.type === 'effort_slider_value') {
+			includeInPayload = { reasoning_effort: reasoningInfo.reasoningEffort };
+		} else {
+			const isReasoningEnabledState = !!reasoningInfo;
+			if (isReasoningEnabledState && canIOReasoning && Array.isArray(openSourceThinkTags)) {
+				includeInPayload = { reasoning: { enabled: true } };
+			}
 		}
 	}
 

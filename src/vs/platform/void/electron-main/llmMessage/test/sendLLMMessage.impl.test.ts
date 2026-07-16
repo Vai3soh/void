@@ -1381,6 +1381,113 @@ suite('sendLLMMessageToProviderImplementation integrations', () => {
 		);
 	});
 
+	test('OpenAI-compatible payload sends default reasoning_effort from effective effort slider capabilities', async () => {
+		let capturedOptions: any = null;
+		class FakeOpenAI {
+			chat = {
+				completions: {
+					create: async (opts: any) => {
+						capturedOptions = opts;
+						return { choices: [{ message: { content: 'ok' } }] };
+					}
+				}
+			};
+		}
+		implTestExports.setOpenAIModule?.({ default: FakeOpenAI, APIError: class extends Error { } } as any);
+
+		const caps = newCaptures();
+		let resolveDone!: () => void;
+		const done = new Promise<void>(r => { resolveDone = r; });
+		await sendChatRouter({
+			messages: [{ role: 'user', content: 'hi' } as any],
+			separateSystemMessage: undefined,
+			onText: caps.onText,
+			onFinalMessage: (p) => { caps.onFinalMessage(p); resolveDone(); },
+			onError: (e) => assert.fail('onError: ' + e.message),
+			settingsOfProvider: { custom: { endpoint: 'https://example.com/v1', apiKey: 'sk-test' } } as any,
+			modelSelectionOptions: {} as any,
+			overridesOfModel: {} as any,
+			modelName: 'custom/reasoning-model',
+			_setAborter: () => { },
+			providerName: 'custom' as any,
+			chatMode: null as any,
+			dynamicRequestConfig: {
+				endpoint: 'https://example.com/v1',
+				apiStyle: 'openai-compatible',
+				supportsSystemMessage: 'system-role',
+				specialToolFormat: 'openai-style',
+				reasoningCapabilities: {
+					supportsReasoning: true,
+					canTurnOffReasoning: true,
+					canIOReasoning: true,
+					reasoningSlider: {
+						type: 'effort_slider',
+						values: ['low', 'medium', 'high'],
+						default: 'low',
+					},
+				},
+				headers: { Authorization: 'Bearer sk-test' },
+			} as any,
+		});
+		await done;
+
+		assert.strictEqual(capturedOptions.reasoning_effort, 'low');
+	});
+
+	test('OpenRouter payload keeps provider-specific effort reasoning shape', async () => {
+		let capturedOptions: any = null;
+		class FakeOpenAI {
+			chat = {
+				completions: {
+					create: async (opts: any) => {
+						capturedOptions = opts;
+						return { choices: [{ message: { content: 'ok' } }] };
+					}
+				}
+			};
+		}
+		implTestExports.setOpenAIModule?.({ default: FakeOpenAI, APIError: class extends Error { } } as any);
+
+		const caps = newCaptures();
+		let resolveDone!: () => void;
+		const done = new Promise<void>(r => { resolveDone = r; });
+		await sendChatRouter({
+			messages: [{ role: 'user', content: 'hi' } as any],
+			separateSystemMessage: undefined,
+			onText: caps.onText,
+			onFinalMessage: (p) => { caps.onFinalMessage(p); resolveDone(); },
+			onError: (e) => assert.fail('onError: ' + e.message),
+			settingsOfProvider: { openrouter: { endpoint: 'https://openrouter.ai/api/v1', apiKey: 'sk-test' } } as any,
+			modelSelectionOptions: { reasoningEffort: 'high' } as any,
+			overridesOfModel: {} as any,
+			modelName: 'openai/reasoning-model',
+			_setAborter: () => { },
+			providerName: 'openrouter' as any,
+			chatMode: null as any,
+			dynamicRequestConfig: {
+				endpoint: 'https://openrouter.ai/api/v1',
+				apiStyle: 'openai-compatible',
+				supportsSystemMessage: 'system-role',
+				specialToolFormat: 'openai-style',
+				reasoningCapabilities: {
+					supportsReasoning: true,
+					canTurnOffReasoning: true,
+					canIOReasoning: true,
+					reasoningSlider: {
+						type: 'effort_slider',
+						values: ['low', 'medium', 'high'],
+						default: 'low',
+					},
+				},
+				headers: { Authorization: 'Bearer sk-test' },
+			} as any,
+		});
+		await done;
+
+		assert.deepStrictEqual(capturedOptions.reasoning, { effort: 'high' });
+		assert.strictEqual(Object.prototype.hasOwnProperty.call(capturedOptions, 'reasoning_effort'), false);
+	});
+
 	test('OpenAI-compatible payload sends parallel_tool_calls=false when supported native tools are present', async () => {
 		setDynamicModelService({
 			getDynamicCapabilities(_modelName: string) {

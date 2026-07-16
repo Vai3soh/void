@@ -45,6 +45,13 @@ export class ChatExecutionEngine {
 		errWhenStringifying: (error: any) => `Tool call succeeded, but there was an error stringifying the output.\n${getErrorMessage(error)}`
 	};
 
+	// Pending tool calls from the current turn that are waiting for their approval queue.
+	// When LLM returns multiple tool calls in parallel, the first is set as
+	// tool_request, the rest are stored here. After Approve/Reject/Skip
+	// chatThreadService advances the queue. Only when the queue is empty
+	// a new LLM loop is started.
+	private readonly _pendingToolCallsByThread = new Map<string, RawToolCallObj[]>();
+
 	private _getDisabledToolNamesSet(): Set<string> {
 		const arr = this._settingsService.state.globalSettings.disabledToolNames;
 		if (!Array.isArray(arr)) return new Set();
@@ -195,7 +202,14 @@ export class ChatExecutionEngine {
 
 		access.setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' });
 
-
+		// If there are pending tool calls in this turn - do NOT start LLM loop.
+		// Wait for user Approve/Reject/Skip on the next tool call from pending.
+		// Only when all tool calls are processed, messages can be sent to the provider,
+		// otherwise LLM will see tool_request without tool_result and get confused.
+		if (this._pendingToolCallsByThread.has(threadId)) {
+			access.setStreamState(threadId, { isRunning: 'awaiting_user' });
+			return;
+		}
 
 		while (shouldSendAnotherMessage) {
 			shouldSendAnotherMessage = false;
@@ -446,17 +460,7 @@ export class ChatExecutionEngine {
 		});
 	}
 
-	private _addSkippedToolResultsForRemainingBatch(
-		threadId: string,
-		toolCalls: readonly RawToolCallObj[],
-		startIndex: number,
-		reason: string,
-		access: IThreadStateAccess
-	): void {
-		for (let i = startIndex; i < toolCalls.length; i += 1) {
-			this._addToolErrorMessage(threadId, toolCalls[i], reason, access);
-		}
-	}
+
 
 	private async _runReturnedToolCalls(
 		threadId: string,
@@ -540,13 +544,14 @@ export class ChatExecutionEngine {
 				}
 
 				if (awaitingUserApproval) {
-					this._addSkippedToolResultsForRemainingBatch(
-						threadId,
-						toolCalls,
-						i + 1,
-						'Tool call was skipped because another tool call in the same assistant turn is awaiting user approval.',
-						access
-					);
+					// Save remaining tool calls to pending buffer. After Approve/Reject/Skip
+					// chatThreadService will take the next one from here. Only when all tool calls
+					// are processed, a new LLM loop is started.
+					const remaining = toolCalls.slice(i + 1);
+					if (remaining.length) {
+						const existing = this._pendingToolCallsByThread.get(threadId) ?? [];
+						this._pendingToolCallsByThread.set(threadId, [...existing, ...remaining]);
+					}
 					return { awaitingUserApproval: true };
 				}
 
@@ -571,13 +576,12 @@ export class ChatExecutionEngine {
 					id: toolCall.id,
 					rawParams: toolCall.rawParams
 				});
-				this._addSkippedToolResultsForRemainingBatch(
-					threadId,
-					toolCalls,
-					i + 1,
-					'Tool call was skipped because another tool call in the same assistant turn is awaiting user approval.',
-					access
-				);
+				// Save remaining tool calls to pending buffer (see comment above).
+				const remaining = toolCalls.slice(i + 1);
+				if (remaining.length) {
+					const existing = this._pendingToolCallsByThread.get(threadId) ?? [];
+					this._pendingToolCallsByThread.set(threadId, [...existing, ...remaining]);
+				}
 				return { awaitingUserApproval: true };
 			}
 
