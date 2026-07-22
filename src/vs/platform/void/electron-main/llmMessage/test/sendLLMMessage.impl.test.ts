@@ -276,7 +276,79 @@ suite('runStream (OpenAI-compatible)', () => {
 		assert.strictEqual(n.notifications[0]?.id, 'void.llm.outputTruncated');
 	});
 
-	test('A1d: notifyOnTruncation=false suppresses truncation notification', async () => {
+	test('A1d: reasoning-only truncation does not retry and notifies immediately', async () => {
+		const stream = makeAsyncStream([
+			makeChunk({ reasoningDetails: [{ type: 'reasoning.text', text: 'reasoning only' }], finish: 'length' }),
+		]);
+		const openai = makeFakeOpenAIClient(stream);
+		const originalCreate = openai.chat.completions.create;
+		let createCallCount = 0;
+		openai.chat.completions.create = async (options: unknown) => {
+			createCallCount += 1;
+			return originalCreate(options);
+		};
+
+		const caps = newCaptures();
+		const n = newNotificationCapture();
+
+		await runStream({
+			openai,
+			options: { model: 'o4-mini', messages: [], stream: true } as any,
+			onText: caps.onText,
+			onFinalMessage: caps.onFinalMessage,
+			onError: (e) => assert.fail('onError ' + e.message),
+			_setAborter: () => { },
+			nameOfReasoningFieldInDelta: undefined,
+			providerName: 'openAICompatible' as any,
+			toolDefsMap,
+			notificationService: n.notificationService as any,
+		});
+
+		assert.strictEqual(createCallCount, 1, 'reasoning-only truncation must not retry');
+		assert.strictEqual(caps.getFinal()!.fullText, '');
+		assert.strictEqual(caps.getFinal()!.fullReasoning, 'reasoning only');
+		assert.strictEqual(n.notifications.length, 1, 'must notify immediately');
+		assert.match(n.notifications[0]?.message, /No automatic retry was attempted/);
+	});
+
+	test('A1e: non-stream reasoning-only truncation does not retry', async () => {
+		const response = {
+			choices: [{
+				finish_reason: 'length',
+				message: {
+					content: '',
+					reasoning_details: [{ type: 'reasoning.text', text: 'reasoning only' }],
+				},
+			}],
+		};
+		const openai = makeFakeOpenAIClient(response);
+		const originalCreate = openai.chat.completions.create;
+		let createCallCount = 0;
+		openai.chat.completions.create = async (options: unknown) => {
+			createCallCount += 1;
+			return originalCreate(options);
+		};
+
+		const caps = newCaptures();
+
+		await runStream({
+			openai,
+			options: { model: 'o4-mini', messages: [], stream: true } as any,
+			onText: caps.onText,
+			onFinalMessage: caps.onFinalMessage,
+			onError: (e) => assert.fail('onError ' + e.message),
+			_setAborter: () => { },
+			nameOfReasoningFieldInDelta: undefined,
+			providerName: 'openAICompatible' as any,
+			toolDefsMap,
+		});
+
+		assert.strictEqual(createCallCount, 1, 'reasoning-only truncation must not retry');
+		assert.strictEqual(caps.getFinal()!.fullText, '');
+		assert.strictEqual(caps.getFinal()!.fullReasoning, 'reasoning only');
+	});
+
+	test('A1f: notifyOnTruncation=false suppresses truncation notification', async () => {
 		const stream = makeAsyncStream([
 			makeChunk({ content: 'partial answer', finish: 'length' }),
 		]);

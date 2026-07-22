@@ -537,9 +537,10 @@ function buildNativeParallelToolCallsSection(ctx: BuildContext): string {
 	return `
 
 Parallel tool calls:
-- When you need multiple independent read-only tool calls, prefer returning them together in a single assistant message as multiple tool calls.
-- Do not batch tool calls that may mutate files, run terminal commands, require user approval, depend on previous tool results, or call tools whose behavior is unknown from their description.
-- If calls depend on each other, execute them sequentially.`
+- When you need multiple independent tool calls, prefer returning them together in a single assistant message as multiple tool calls.
+- Independent run_command calls may be batched only when every command is strictly read-only. Recognized read-only commands run concurrently in separate terminals; unrecognized or potentially mutating commands are automatically serialized.
+- Independent edit_file or rewrite_file calls for different objects may be batched. The runtime serializes mutating calls, so batching avoids extra model round trips without applying writes concurrently.
+- Never batch multiple writes to the same object, calls that depend on previous tool results, or calls whose behavior is unknown. Execute dependent calls sequentially.`
 }
 
 function buildNativePromptFromSections(ctx: BuildContext, s: NativeSections): string {

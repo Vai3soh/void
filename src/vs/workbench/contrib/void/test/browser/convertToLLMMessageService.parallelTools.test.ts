@@ -25,6 +25,27 @@ suite('convertToLLMMessageService parallel tool history', () => {
 		assert.deepStrictEqual(messages.slice(1).map((m: any) => m.tool_call_id), ['call_a', 'call_b']);
 	});
 
+	test('OpenAI history drops orphan tool results after a later user or assistant message', () => {
+		const messages = __test.prepareOpenAIToolsMessages([
+			{ role: 'assistant', content: 'checking', anthropicReasoning: null },
+			{ role: 'tool', id: 'call_a', name: 'read_file', rawParams: { uri: '/a' } as any, content: 'A' },
+			{ role: 'user', content: 'stop' },
+			{ role: 'tool', id: 'call_b', name: 'read_file', rawParams: { uri: '/b' } as any, content: 'B' },
+		] as any) as any[];
+
+		assert.deepStrictEqual(messages[0].tool_calls.map((toolCall: any) => toolCall.id), ['call_a']);
+		assert.deepStrictEqual(messages.filter(message => message.role === 'tool').map(message => message.tool_call_id), ['call_a']);
+	});
+
+	test('OpenAI history never sends an assistant tool_calls entry without its result', () => {
+		const messages = __test.prepareOpenAIToolsMessages([
+			{ role: 'assistant', content: 'checking', anthropicReasoning: null },
+			{ role: 'user', content: 'stop' },
+		] as any) as any[];
+
+		assert.strictEqual(messages[0].tool_calls, undefined);
+	});
+
 	test('OpenAI trimming preserves terminal timeout and truncation meta tool outputs', () => {
 		const timeoutContent = '$ bash -lc "for i in {1..100}; do echo $i; sleep 1; done"\n' +
 			Array.from({ length: 60 }, (_, i) => String(i + 1)).join('\n') +

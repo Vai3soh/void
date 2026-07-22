@@ -50,6 +50,7 @@ const ScrollToBottomContainer = ({
 
 	const divRef = scrollContainerRef;
 	const contentRef = useRef<HTMLDivElement | null>(null);
+	const scrollAnimationFrameRef = useRef<number | null>(null);
 
 	const computeIsAtBottom = useCallback(() => {
 		const div = divRef.current;
@@ -63,11 +64,10 @@ const ScrollToBottomContainer = ({
 	}, []);
 
 	const scrollToBottomNow = useCallback(() => {
-		const div = divRef.current;
-		if (!div) return;
+		if (!divRef.current || scrollAnimationFrameRef.current !== null) return;
 
-		
-		requestAnimationFrame(() => {
+		scrollAnimationFrameRef.current = requestAnimationFrame(() => {
+			scrollAnimationFrameRef.current = null;
 			const d = divRef.current;
 			if (!d) return;
 			d.scrollTop = d.scrollHeight;
@@ -95,33 +95,24 @@ const ScrollToBottomContainer = ({
 	
 	
 	useEffect(() => {
-		const div = divRef.current;
 		const content = contentRef.current;
-		if (!div || !content) return;
+		if (!content || typeof ResizeObserver === 'undefined') return;
 
-		const handleContentChange = () => {
+		const ro = new ResizeObserver(() => {
 			if (isAtBottomRef.current) {
 				scrollToBottomNow();
 			}
-		};
-
-		let ro: ResizeObserver | null = null;
-		if (typeof ResizeObserver !== 'undefined') {
-			ro = new ResizeObserver(handleContentChange);
-			ro.observe(content);
-		}
-
-		let mo: MutationObserver | null = null;
-		if (typeof MutationObserver !== 'undefined') {
-			mo = new MutationObserver(handleContentChange);
-			mo.observe(content, { childList: true, subtree: true, characterData: true });
-		}
+		});
+		ro.observe(content);
 
 		return () => {
-			ro?.disconnect();
-			mo?.disconnect();
+			ro.disconnect();
+			if (scrollAnimationFrameRef.current !== null) {
+				cancelAnimationFrame(scrollAnimationFrameRef.current);
+				scrollAnimationFrameRef.current = null;
+			}
 		};
-	}, [divRef, scrollToBottomNow]);
+	}, [scrollToBottomNow]);
 
 	return (
 		<div

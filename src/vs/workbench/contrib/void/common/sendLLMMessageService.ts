@@ -332,7 +332,11 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 				const providerSlug = (providerName || '').trim().toLowerCase();
 				this.logService.debug(`[DEBUG sendLLMMessageService] providerSlug: "${providerSlug}"`);
 				dynamicRequestConfig = registry.getRequestConfigForModel(fullId, providerSlug);
-				this.logService.debug(`[DEBUG sendLLMMessageService] dynamicRequestConfig:`, JSON.stringify(dynamicRequestConfig, null, 2));
+				const requestConfigForLog = dynamicRequestConfig ? {
+					...dynamicRequestConfig,
+					headers: Object.fromEntries(Object.keys(dynamicRequestConfig.headers).map(name => [name, '***'])),
+				} : dynamicRequestConfig;
+				this.logService.debug(`[DEBUG sendLLMMessageService] dynamicRequestConfig:`, JSON.stringify(requestConfigForLog, null, 2));
 
 				let parallelToolCallsMode: ParallelToolCallsMode | undefined;
 				try {

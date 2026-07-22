@@ -33,7 +33,7 @@ export const ReasoningSpoiler = ({ reasoning, anthropicReasoning }: { reasoning:
 	const [open, setOpen] = useState(false);
 
 	const text = useMemo(() => {
-		if (reasoning && reasoning.trim()) return reasoning;
+		if (reasoning) return reasoning;
 		if (anthropicReasoning && anthropicReasoning.length) {
 			return anthropicReasoning.map((r: any) => (r && typeof r.thinking === 'string') ? r.thinking : '').join('\n').trim();
 		}
@@ -507,11 +507,16 @@ type ChatBubbleProps = {
 	hideEncryptedReasoning?: boolean,
 };
 
-export const ChatBubble = (props: ChatBubbleProps) => {
+export const ChatBubble = React.memo((props: ChatBubbleProps) => {
 	return <ErrorBoundary>
 		<_ChatBubble {...props} />
 	</ErrorBoundary>;
-};
+}, (prevProps, nextProps) => {
+	if (!prevProps.isCommitted || !nextProps.isCommitted) return false;
+	return prevProps.chatMessage === nextProps.chatMessage &&
+		prevProps.currCheckpointIdx === nextProps.currCheckpointIdx &&
+		prevProps.chatIsRunning === nextProps.chatIsRunning;
+});
 
 const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, messageIdx, chatIsRunning, _scrollToBottom, hideEncryptedReasoning }: ChatBubbleProps) => {
 	const accessor = useAccessor();
@@ -615,7 +620,7 @@ const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, me
 						</div>
 						{(chatMessage as any).type === 'tool_request' ?
 							<div className={`${isCheckpointGhost ? 'opacity-50 pointer-events-none' : ''}`}>
-								<ToolRequestAcceptRejectButtons toolName={nameAsTool} />
+								<ToolRequestAcceptRejectButtons toolName={nameAsTool} threadId={threadId} toolCallId={(chatMessage as any).id} />
 							</div> : null}
 					</>
 				);

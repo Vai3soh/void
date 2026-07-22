@@ -197,6 +197,9 @@ export type GlobalSettings = {
 	chatRetries: number;
 	retryDelay: number;
 	maxToolOutputLength: number;
+	terminalOutputSummarization: boolean;
+	terminalOutputHeadLines: number;
+	terminalOutputTailLines: number;
 	readFileChunkLines: number;
 	terminalCommandTimeoutMinutes: number;
 	notifyOnTruncation: boolean;
@@ -237,6 +240,9 @@ export const defaultGlobalSettings: GlobalSettings = {
 	chatRetries: 0,
 	retryDelay: 2500,
 	maxToolOutputLength: 40000,
+	terminalOutputSummarization: true,
+	terminalOutputHeadLines: 50,
+	terminalOutputTailLines: 50,
 	readFileChunkLines: 200,
 	terminalCommandTimeoutMinutes: 40,
 	notifyOnTruncation: true,

@@ -31,7 +31,7 @@ const paginationParam = {
 	page_number: { description: 'Optional. The page number of the result. Default is 1.' }
 } as const;
 
-const terminalDescHelper = `You can use this tool to run any command: sed, grep, etc. Do not edit any files with this tool; use edit_file instead. When working with git and other tools that open an editor (e.g. git diff), you should pipe to cat to get all results and not get stuck in vim.`;
+const terminalDescHelper = `You can use this tool to run any command: sed, grep, etc. Do not edit any files with this tool; use edit_file instead. Independent strictly read-only run_command calls may be returned together; recognized read-only commands run concurrently and all other terminal commands are serialized automatically. When working with git and other tools that open an editor (e.g. git diff), use non-interactive flags instead of piping commands so safe read-only calls can remain parallelizable.`;
 
 const cwdHelper = 'Optional. The directory in which to run the command. Defaults to the first workspace folder.';
 

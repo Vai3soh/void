@@ -14,7 +14,7 @@ import { ILanguageModelToolsService } from '../../chat/common/languageModelTools
 import { IMetricsService } from '../../../../platform/void/common/metricsService.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { LLMLoopDetector, LOOP_DETECTED_MESSAGE } from '../../../../platform/void/common/loopGuard.js';
-import { getErrorMessage, RawToolCallObj, RawToolParamsObj, LLMTokenUsage } from '../../../../platform/void/common/sendLLMMessageTypes.js';
+import { getErrorMessage, RawToolCallObj, RawToolParamsObj, LLMTokenUsage, type OnText } from '../../../../platform/void/common/sendLLMMessageTypes.js';
 import { isAToolName } from '../common/prompt/prompts.js';
 import { approvalTypeOfToolName, } from '../../../../platform/void/common/toolsServiceTypes.js';
 import { ChatMessage, ToolMessage, ChatAttachment } from '../../../../platform/void/common/chatThreadServiceTypes.js';
@@ -36,6 +36,14 @@ export type IsRunningType =
 	| 'idle' // nothing is running now, but the chat should still appear like it's going (used in-between calls)
 	| undefined
 
+const STREAM_UPDATE_INTERVAL_MS = 50;
+const LIVE_REASONING_PREVIEW_CHARS = 8_000;
+
+const toLiveReasoningPreview = (reasoning: string): string => {
+	if (reasoning.length <= LIVE_REASONING_PREVIEW_CHARS) return reasoning;
+	const sectionLength = Math.floor(LIVE_REASONING_PREVIEW_CHARS / 2);
+	return `${reasoning.slice(0, sectionLength)}\n\n… live reasoning preview truncated …\n\n${reasoning.slice(-sectionLength)}`;
+};
 
 export class ChatExecutionEngine {
 
@@ -51,6 +59,102 @@ export class ChatExecutionEngine {
 	// chatThreadService advances the queue. Only when the queue is empty
 	// a new LLM loop is started.
 	private readonly _pendingToolCallsByThread = new Map<string, RawToolCallObj[]>();
+	private readonly _runningToolInterruptorsByThread = new Map<string, Map<string, () => void>>();
+	private readonly _stoppedToolIdsByThread = new Map<string, Set<string>>();
+	private readonly _runGenerationByThread = new Map<string, number>();
+
+	private _setRunningToolInterruptor(threadId: string, toolId: string, interruptor: () => void): void {
+		const existing = this._runningToolInterruptorsByThread.get(threadId);
+		if (existing) {
+			existing.set(toolId, interruptor);
+			return;
+		}
+		this._runningToolInterruptorsByThread.set(threadId, new Map([[toolId, interruptor]]));
+	}
+
+	private _deleteRunningToolInterruptor(threadId: string, toolId: string): void {
+		const existing = this._runningToolInterruptorsByThread.get(threadId);
+		if (!existing) return;
+		existing.delete(toolId);
+		if (!existing.size) this._runningToolInterruptorsByThread.delete(threadId);
+	}
+
+	private _currentRunGeneration(threadId: string): number {
+		return this._runGenerationByThread.get(threadId) ?? 0;
+	}
+
+	private _isRunStopped(threadId: string, runGeneration: number): boolean {
+		return this._currentRunGeneration(threadId) !== runGeneration;
+	}
+
+	private _markToolStopped(threadId: string, toolId: string): void {
+		const existing = this._stoppedToolIdsByThread.get(threadId);
+		if (existing) {
+			existing.add(toolId);
+			return;
+		}
+		this._stoppedToolIdsByThread.set(threadId, new Set([toolId]));
+	}
+
+	private _consumeToolStopped(threadId: string, toolId: string): boolean {
+		const existing = this._stoppedToolIdsByThread.get(threadId);
+		if (!existing?.delete(toolId)) return false;
+		if (!existing.size) this._stoppedToolIdsByThread.delete(threadId);
+		return true;
+	}
+
+	public stopThread(threadId: string): RawToolCallObj[] {
+		this._runGenerationByThread.set(threadId, this._currentRunGeneration(threadId) + 1);
+		const pending = this._pendingToolCallsByThread.get(threadId) ?? [];
+		this._pendingToolCallsByThread.delete(threadId);
+
+		const interruptors = this._runningToolInterruptorsByThread.get(threadId);
+		if (interruptors) {
+			for (const [toolId, interruptor] of interruptors) {
+				this._markToolStopped(threadId, toolId);
+				interruptor();
+			}
+			this._runningToolInterruptorsByThread.delete(threadId);
+		}
+
+		return pending;
+	}
+
+	public interruptRunningTools(threadId: string): void {
+		const interruptors = this._runningToolInterruptorsByThread.get(threadId);
+		if (!interruptors) return;
+		for (const [toolId, interruptor] of interruptors) {
+			this.skippedToolCallIds.add(toolId);
+			interruptor();
+		}
+		this._runningToolInterruptorsByThread.delete(threadId);
+	}
+
+	private _stopPendingToolCalls(threadId: string, access: IThreadStateAccess): void {
+		const pending = this._pendingToolCallsByThread.get(threadId) ?? [];
+		this._pendingToolCallsByThread.delete(threadId);
+		for (const toolCall of pending) {
+			this._addToolErrorMessage(threadId, toolCall, this.toolErrMsgs.interrupted, access);
+		}
+	}
+
+	public clearThreadExecutionState(threadId: string): void {
+		this._pendingToolCallsByThread.delete(threadId);
+		this._runningToolInterruptorsByThread.delete(threadId);
+		this._stoppedToolIdsByThread.delete(threadId);
+		this._runGenerationByThread.delete(threadId);
+	}
+
+	public clearAllExecutionState(): void {
+		this._pendingToolCallsByThread.clear();
+		this._runningToolInterruptorsByThread.clear();
+		this._stoppedToolIdsByThread.clear();
+		this._runGenerationByThread.clear();
+	}
+
+	private _isThreadExecutionStopped(threadId: string, runGeneration: number): boolean {
+		return this._isRunStopped(threadId, runGeneration);
+	}
 
 	private _getDisabledToolNamesSet(): Set<string> {
 		const arr = this._settingsService.state.globalSettings.disabledToolNames;
@@ -96,9 +200,11 @@ export class ChatExecutionEngine {
 	}, access: IThreadStateAccess) {
 
 		const { threadId, modelSelection, modelSelectionOptions, callThisToolFirst } = opts;
+		const runGeneration = this._currentRunGeneration(threadId);
 
 		let interruptedWhenIdle = false;
 		const idleInterruptor = Promise.resolve(() => { interruptedWhenIdle = true });
+		const isStopped = () => interruptedWhenIdle || this._isThreadExecutionStopped(threadId, runGeneration);
 
 		const gs = this._settingsService.state.globalSettings;
 		const chatMode = gs.chatMode;
@@ -126,6 +232,17 @@ export class ChatExecutionEngine {
 				}, access);
 
 				if (interrupted) {
+					if (this._consumeToolStopped(threadId, callThisToolFirst.id)) {
+						this._addToolErrorMessage(threadId, {
+							id: callThisToolFirst.id,
+							name: callThisToolFirst.name,
+							rawParams: callThisToolFirst.rawParams,
+							isDone: true,
+							doneParams: []
+						}, this.toolErrMsgs.interrupted, access);
+						this._stopPendingToolCalls(threadId, access);
+						return;
+					}
 					if (this.skippedToolCallIds.delete(callThisToolFirst.id)) {
 
 					} else {
@@ -136,6 +253,16 @@ export class ChatExecutionEngine {
 				}
 			} else {
 				// Dynamic tool (MCP)
+				if (isStopped()) {
+					this._addToolErrorMessage(threadId, {
+						id: callThisToolFirst.id,
+						name: callThisToolFirst.name,
+						rawParams: callThisToolFirst.rawParams,
+						isDone: true,
+						doneParams: []
+					}, this.toolErrMsgs.interrupted, access);
+					return;
+				}
 				if (this._isToolDisabled(callThisToolFirst.name)) {
 					const disabledError = this._disabledToolError(callThisToolFirst.name);
 					access.addMessageToThread(threadId, {
@@ -166,6 +293,22 @@ export class ChatExecutionEngine {
 						callThisToolFirst.name,
 						toJsonObject(callThisToolFirst.rawParams)
 					);
+
+					if (isStopped()) {
+						access.updateLatestTool(threadId, {
+							role: 'tool',
+							type: 'tool_error',
+							params: callThisToolFirst.params as any,
+							result: this.toolErrMsgs.interrupted,
+							name: callThisToolFirst.name as any,
+							content: this.toolErrMsgs.interrupted,
+							displayContent: this.toolErrMsgs.interrupted,
+							id: callThisToolFirst.id,
+							rawParams: callThisToolFirst.rawParams
+						});
+						this._stopPendingToolCalls(threadId, access);
+						return;
+					}
 
 					if (!exec.ok) {
 						access.updateLatestTool(threadId, {
@@ -198,6 +341,11 @@ export class ChatExecutionEngine {
 				}
 			}
 
+		}
+
+		if (isStopped()) {
+			this._stopPendingToolCalls(threadId, access);
+			return;
 		}
 
 		access.setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' });
@@ -257,8 +405,7 @@ export class ChatExecutionEngine {
 
 			await this._patchImagesIntoMessages({ messages, chatMessages, modelSelection });
 
-			if (interruptedWhenIdle) {
-				access.setStreamState(threadId, undefined);
+			if (isStopped()) {
 				return;
 			}
 
@@ -310,6 +457,46 @@ export class ChatExecutionEngine {
 
 				let resMessageIsDonePromise: (res: ResTypes) => void;
 				const messageIsDonePromise = new Promise<ResTypes>((res) => { resMessageIsDonePromise = res; });
+				let pendingStreamUpdate: Parameters<OnText>[0] | undefined;
+				let streamUpdateTimer: ReturnType<typeof setTimeout> | undefined;
+				let lastStreamUpdateAt = 0;
+
+				const clearPendingStreamUpdate = () => {
+					if (streamUpdateTimer !== undefined) {
+						clearTimeout(streamUpdateTimer);
+						streamUpdateTimer = undefined;
+					}
+					pendingStreamUpdate = undefined;
+				};
+
+				const publishStreamUpdate = (update: Parameters<OnText>[0]) => {
+					if (isStopped()) return;
+					lastStreamUpdateAt = Date.now();
+					const displayToolCall = update.toolCall ?? update.toolCalls?.[0] ?? null;
+					const reasoningPreview = toLiveReasoningPreview(update.fullReasoning);
+					access.setStreamState(threadId, {
+						isRunning: 'LLM',
+						llmInfo: { displayContentSoFar: update.fullText, reasoningSoFar: reasoningPreview, toolCallSoFar: displayToolCall },
+						interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken); })
+					});
+				};
+
+				const queueStreamUpdate = (update: Parameters<OnText>[0]) => {
+					pendingStreamUpdate = update;
+					const elapsed = Date.now() - lastStreamUpdateAt;
+					if (elapsed >= STREAM_UPDATE_INTERVAL_MS && streamUpdateTimer === undefined) {
+						pendingStreamUpdate = undefined;
+						publishStreamUpdate(update);
+						return;
+					}
+					if (streamUpdateTimer !== undefined) return;
+					streamUpdateTimer = setTimeout(() => {
+						streamUpdateTimer = undefined;
+						const next = pendingStreamUpdate;
+						pendingStreamUpdate = undefined;
+						if (next) publishStreamUpdate(next);
+					}, Math.max(0, STREAM_UPDATE_INTERVAL_MS - elapsed));
+				};
 
 				const llmCancelToken = this._llmMessageService.sendLLMMessage({
 					messagesType: 'chatMessages',
@@ -320,23 +507,25 @@ export class ChatExecutionEngine {
 					overridesOfModel,
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
 					separateSystemMessage: separateSystemMessage,
-					onText: ({ fullText, fullReasoning, toolCalls, toolCall, tokenUsage }) => {
-						if (tokenUsage) lastUsageForTurn = tokenUsage;
-						const displayToolCall = toolCall ?? toolCalls?.[0] ?? null;
-						access.setStreamState(threadId, {
-							isRunning: 'LLM',
-							llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallSoFar: displayToolCall },
-							interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken); })
-						});
+					onText: (update) => {
+						if (isStopped()) return;
+						if (update.tokenUsage) lastUsageForTurn = update.tokenUsage;
+						queueStreamUpdate(update);
 					},
 					onFinalMessage: async ({ fullText, fullReasoning, toolCalls, toolCall, anthropicReasoning, tokenUsage, }) => {
+						clearPendingStreamUpdate();
+						if (isStopped()) return;
 						if (tokenUsage) lastUsageForTurn = tokenUsage;
 						resMessageIsDonePromise({ type: 'llmDone', toolCalls, toolCall, info: { fullText, fullReasoning, anthropicReasoning }, tokenUsage });
 					},
 					onError: async (error) => {
+						clearPendingStreamUpdate();
+						if (isStopped()) return;
 						resMessageIsDonePromise({ type: 'llmError', error: error });
 					},
 					onAbort: () => {
+						clearPendingStreamUpdate();
+						if (isStopped()) return;
 						if (lastUsageForTurn) access.accumulateTokenUsage(threadId, lastUsageForTurn);
 						resMessageIsDonePromise({ type: 'llmAborted' });
 						this._metricsService.capture('Agent Loop Done (Aborted)', { nMessagesSent, chatMode });
@@ -348,10 +537,15 @@ export class ChatExecutionEngine {
 					break;
 				}
 
+				if (isStopped()) {
+					this._llmMessageService.abort(llmCancelToken);
+					return;
+				}
 				access.setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '', reasoningSoFar: '', toolCallSoFar: null }, interrupt: Promise.resolve(() => this._llmMessageService.abort(llmCancelToken)) });
 
 				const llmRes = await messageIsDonePromise;
 
+				if (isStopped()) return;
 				const currStream = access.getStreamState(threadId);
 				if (currStream?.isRunning !== 'LLM') return; // interrupted by new thread
 
@@ -366,8 +560,7 @@ export class ChatExecutionEngine {
 						shouldRetryLLM = true;
 						access.setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor });
 						await timeout(retryDelay);
-						if (interruptedWhenIdle) {
-							access.setStreamState(threadId, undefined);
+						if (isStopped()) {
 							return;
 						}
 						continue;
@@ -423,7 +616,7 @@ export class ChatExecutionEngine {
 						return;
 					}
 					if (batchResult.interrupted) {
-						access.setStreamState(threadId, undefined);
+						if (!isStopped()) access.setStreamState(threadId, undefined);
 						return;
 					}
 					if (batchResult.awaitingUserApproval) {
@@ -468,17 +661,23 @@ export class ChatExecutionEngine {
 		loopDetector: LLMLoopDetector,
 		access: IThreadStateAccess
 	): Promise<{ awaitingUserApproval?: boolean; interrupted?: boolean; loopDetected?: boolean }> {
+		const runGeneration = this._currentRunGeneration(threadId);
 		const seenWriteTargets = new Set<string>();
 		let executedOrErrored = false;
-		let pendingReadOnlyToolExecutions: Promise<{ toolCall: RawToolCallObj; awaitingUserApproval?: boolean; interrupted?: boolean }>[] = [];
+		let pendingParallelToolExecutions: Promise<{ toolCall: RawToolCallObj; awaitingUserApproval?: boolean; interrupted?: boolean }>[] = [];
 
-		const drainPendingReadOnlyToolExecutions = async (): Promise<{ awaitingUserApproval?: boolean; interrupted?: boolean }> => {
-			if (!pendingReadOnlyToolExecutions.length) return {};
-			const batch = pendingReadOnlyToolExecutions;
-			pendingReadOnlyToolExecutions = [];
+		const drainPendingParallelToolExecutions = async (): Promise<{ awaitingUserApproval?: boolean; interrupted?: boolean }> => {
+			if (!pendingParallelToolExecutions.length) return {};
+			const batch = pendingParallelToolExecutions;
+			pendingParallelToolExecutions = [];
 			const results = await Promise.all(batch);
+			const stopped = this._isThreadExecutionStopped(threadId, runGeneration);
 			for (const result of results) {
 				if (result.interrupted) {
+					if (stopped && this._consumeToolStopped(threadId, result.toolCall.id)) {
+						executedOrErrored = true;
+						continue;
+					}
 					if (this.skippedToolCallIds.delete(result.toolCall.id)) {
 						executedOrErrored = true;
 						continue;
@@ -490,15 +689,29 @@ export class ChatExecutionEngine {
 				}
 				executedOrErrored = true;
 			}
+			if (stopped) {
+				this._stopPendingToolCalls(threadId, access);
+				return { interrupted: true };
+			}
 			return {};
 		};
 
 		for (let i = 0; i < toolCalls.length; i += 1) {
+			if (this._isThreadExecutionStopped(threadId, runGeneration)) {
+				this._stopPendingToolCalls(threadId, access);
+				for (const remainingToolCall of toolCalls.slice(i)) {
+					this._addToolErrorMessage(threadId, remainingToolCall, this.toolErrMsgs.interrupted, access);
+				}
+				return { interrupted: true };
+			}
 			const toolCall = toolCalls[i];
 			const plan = classifyToolCall({ id: toolCall.id, name: toolCall.name, rawParams: toolCall.rawParams as Record<string, unknown> });
 
-			if (plan.kind !== 'read-only') {
-				const pendingResult = await drainPendingReadOnlyToolExecutions();
+			if (plan.kind !== 'read-only' && plan.kind !== 'read-only-terminal') {
+				const pendingResult = await drainPendingParallelToolExecutions();
+				if (pendingResult.interrupted || pendingResult.awaitingUserApproval) return pendingResult;
+			} else if (plan.kind === 'read-only-terminal' && this._settingsService.state.globalSettings.autoApprove.terminal !== true) {
+				const pendingResult = await drainPendingParallelToolExecutions();
 				if (pendingResult.interrupted || pendingResult.awaitingUserApproval) return pendingResult;
 			}
 
@@ -514,7 +727,7 @@ export class ChatExecutionEngine {
 
 			const loopAfterTool = loopDetector.registerToolCall(toolCall.name, toolCall.rawParams);
 			if (loopAfterTool.isLoop) {
-				const pendingResult = await drainPendingReadOnlyToolExecutions();
+				const pendingResult = await drainPendingParallelToolExecutions();
 				if (pendingResult.interrupted || pendingResult.awaitingUserApproval) return pendingResult;
 				return { loopDetected: true };
 			}
@@ -528,14 +741,22 @@ export class ChatExecutionEngine {
 					return { toolCall, awaitingUserApproval, interrupted };
 				};
 
-				if (plan.kind === 'read-only') {
-					pendingReadOnlyToolExecutions.push(runBuiltInTool());
+				if (plan.kind === 'read-only' || (plan.kind === 'read-only-terminal' && this._settingsService.state.globalSettings.autoApprove.terminal === true)) {
+					pendingParallelToolExecutions.push(runBuiltInTool());
 					continue;
 				}
 
 				const { awaitingUserApproval, interrupted } = await runBuiltInTool();
 
 				if (interrupted) {
+					if (this._consumeToolStopped(threadId, toolCall.id)) {
+						this._addToolErrorMessage(threadId, toolCall, this.toolErrMsgs.interrupted, access);
+						for (const remainingToolCall of toolCalls.slice(i + 1)) {
+							this._addToolErrorMessage(threadId, remainingToolCall, this.toolErrMsgs.interrupted, access);
+						}
+						this._stopPendingToolCalls(threadId, access);
+						return { interrupted: true };
+					}
 					if (this.skippedToolCallIds.delete(toolCall.id)) {
 						executedOrErrored = true;
 						continue;
@@ -602,6 +823,25 @@ export class ChatExecutionEngine {
 				toJsonObject(toolCall.rawParams)
 			);
 
+			if (this._isThreadExecutionStopped(threadId, runGeneration)) {
+				access.updateLatestTool(threadId, {
+					role: 'tool',
+					type: 'tool_error',
+					params: toolCall.rawParams as any,
+					result: this.toolErrMsgs.interrupted,
+					name: toolCall.name as any,
+					content: this.toolErrMsgs.interrupted,
+					displayContent: this.toolErrMsgs.interrupted,
+					id: toolCall.id,
+					rawParams: toolCall.rawParams
+				});
+				for (const remainingToolCall of toolCalls.slice(i + 1)) {
+					this._addToolErrorMessage(threadId, remainingToolCall, this.toolErrMsgs.interrupted, access);
+				}
+				this._stopPendingToolCalls(threadId, access);
+				return { interrupted: true };
+			}
+
 			if (!exec.ok) {
 				access.updateLatestTool(threadId, {
 					role: 'tool',
@@ -634,7 +874,7 @@ export class ChatExecutionEngine {
 			executedOrErrored = true;
 		}
 
-		const pendingResult = await drainPendingReadOnlyToolExecutions();
+		const pendingResult = await drainPendingParallelToolExecutions();
 		if (pendingResult.interrupted || pendingResult.awaitingUserApproval) return pendingResult;
 
 		return executedOrErrored ? {} : {};
@@ -782,8 +1022,10 @@ export class ChatExecutionEngine {
 		} as const);
 
 		let interrupted = false;
-		let resolveInterruptor: (r: () => void) => void = () => { };
-		const interruptorPromise = new Promise<() => void>(res => { resolveInterruptor = res; });
+		let interruptTool: (() => void) | undefined;
+		const interruptor = () => { interrupted = true; interruptTool?.(); };
+		const interruptorPromise = Promise.resolve(interruptor);
+		this._setRunningToolInterruptor(threadId, toolId, interruptor);
 
 		// streamState init
 		access.setStreamState(threadId, {
@@ -854,7 +1096,6 @@ export class ChatExecutionEngine {
 
 		try {
 			let result: Promise<any>;
-			let interruptTool: (() => void) | undefined;
 
 			if (isAToolName(toolName)) {
 				// Pass ctx only for terminal tools
@@ -868,10 +1109,11 @@ export class ChatExecutionEngine {
 				result = Promise.resolve({});
 			}
 
-			const interruptor = () => { interrupted = true; interruptTool?.(); };
-			resolveInterruptor(interruptor);
-
-			toolResult = await result;
+			try {
+				toolResult = await result;
+			} finally {
+				this._deleteRunningToolInterruptor(threadId, toolId);
+			}
 
 			if (pushTimer) {
 				try { clearTimeout(pushTimer); } catch { }
@@ -879,10 +1121,10 @@ export class ChatExecutionEngine {
 			}
 			push(true);
 
-			if (interrupted) return { interrupted: true };
+			if (interrupted || this._consumeToolStopped(threadId, toolId)) return { interrupted: true };
 		} catch (error) {
-			resolveInterruptor(() => { });
-			if (interrupted) return { interrupted: true };
+			this._deleteRunningToolInterruptor(threadId, toolId);
+			if (interrupted || this._consumeToolStopped(threadId, toolId)) return { interrupted: true };
 
 			const errorMessage = getErrorMessage(error);
 			access.updateLatestTool(threadId, {

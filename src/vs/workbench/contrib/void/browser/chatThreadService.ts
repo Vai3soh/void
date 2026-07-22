@@ -34,7 +34,7 @@ import {
 	ChatMessage, StagingSelectionItem, ChatAttachment, CodespanLocationLink,
 	AnyToolName, ToolMessage
 } from '../../../../platform/void/common/chatThreadServiceTypes.js';
-import { chat_userMessageContent } from '../common/prompt/prompts.js';
+import { chat_userMessageContent, isAToolName } from '../common/prompt/prompts.js';
 import { LLMTokenUsage, RawToolCallObj, RawToolParamsObj } from '../../../../platform/void/common/sendLLMMessageTypes.js';
 import { ChatNotificationManager } from './ChatNotificationManager.js';
 import { ChatHistoryCompressor } from './ChatHistoryCompressor.js';
@@ -183,9 +183,9 @@ export interface IChatThreadService {
 	dismissStreamError(threadId: string): void;
 	editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId }: { userMessage: string, messageIdx: number, threadId: string }): Promise<void>;
 	addUserMessageAndStreamResponse({ userMessage, threadId, attachments }: { userMessage: string, threadId: string, attachments?: ChatAttachment[] }): Promise<void>;
-	approveLatestToolRequest(threadId: string): void;
-	rejectLatestToolRequest(threadId: string): void;
-	skipLatestToolRequest(threadId: string): void;
+	approveLatestToolRequest(threadId: string, toolCallId?: string): Promise<void>;
+	rejectLatestToolRequest(threadId: string, toolCallId?: string): void;
+	skipLatestToolRequest(threadId: string, toolCallId?: string): void;
 	skipRunningTool(threadId: string): void;
 	jumpToCheckpointBeforeMessageIdx(opts: { threadId: string, messageIdx: number, jumpToUserModified: boolean }): void;
 	awaitMountWithTimeout(threadId: string): Promise<{ textAreaRef: { current: HTMLTextAreaElement | null }; scrollToBottom: () => void } | null>;
@@ -231,10 +231,10 @@ type LatestToolRequest = {
 	index: number;
 };
 
-function findLatestToolRequestMessage(messages: readonly ChatMessage[]): LatestToolRequest | undefined {
+function findLatestToolRequestMessage(messages: readonly ChatMessage[], toolCallId?: string): LatestToolRequest | undefined {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
-		if (message.role === 'tool' && message.type === 'tool_request') {
+		if (message.role === 'tool' && message.type === 'tool_request' && (toolCallId === undefined || message.id === toolCallId)) {
 			return { message, index: i };
 		}
 	}
@@ -294,7 +294,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		@IStorageService private readonly _storageService: IStorageService,
 		@IVoidModelService private readonly _voidModelService: IVoidModelService,
 		@ILLMMessageService _llmMessageService: ILLMMessageService,
-		@IToolsService _toolsService: IToolsService,
+		@IToolsService private readonly _toolsService: IToolsService,
 		@IVoidSettingsService private readonly _settingsService: IVoidSettingsService,
 		@ILanguageFeaturesService _languageFeaturesService: ILanguageFeaturesService,
 		@ILanguageModelToolsService _lmToolsService: ILanguageModelToolsService,
@@ -537,6 +537,12 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	async abortRunning(threadId: string) {
 		const st = this.streamState[threadId];
+		const runningToolIds = new Set<string>();
+		const thread = this.state.allThreads[threadId];
+		for (const message of thread?.messages ?? []) {
+			if (message.role === 'tool' && message.type === 'running_now') runningToolIds.add(message.id);
+		}
+
 		if (st?.isRunning === 'LLM' && st.llmInfo) {
 			this._addMessageToThread(threadId, {
 				role: 'assistant',
@@ -547,31 +553,52 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			if (st.llmInfo.toolCallSoFar) {
 				this._addMessageToThread(threadId, { role: 'interrupted_streaming_tool', name: st.llmInfo.toolCallSoFar.name as any });
 			}
-		} else if (st?.isRunning === 'tool' && st.toolInfo) {
-			const { toolName, toolParams, id, content } = st.toolInfo;
-			this._updateLatestTool(threadId, {
-				role: 'tool', name: toolName, params: toolParams, id,
-				content: content || 'Interrupted', displayContent: content || 'Interrupted',
-				type: 'rejected', result: null, rawParams: st.toolInfo.rawParams
-			});
 		}
 
 		this._checkpointManager.addUserCheckpoint(threadId, this._threadAccess);
+		const pendingToolCalls = this._executionEngine.stopThread(threadId);
+
+		for (const toolCallId of runningToolIds) {
+			const idx = this._findLastToolMessageIndexById(threadId, toolCallId);
+			if (idx === null) continue;
+			const message = this.state.allThreads[threadId]?.messages[idx];
+			if (!message || message.role !== 'tool' || message.type !== 'running_now') continue;
+			this._editToolMessageById(threadId, toolCallId, {
+				type: 'tool_error',
+				content: 'Tool call was interrupted by the user.',
+				displayContent: 'Tool call was interrupted by the user.',
+				result: 'Tool call was interrupted by the user.'
+			});
+		}
+
+		for (const pendingToolCall of pendingToolCalls) {
+			this._addMessageToThread(threadId, {
+				role: 'tool',
+				type: 'tool_error',
+				params: pendingToolCall.rawParams as any,
+				result: 'Tool call was interrupted by the user.',
+				name: pendingToolCall.name as any,
+				content: 'Tool call was interrupted by the user.',
+				displayContent: 'Tool call was interrupted by the user.',
+				id: pendingToolCall.id,
+				rawParams: pendingToolCall.rawParams
+			});
+		}
 
 		try {
-			const interrupt = await this.streamState[threadId]?.interrupt;
-			if (typeof interrupt === 'function') (interrupt as any)();
+			const interrupt = await st?.interrupt;
+			if (typeof interrupt === 'function') interrupt();
 		} catch { }
 
 		this._acpHandler.clearAcpState(threadId);
 		this._setStreamState(threadId, undefined);
 	}
 
-	approveLatestToolRequest(threadId: string) {
+	async approveLatestToolRequest(threadId: string, toolCallId?: string) {
 		const thread = this.state.allThreads[threadId];
 		if (!thread) return;
 
-		const latestToolRequest = findLatestToolRequestMessage(thread.messages);
+		const latestToolRequest = findLatestToolRequestMessage(thread.messages, toolCallId);
 		if (!latestToolRequest) return;
 		const lastMsg = latestToolRequest.message;
 
@@ -610,28 +637,36 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// non-ACP: start execution engine with callThisToolFirst.
 		// If there are pending tool calls - runChatAgent will return immediately
 		// (without starting LLM loop), and we advance the queue further.
+		const agentPromise = this._executionEngine.runChatAgent({
+			threadId,
+			callThisToolFirst: lastMsg as any,
+			...this._currentModelSelectionProps()
+		}, this._threadAccess);
+
 		this._notificationManager.wrapRunAgentToNotify(
-			this._executionEngine.runChatAgent({
-				threadId,
-				callThisToolFirst: lastMsg as any,
-				...this._currentModelSelectionProps()
-			}, this._threadAccess),
+			agentPromise,
 			threadId,
 			() => this.state.currentThreadId,
 			() => this._getLastUserMessageContent(threadId),
 			(id: string) => this.switchToThread(id)
 		);
 
-		// Advance the next pending tool call, if any.
-		// Sets it as tool_request, NOT starting LLM loop.
+		// Await the agent to ensure the approved tool fully completes (running_now → success)
+		// BEFORE advancing the pending queue. Without this, _advancePendingToolCall runs
+		// synchronously right after, adding a new tool_request while the previous tool
+		// is still executing. This causes findLatestToolRequestMessage to return the
+		// wrong (newer) tool_request, and user ends up approving the wrong tool.
+		await agentPromise;
+
+		// Now that the approved tool has completed, we can safely show the next one.
 		this._advancePendingToolCall(threadId);
 	}
 
-	rejectLatestToolRequest(threadId: string) {
+	rejectLatestToolRequest(threadId: string, toolCallId?: string) {
 		const thread = this.state.allThreads[threadId];
 		if (!thread) return;
 
-		const latestToolRequest = findLatestToolRequestMessage(thread.messages);
+		const latestToolRequest = findLatestToolRequestMessage(thread.messages, toolCallId);
 		if (!latestToolRequest) return;
 		const lastMsg = latestToolRequest.message;
 
@@ -656,7 +691,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 	}
 
-	skipLatestToolRequest(threadId: string) {
+	skipLatestToolRequest(threadId: string, toolCallId?: string) {
 		const thread = this.state.allThreads[threadId];
 		if (!thread) return;
 
@@ -665,12 +700,12 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 		// after Approve the tool becomes "running_now".
 		// In that case, "Skip" should behave like skipping a running tool.
-		if (trueLast?.role === 'tool' && trueLast.type === 'running_now') {
+		if (trueLast?.role === 'tool' && trueLast.type === 'running_now' && (toolCallId === undefined || trueLast.id === toolCallId)) {
 			this.skipRunningTool(threadId);
 			return;
 		}
 
-		const latestToolRequest = findLatestToolRequestMessage(messages);
+		const latestToolRequest = findLatestToolRequestMessage(messages, toolCallId);
 		if (!latestToolRequest) return;
 		const lastMsg = latestToolRequest.message;
 
@@ -797,18 +832,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		});
 
 		// ACP: do NOT fire permission decision here (permission already resolved).
-		// non-ACP: keep existing behavior (hidden user msg helps agent continue).
+		// non-ACP: existing behavior notifies the execution engine to continue.
 		if (!useAcp) {
-			this._addMessageToThread(threadId, {
-				role: 'user',
-				content: `Skip ${toolName}. Continue with next steps.`,
-				displayContent: '',
-				selections: [],
-				state: { stagingSelections: [], isBeingEdited: false },
-				hidden: true
-			});
-
-			// existing behavior (harmless if nobody listens)
 			this._onExternalToolDecision.fire({ threadId, toolCallId, decision: 'skipped' });
 		}
 
@@ -851,8 +876,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const newThreads = { ...this.state.allThreads };
 		delete newThreads[threadId];
 		this._removeThreadFromStorage(threadId);
-		// Clear pending tool calls to prevent leaks into the next thread.
-		(this._executionEngine as any)._pendingToolCallsByThread?.delete(threadId);
+		// Clear execution state to prevent leaks into the next thread.
+		this._executionEngine.clearThreadExecutionState(threadId);
 		this._setState({ ...this.state, allThreads: newThreads });
 	}
 
@@ -1014,7 +1039,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	dangerousSetState = (newState: ThreadsState) => { this.state = newState; this._onDidChangeCurrentThread.fire(); }
 	resetState = () => {
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string };
-		(this._executionEngine as any)._pendingToolCallsByThread?.clear();
+		this._executionEngine.clearAllExecutionState();
 		this.openNewThread();
 		this._onDidChangeCurrentThread.fire();
 	}
@@ -1077,6 +1102,15 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const next = pending.shift()!;
 		if (pending.length === 0) pendingMap.delete(threadId);
 
+		let params: unknown = next.rawParams;
+		if (isAToolName(next.name)) {
+			try {
+				params = this._toolsService.validateParams[next.name](next.rawParams);
+			} catch {
+				params = next.rawParams;
+			}
+		}
+
 		// Set the next tool call as tool_request, NOT starting LLM loop.
 		// chatThreadService._setStreamState keeps isRunning: 'awaiting_user'.
 		this._addMessageToThread(threadId, {
@@ -1085,7 +1119,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			content: '(Awaiting user permission...)',
 			result: null,
 			name: next.name as any,
-			params: next.rawParams as any,
+			params: params as any,
 			id: next.id,
 			rawParams: next.rawParams
 		});

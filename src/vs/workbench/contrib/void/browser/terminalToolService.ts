@@ -14,7 +14,6 @@ import { ITerminalService, ITerminalInstance, ICreateTerminalOptions } from '../
 import { MAX_TERMINAL_CHARS } from '../../../../platform/void/common/prompt/constants.js';
 import { TerminalResolveReason } from '../../../../platform/void/common/toolsServiceTypes.js';
 import { normalizeTerminalCommandOutput } from '../../../../platform/void/common/terminalToolOutput.js';
-import { timeout } from '../../../../base/common/async.js';
 import * as dom from '../../../../base/browser/dom.js';
 import { IVoidSettingsService } from '../../../../platform/void/common/voidSettingsService.js';
 import { defaultGlobalSettings } from '../../../../platform/void/common/voidSettingsTypes.js';
@@ -122,24 +121,29 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 	};
 
 	private async _waitForCommandDetectionCapability(terminal: ITerminalInstance) {
-		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection);
-		if (cmdCap) return cmdCap
+		const mounted = terminal.capabilities.get(TerminalCapability.CommandDetection);
+		if (mounted) return mounted
 
 		const disposables: IDisposable[] = []
-
-		const waitTimeout = timeout(10_000)
-		const waitForCapability = new Promise<ITerminalCapabilityImplMap[TerminalCapability.CommandDetection]>((res) => {
-			disposables.push(
-				terminal.capabilities.onDidAddCapability((e) => {
-					if (e.id === TerminalCapability.CommandDetection) res(e.capability)
-				})
-			)
+		let resolveCapability: (capability: ITerminalCapabilityImplMap[TerminalCapability.CommandDetection] | undefined) => void = () => { }
+		const capabilityPromise = new Promise<ITerminalCapabilityImplMap[TerminalCapability.CommandDetection] | undefined>(resolve => {
+			resolveCapability = resolve
 		})
 
-		const capability = await Promise.any([waitTimeout, waitForCapability])
-			.finally(() => { disposables.forEach((d) => d.dispose()) })
+		disposables.push(
+			terminal.capabilities.onDidAddCapability((e) => {
+				if (e.id === TerminalCapability.CommandDetection) resolveCapability(e.capability)
+			})
+		)
 
-		return capability ?? undefined
+		const capabilityTimeout = setTimeout(() => {
+			resolveCapability(terminal.capabilities.get(TerminalCapability.CommandDetection))
+		}, 10_000)
+
+		return capabilityPromise.finally(() => {
+			clearTimeout(capabilityTimeout)
+			disposables.forEach((d) => d.dispose())
+		})
 	}
 
 	runCommand: ITerminalToolService['runCommand'] = async (command, params) => {

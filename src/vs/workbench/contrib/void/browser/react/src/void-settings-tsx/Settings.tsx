@@ -2526,8 +2526,48 @@ export const Settings = () => {
 																			/>
 																		</div>
 																	</div>
-																																												<div className='flex items-center gap-x-2'>
-																												<span className='w-56'>Read File Chunk Lines</span>
+																																																																	<div className='flex items-center gap-x-2 mt-1'>
+																						<VoidSwitch
+																							size='xs'
+																							value={settingsState.globalSettings.terminalOutputSummarization ?? defaultGlobalSettings.terminalOutputSummarization}
+																							onChange={(newVal) => voidSettingsService.setGlobalSetting('terminalOutputSummarization', newVal)}
+																						/>
+																						<span className='text-void-fg-3 text-xs pointer-events-none'>
+																							Summarize terminal output
+																						</span>
+																					</div>
+																					<div className='flex items-center gap-x-2'>
+																						<span className='w-56'>Terminal Output Head Lines</span>
+																						<div className='w-20'>
+																							<VoidSimpleInputBox
+																								compact
+																								placeholder={String(defaultGlobalSettings.terminalOutputHeadLines)}
+																								value={String(settingsState.globalSettings.terminalOutputHeadLines ?? defaultGlobalSettings.terminalOutputHeadLines)}
+																								onChangeValue={(raw) => {
+																									const n = Number(raw)
+																									const safe = Number.isInteger(n) && n >= 0 ? n : 0
+																									voidSettingsService.setGlobalSetting('terminalOutputHeadLines', safe)
+																								}}
+																							/>
+																						</div>
+																					</div>
+																					<div className='flex items-center gap-x-2'>
+																						<span className='w-56'>Terminal Output Tail Lines</span>
+																						<div className='w-20'>
+																							<VoidSimpleInputBox
+																								compact
+																								placeholder={String(defaultGlobalSettings.terminalOutputTailLines)}
+																								value={String(settingsState.globalSettings.terminalOutputTailLines ?? defaultGlobalSettings.terminalOutputTailLines)}
+																								onChangeValue={(raw) => {
+																									const n = Number(raw)
+																									const safe = Number.isInteger(n) && n >= 0 ? n : 0
+																									voidSettingsService.setGlobalSetting('terminalOutputTailLines', safe)
+																								}}
+																							/>
+																						</div>
+																					</div>
+																					<div className='flex items-center gap-x-2'>
+																						<span className='w-56'>Read File Chunk Lines</span>
 																												<div className='w-20'>
 																													<VoidSimpleInputBox
 																														compact

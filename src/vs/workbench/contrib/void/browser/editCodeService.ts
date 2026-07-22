@@ -1399,11 +1399,13 @@ export class EditCodeService extends Disposable implements IEditCodeService {
 	}
 
 	weAreWriting = false
+	private _refreshRafScheduled = false
+	private _refreshPendingUris = new Set<string>()
 	private readonly _activeBulkAcceptRejectUris = new Set<string>()
 	private _writeURIText(uri: URI, text: string, range_: IRange | 'wholeFileRange', { shouldRealignDiffAreas, }: { shouldRealignDiffAreas: boolean, }) {
 		const { model } = this._voidModelService.getModel(uri)
 		if (!model) {
-			this._refreshStylesAndDiffsInURI(uri) // at the end of a write, we still expect to refresh all styles. e.g. sometimes we expect to restore all the decorations even if no edits were made when _writeText is used
+			this._refreshStylesAndDiffsInURIDebounced(uri)
 			return
 		}
 
@@ -1422,7 +1424,7 @@ export class EditCodeService extends Disposable implements IEditCodeService {
 		// heuristic check
 		const dontNeedToWrite = uriStr === text
 		if (dontNeedToWrite) {
-			this._refreshStylesAndDiffsInURI(uri) // at the end of a write, we still expect to refresh all styles. e.g. sometimes we expect to restore all the decorations even if no edits were made when _writeText is used
+			this._refreshStylesAndDiffsInURIDebounced(uri)
 			return
 		}
 
@@ -1430,7 +1432,7 @@ export class EditCodeService extends Disposable implements IEditCodeService {
 		model.applyEdits([{ range, text }])
 		this.weAreWriting = false
 
-		this._refreshStylesAndDiffsInURI(uri)
+		this._refreshStylesAndDiffsInURIDebounced(uri)
 	}
 
 
@@ -1700,21 +1702,38 @@ export class EditCodeService extends Disposable implements IEditCodeService {
 	}
 
 	private _refreshStylesAndDiffsInURI(uri: URI) {
+		this._refreshStylesAndDiffsInURISync(uri)
+	}
 
-		// 1. clear DiffArea styles and Diffs
+	private _refreshStylesAndDiffsInURISync(uri: URI) {
 		this._clearAllEffects(uri)
-
-		// 2. style DiffAreas (sweep, etc)
 		this._addDiffAreaStylesToURI(uri)
-
-		// 3. add Diffs
 		this._computeDiffsAndAddStylesToURI(uri)
-
-		// 4. refresh ctrlK zones
 		this._refreshCtrlKInputs(uri)
-
-		// 5. this is the only place where diffs are changed, so can fire here only
 		this._fireChangeDiffsIfNotStreaming(uri)
+	}
+
+	private _refreshStylesAndDiffsInURIDebounced(uri: URI) {
+		this._refreshPendingUris.add(uri.fsPath)
+		if (this._refreshRafScheduled) return
+		this._refreshRafScheduled = true
+		const g = globalThis as any
+		const schedule = () => {
+			this._refreshRafScheduled = false
+			const uris = Array.from(this._refreshPendingUris)
+			this._refreshPendingUris.clear()
+			for (const fsPath of uris) {
+				const uri = URI.file(fsPath)
+				this._refreshStylesAndDiffsInURISync(uri)
+			}
+		}
+		if (typeof g.requestIdleCallback === 'function') {
+			g.requestIdleCallback(schedule, { timeout: 100 })
+		} else if (typeof g.setTimeout === 'function') {
+			g.setTimeout(schedule, 16)
+		} else {
+			schedule()
+		}
 	}
 
 	// called first, then call startApplying
@@ -2084,6 +2103,7 @@ export class EditCodeService extends Disposable implements IEditCodeService {
 		}
 
 		this._writeURIText(uri, newContent, 'wholeFileRange', { shouldRealignDiffAreas: true })
+		this._refreshStylesAndDiffsInURISync(uri)
 		onDone()
 	}
 

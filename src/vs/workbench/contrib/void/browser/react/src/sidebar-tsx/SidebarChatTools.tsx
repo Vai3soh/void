@@ -26,6 +26,7 @@ import { RawToolCallObj } from '../../../../../../../platform/void/common/sendLL
 import { BlockCode } from '../util/inputs.js';
 import { MAX_FILE_CHARS_PAGE } from '../../../../../../../platform/void/common/prompt/constants.js';
 import { formatTerminalCommandLine, normalizeTerminalCommandOutput, normalizeTerminalCwdLabel } from '../../../../../../../platform/void/common/terminalToolOutput.js';
+import { getTerminalOutputSavedTokensLabel } from '../../../terminalOutputSavedTokens.js';
 
 const USER_CANCELED_TOOL_LABEL = 'User canceled tool';
 
@@ -472,53 +473,46 @@ export const ToolHeaderWrapper = ({
 	);
 };
 
-export const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolName }) => {
+export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolCallId }: { toolName: ToolName; threadId: string; toolCallId: string }) => {
 	const accessor = useAccessor();
 	const chatThreadsService = accessor.get('IChatThreadService');
 	const metricsService = accessor.get('IMetricsService');
 	const voidSettingsService = accessor.get('IVoidSettingsService');
 
-	const isAcp = !!voidSettingsService.state.globalSettings.useAcp;
-
 	const onAccept = useCallback(() => {
 		try {
-			const threadId = chatThreadsService.state.currentThreadId;
-			chatThreadsService.approveLatestToolRequest(threadId);
+			chatThreadsService.approveLatestToolRequest(threadId, toolCallId);
 			metricsService.capture('Tool Request Accepted', {});
 		} catch (e) {
 			console.error('Error while approving message in chat:', e);
 		}
-	}, [chatThreadsService, metricsService]);
+	}, [chatThreadsService, metricsService, threadId, toolCallId]);
 
 	const onReject = useCallback(() => {
 		try {
-			const threadId = chatThreadsService.state.currentThreadId;
-
 			// Mark tool as rejected. In ACP mode this fires onExternalToolDecision
 			// which resolves the permission request with reject_once - the ACP agent
 			// will skip this tool call and continue with the remaining ones in the
 			// same turn. We do NOT call abortRunning here, because that would cancel
 			// the entire ACP session and discard the remaining parallel tool calls.
-			chatThreadsService.rejectLatestToolRequest(threadId);
+			chatThreadsService.rejectLatestToolRequest(threadId, toolCallId);
 		} catch (e) {
 			console.error('Error while rejecting tool request:', e);
 		}
 		metricsService.capture('Tool Request Rejected', {});
-	}, [chatThreadsService, metricsService]);
+	}, [chatThreadsService, metricsService, threadId, toolCallId]);
 
 	const onSkip = useCallback(() => {
 		try {
-			const threadId = chatThreadsService.state.currentThreadId;
-
 			// Skip != Cancel:
 			// skip should mark tool as "skipped" (NOT "rejected"), so it won't show "User canceled tool".
 			// This works for both ACP and non-ACP.
-			chatThreadsService.skipLatestToolRequest(threadId);
+			chatThreadsService.skipLatestToolRequest(threadId, toolCallId);
 		} catch (e) {
 			console.error('Error while skipping tool request:', e);
 		}
 		metricsService.capture('Tool Request Skipped', {});
-	}, [chatThreadsService, metricsService]);
+	}, [chatThreadsService, metricsService, threadId, toolCallId]);
 
 	const [showSkipButton, setShowSkipButton] = useState(false);
 
@@ -582,11 +576,10 @@ export const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolNam
 	let alwaysRequireManualApproval = false;
 	if (approvalType === 'terminal' && toolName === 'run_command') {
 		try {
-			const threadId = chatThreadsService.state.currentThreadId;
 			const thread = chatThreadsService.state.allThreads[threadId];
-			const lastMsg = thread?.messages[thread.messages.length - 1];
-			if (lastMsg && lastMsg.role === 'tool' && lastMsg.type === 'tool_request' && lastMsg.name === toolName) {
-				const cmd = typeof (lastMsg.params as any)?.command === 'string' ? (lastMsg.params as any).command : undefined;
+			const toolMessage = thread?.messages.find((message): message is Extract<ToolMessage, { type: 'tool_request' }> => message.role === 'tool' && message.type === 'tool_request' && message.id === toolCallId);
+			if (toolMessage && toolMessage.name === toolName) {
+				const cmd = typeof toolMessage.params?.command === 'string' ? toolMessage.params.command : undefined;
 				if (cmd && isDangerousTerminalCommand(cmd)) {
 					alwaysRequireManualApproval = true;
 				}
@@ -617,8 +610,7 @@ export const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolNam
 				approvalType={approvalType}
 				desc='Auto-approve'
 				onApproveCurrent={() => {
-					const threadId = chatThreadsService.state.currentThreadId;
-					chatThreadsService.approveLatestToolRequest(threadId);
+					chatThreadsService.approveLatestToolRequest(threadId, toolCallId);
 					metricsService.capture('Tool Request Accepted', {});
 				}}
 			/>
@@ -630,8 +622,7 @@ export const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolNam
 				onChange={(newVal) => {
 					voidSettingsService.setGlobalSetting('mcpAutoApprove', newVal);
 					if (newVal) {
-						const threadId = chatThreadsService.state.currentThreadId;
-						chatThreadsService.approveLatestToolRequest(threadId);
+						chatThreadsService.approveLatestToolRequest(threadId, toolCallId);
 						metricsService.capture('Tool Request Accepted', {});
 					}
 				}}
@@ -1093,6 +1084,7 @@ export const CommandTool = ({ toolMessage, threadId }: { threadId: string; toolM
 
 	if (toolMessage.type === 'success') {
 		const { result } = toolMessage;
+		const savedTokensLabel = getTerminalOutputSavedTokensLabel(toolMessage.content);
 
 		let msg: string =
 			toolMessage.displayContent
@@ -1108,7 +1100,14 @@ export const CommandTool = ({ toolMessage, threadId }: { threadId: string; toolM
 			</ToolChildrenWrapper>
 		);
 
-		componentParams.bottomChildren = commandBlock;
+		componentParams.bottomChildren = (
+			<>
+				{commandBlock}
+				{savedTokensLabel !== null && (
+					<div className="px-2 pt-1 pb-0 text-xs text-void-fg-4">{savedTokensLabel}</div>
+				)}
+			</>
+		);
 		return <ToolHeaderWrapper {...componentParams} />;
 	}
 

@@ -121,12 +121,28 @@ export const _registerServices = (accessor: ServicesAccessor) => {
 		})
 	)
 
-	// same service, different state
 	chatThreadsStreamState = chatThreadsStateService.streamState
+	const pendingStreamUpdates = new Set<string>()
+	let rafScheduled = false
+	const flushStreamUpdates = () => {
+		rafScheduled = false
+		if (pendingStreamUpdates.size === 0) return
+		chatThreadsStreamState = chatThreadsStateService.streamState
+		const updates = Array.from(pendingStreamUpdates)
+		pendingStreamUpdates.clear()
+		chatThreadsStreamStateListeners.forEach(l => {
+			for (const threadId of updates) {
+				l(threadId)
+			}
+		})
+	}
 	disposables.push(
 		chatThreadsStateService.onDidChangeStreamState(({ threadId }) => {
-			chatThreadsStreamState = chatThreadsStateService.streamState
-			chatThreadsStreamStateListeners.forEach(l => l(threadId))
+			pendingStreamUpdates.add(threadId)
+			if (!rafScheduled) {
+				rafScheduled = true
+				requestAnimationFrame(flushStreamUpdates)
+			}
 		})
 	)
 

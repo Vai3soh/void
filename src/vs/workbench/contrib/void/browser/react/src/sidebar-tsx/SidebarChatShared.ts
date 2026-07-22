@@ -9,23 +9,36 @@ import { ChatMessage } from '../../../../../../../platform/void/common/chatThrea
 export type AccessorLike = { get: (serviceId: string) => any };
 
 export const getRelative = (uri: URI, accessor: AccessorLike) => {
-	const workspaceContextService = accessor.get('IWorkspaceContextService');
-	let path: string = '';
+	try {
+		if (!uri || typeof uri.fsPath !== 'string') return undefined;
+		if (!uri.scheme || !uri.path) {
+			return uri.fsPath || undefined;
+		}
 
-	const isInside = workspaceContextService.isInsideWorkspace(uri);
-	if (isInside) {
-		const f = workspaceContextService
-			.getWorkspace()
-			.folders.find((f: any) => uri.fsPath?.startsWith(f.uri.fsPath));
-		if (f) {
-			path = uri.fsPath?.replace(f.uri.fsPath, '') || '';
+		const workspaceContextService = accessor.get('IWorkspaceContextService');
+		let path: string = '';
+
+		const isInside = workspaceContextService.isInsideWorkspace(uri);
+		if (isInside) {
+			const f = workspaceContextService
+				.getWorkspace()
+				.folders.find((f: any) => uri.fsPath?.startsWith(f.uri.fsPath));
+			if (f) {
+				path = uri.fsPath?.replace(f.uri.fsPath, '') || '';
+			} else {
+				path = uri.fsPath || '';
+			}
 		} else {
 			path = uri.fsPath || '';
 		}
-	} else {
-		path = uri.fsPath || '';
+		return path || undefined;
+	} catch (e) {
+		try {
+			return (typeof uri?.fsPath === 'string' ? uri.fsPath : undefined) ?? undefined;
+		} catch {
+			return undefined;
+		}
 	}
-	return path || undefined;
 };
 
 export const getFolderName = (pathStr: string | undefined) => {
@@ -62,7 +75,7 @@ export const getChatMessageMarkdown = (chatMessage: ChatMessage): string => {
 export const getAssistantTurnInfo = (messages: ChatMessage[], idx: number) => {
 	if (!Array.isArray(messages) || idx < 0 || idx >= messages.length) return undefined;
 
-	
+
 	let prevUserIdx = -1;
 	for (let i = idx; i >= 0; i--) {
 		if (messages[i]?.role === 'user') {
@@ -71,7 +84,7 @@ export const getAssistantTurnInfo = (messages: ChatMessage[], idx: number) => {
 		}
 	}
 
-	
+
 	let nextUserIdx = messages.length;
 	for (let i = idx + 1; i < messages.length; i++) {
 		if (messages[i]?.role === 'user') {
@@ -80,14 +93,14 @@ export const getAssistantTurnInfo = (messages: ChatMessage[], idx: number) => {
 		}
 	}
 
-	const start = prevUserIdx + 1; 
+	const start = prevUserIdx + 1;
 	const end = nextUserIdx; // end exclusive
 
-	
+
 	const containsAssistant = messages.slice(start, end).some(m => m?.role === 'assistant');
 	if (!containsAssistant) return undefined;
 
-	
+
 	let lastNonCheckpointIdx = -1;
 	for (let i = end - 1; i >= start; i--) {
 		if (messages[i]?.role !== 'checkpoint') {

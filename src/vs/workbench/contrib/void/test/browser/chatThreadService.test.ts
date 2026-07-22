@@ -5,8 +5,9 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
-import type { ChatMessage } from '../../../../../platform/void/common/chatThreadServiceTypes.js';
+import type { ChatMessage, ToolMessage } from '../../../../../platform/void/common/chatThreadServiceTypes.js';
 import type { ModelSelection, ModelSelectionOptions } from '../../../../../platform/void/common/voidSettingsTypes.js';
+import type { RawToolCallObj, RawToolParamsObj } from '../../../../../platform/void/common/sendLLMMessageTypes.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { NullLogService } from '../../../../../platform/log/common/log.js';
 import {
@@ -46,7 +47,11 @@ type ChatThreadServiceHarness = {
 	_threadAccess?: unknown;
 	_settingsService: unknown;
 	_notificationManager?: { wrapRunAgentToNotify(promise: Promise<unknown>): void };
-	_executionEngine?: { runChatAgent(opts?: { callThisToolFirst?: { id: string } }): Promise<void> };
+	_executionEngine?: {
+		runChatAgent(opts?: { callThisToolFirst?: { id: string } }): Promise<void>;
+		_pendingToolCallsByThread?: Map<string, RawToolCallObj[]>;
+	};
+	_toolsService?: { validateParams: { edit_file(params: RawToolParamsObj): { uri: URI } & Record<string, unknown> } };
 	_onExternalToolDecision: { fire(event: ToolDecision): void };
 	_updateLatestTool(threadId: string, tool: ChatMessage): void;
 	_setStreamState(threadId: string, state: unknown): void;
@@ -54,9 +59,9 @@ type ChatThreadServiceHarness = {
 	_currentModelSelectionProps(): Record<string, unknown>;
 	_getLastUserMessageContent(threadId: string): string;
 	switchToThread(threadId: string): void;
-	rejectLatestToolRequest(threadId: string): void;
-	skipLatestToolRequest(threadId: string): void;
-	approveLatestToolRequest(threadId: string): void;
+	rejectLatestToolRequest(threadId: string, toolCallId?: string): void;
+	skipLatestToolRequest(threadId: string, toolCallId?: string): void;
+	approveLatestToolRequest(threadId: string, toolCallId?: string): void;
 };
 
 /**
@@ -311,13 +316,17 @@ suite('ChatThreadService - latest tool request lookup', () => {
 		];
 
 		const latestToolRequest = chatThreadServiceTest.findLatestToolRequestMessage(messages);
+		const firstToolRequest = chatThreadServiceTest.findLatestToolRequestMessage(messages, 'tool-a');
 
 		assert.ok(latestToolRequest);
 		assert.strictEqual(latestToolRequest.index, 1);
 		assert.strictEqual(latestToolRequest.message.id, 'tool-b');
+		assert.ok(firstToolRequest);
+		assert.strictEqual(firstToolRequest.index, 0);
+		assert.strictEqual(firstToolRequest.message.id, 'tool-a');
 	});
 
-	test('rejectLatestToolRequest rejects the pending request, not the trailing skipped result', () => {
+	test('rejectLatestToolRequest rejects the explicitly selected parallel request', () => {
 		const threadId = 'thread-reject-latest-request';
 		const messages: ChatMessage[] = [
 			{
@@ -332,14 +341,13 @@ suite('ChatThreadService - latest tool request lookup', () => {
 			},
 			{
 				role: 'tool',
-				type: 'tool_error',
-				content: 'skipped',
-				displayContent: 'skipped',
-				result: 'skipped',
-				name: 'read_file',
-				params: { uri: 'b.ts' },
+				type: 'tool_request',
+				content: '(Awaiting user permission...)',
+				result: null,
+				name: 'run_command',
+				params: { command: 'echo b' },
 				id: 'tool-b',
-				rawParams: { uri: 'b.ts' },
+				rawParams: { command: 'echo b' },
 			},
 		];
 		const decisions: ToolDecision[] = [];
@@ -374,11 +382,74 @@ suite('ChatThreadService - latest tool request lookup', () => {
 		};
 		service._setStreamState = (tid: string, state: unknown) => { service.streamState[tid] = state as any; };
 
-		service.rejectLatestToolRequest(threadId);
+		service.rejectLatestToolRequest(threadId, 'tool-a');
 
 		assert.strictEqual((service.state.allThreads[threadId]!.messages[0] as any).type, 'rejected');
-		assert.strictEqual((service.state.allThreads[threadId]!.messages[1] as any).type, 'tool_error');
+		assert.strictEqual((service.state.allThreads[threadId]!.messages[1] as any).type, 'tool_request');
 		assert.deepStrictEqual(decisions, [{ threadId, toolCallId: 'tool-a', decision: 'rejected' }]);
+	});
+
+	test('skipLatestToolRequest skips the explicitly selected parallel request', () => {
+		const threadId = 'thread-skip-targeted-request';
+		const messages: ChatMessage[] = [
+			{
+				role: 'tool',
+				type: 'tool_request',
+				content: '(Awaiting user permission...)',
+				result: null,
+				name: 'run_command',
+				params: { command: 'echo a' },
+				id: 'tool-a',
+				rawParams: { command: 'echo a' },
+			},
+			{
+				role: 'tool',
+				type: 'tool_request',
+				content: '(Awaiting user permission...)',
+				result: null,
+				name: 'run_command',
+				params: { command: 'echo b' },
+				id: 'tool-b',
+				rawParams: { command: 'echo b' },
+			},
+		];
+		const decisions: ToolDecision[] = [];
+		const service = Object.create(ChatThreadService.prototype) as ChatThreadServiceHarness;
+		service.state = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages,
+					state: {
+						currCheckpointIdx: null,
+						stagingSelections: [],
+						focusedMessageIdx: undefined,
+						linksOfMessageIdx: {},
+					},
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		service.streamState = {};
+		service._settingsService = { state: { globalSettings: { useAcp: true } } };
+		service._onExternalToolDecision = { fire: event => decisions.push(event) };
+		service._updateLatestTool = (tid: string, tool: ChatMessage) => {
+			const thread = service.state.allThreads[tid];
+			assert.ok(thread);
+			const idx = thread.messages.findIndex(message => message.role === 'tool' && message.id === (tool as ToolMessage).id);
+			assert.notStrictEqual(idx, -1);
+			thread.messages[idx] = tool;
+		};
+		service._setStreamState = (tid: string, state: unknown) => { service.streamState[tid] = state as ThreadStreamState[string]; };
+
+		service.skipLatestToolRequest(threadId, 'tool-a');
+
+		assert.strictEqual((messages[0] as ToolMessage).type, 'skipped');
+		assert.strictEqual((messages[1] as ToolMessage).type, 'tool_request');
+		assert.deepStrictEqual(decisions, [{ threadId, toolCallId: 'tool-a', decision: 'skipped' }]);
 	});
 
 	test('skipLatestToolRequest skips the pending request, not the trailing skipped result', () => {
@@ -457,8 +528,8 @@ suite('ChatThreadService - latest tool request lookup', () => {
 		assert.strictEqual(resumed, true);
 	});
 
-	test('approveLatestToolRequest resumes the pending request behind trailing skipped results', () => {
-		const threadId = 'thread-approve-latest-request';
+	test('approveLatestToolRequest targets the requested parallel tool call', () => {
+		const threadId = 'thread-approve-targeted-request';
 		const messages: ChatMessage[] = [
 			{
 				role: 'tool',
@@ -472,14 +543,13 @@ suite('ChatThreadService - latest tool request lookup', () => {
 			},
 			{
 				role: 'tool',
-				type: 'tool_error',
-				content: 'skipped',
-				displayContent: 'skipped',
-				result: 'skipped',
-				name: 'read_file',
-				params: { uri: 'b.ts' },
+				type: 'tool_request',
+				content: '(Awaiting user permission...)',
+				result: null,
+				name: 'run_command',
+				params: { command: 'echo b' },
 				id: 'tool-b',
-				rawParams: { uri: 'b.ts' },
+				rawParams: { command: 'echo b' },
 			},
 		];
 		const decisions: ToolDecision[] = [];
@@ -513,10 +583,83 @@ suite('ChatThreadService - latest tool request lookup', () => {
 		service._getLastUserMessageContent = () => '';
 		service.switchToThread = () => { };
 
-		service.approveLatestToolRequest(threadId);
+		service.approveLatestToolRequest(threadId, 'tool-a');
 
 		assert.strictEqual(approvedToolId, 'tool-a');
+		const untouchedMessage = messages[1];
+		assert.ok(untouchedMessage);
+		assert.strictEqual(untouchedMessage.role, 'tool');
+		if (untouchedMessage.role !== 'tool') return;
+		assert.strictEqual(untouchedMessage.type, 'tool_request');
 		assert.deepStrictEqual(decisions, [{ threadId, toolCallId: 'tool-a', decision: 'approved' }]);
+	});
+
+	test('non-ACP pending edit_file keeps validated URI when advanced for approval', () => {
+		const threadId = 'thread-pending-edit-file';
+		const rawParams = {
+			uri: './config.toml',
+			original_snippet: 'requestBodyLimit = "50mb"',
+			updated_snippet: 'requestBodyLimit = "60mb"',
+		};
+		const validatedUri = URI.file('/workspace/config.toml');
+		const messages: ChatMessage[] = [];
+		const pendingToolCallsByThread = new Map([
+			[threadId, [{
+				id: 'tool-edit-config',
+				name: 'edit_file',
+				rawParams,
+				isDone: true,
+				doneParams: [],
+			}]],
+		]);
+		const service = Object.create(ChatThreadService.prototype) as ChatThreadServiceHarness;
+		service.state = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages,
+					state: {
+						currCheckpointIdx: null,
+						stagingSelections: [],
+						focusedMessageIdx: undefined,
+						linksOfMessageIdx: {},
+					},
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		service._settingsService = { state: { globalSettings: { useAcp: false } } };
+		service._executionEngine = {
+			runChatAgent: async () => { },
+			_pendingToolCallsByThread: pendingToolCallsByThread,
+		};
+		service._toolsService = {
+			validateParams: {
+				edit_file: () => ({
+					uri: validatedUri,
+					originalSnippet: rawParams.original_snippet,
+					updatedSnippet: rawParams.updated_snippet,
+					occurrence: null,
+					replaceAll: false,
+					locationHint: null,
+					encoding: null,
+					newline: null,
+				}),
+			},
+		};
+		service._addMessageToThread = (_tid: string, message: ChatMessage) => messages.push(message);
+
+		(service as any)._advancePendingToolCall(threadId);
+
+		assert.strictEqual(messages.length, 1);
+		const request = messages[0] as any;
+		assert.strictEqual(request.type, 'tool_request');
+		assert.strictEqual(request.params.uri, validatedUri);
+		assert.strictEqual(request.rawParams.uri, './config.toml');
+		assert.strictEqual(pendingToolCallsByThread.has(threadId), false);
 	});
 });
 
@@ -682,6 +825,264 @@ suite('ChatThreadService - terminal auto-approve overrides for dangerous command
 		await runPromise;
 
 		assert.deepStrictEqual(observedStarted.sort(), ['a.ts', 'b.ts']);
+	});
+
+	test('Stop interrupts every parallel tool and records one result per tool call', async () => {
+		const threadId = 'thread-stop-parallel-tools';
+		const threadsState: ThreadsState = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages: [],
+					state: {
+						currCheckpointIdx: null,
+						stagingSelections: [],
+						focusedMessageIdx: undefined,
+						linksOfMessageIdx: {},
+					},
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		const started: string[] = [];
+		const interrupted: string[] = [];
+		let resolveBothStarted!: () => void;
+		const bothStarted = new Promise<void>(resolve => { resolveBothStarted = resolve; });
+		const pendingResolvers = new Map<string, () => void>();
+		const _settingsService: any = {
+			state: {
+				globalSettings: {
+					chatMode: 'normal',
+					mcpAutoApprove: false,
+					useAcp: false,
+					autoApprove: {},
+					disabledToolNames: [],
+				},
+			},
+		};
+		const _toolsService: any = {
+			validateParams: {
+				read_file: (params: any) => params,
+			},
+			callTool: {
+				read_file: async (params: any) => {
+					const uri = String(params.uri);
+					started.push(uri);
+					if (started.length === 2) resolveBothStarted();
+					const result = new Promise<{ contents: string }>(resolve => {
+						pendingResolvers.set(uri, () => resolve({ contents: uri }));
+					});
+					return {
+						result,
+						interruptTool: () => {
+							interrupted.push(uri);
+							pendingResolvers.get(uri)?.();
+						},
+					};
+				},
+			},
+			stringOfResult: {
+				read_file: (_params: any, result: any) => String(result.contents),
+			},
+		};
+		const engine = new ChatExecutionEngine(
+			{ abort: () => { }, sendLLMMessage: () => null } as any,
+			_toolsService,
+			_settingsService,
+			{} as any,
+			{} as any,
+			{ capture: () => { } } as any,
+			{} as any,
+			{} as any,
+			{} as any,
+			toolOutputStub,
+		);
+		const threadAccess = makeThreadAccess(threadsState, {}, []);
+		const runReturnedToolCalls = pickMethod(engine as any, ['_runReturnedToolCalls']);
+		const toolCalls = [
+			{ id: 'read-a', name: 'read_file', rawParams: { uri: 'a.ts' }, isDone: true, doneParams: ['uri'] } as RawToolCallObj,
+			{ id: 'read-b', name: 'read_file', rawParams: { uri: 'b.ts' }, isDone: true, doneParams: ['uri'] } as RawToolCallObj,
+		];
+
+		const runPromise = Promise.resolve(runReturnedToolCalls(threadId, toolCalls, { registerToolCall: () => ({ isLoop: false }) } as any, threadAccess));
+		await bothStarted;
+		engine.stopThread(threadId);
+		await runPromise;
+
+		assert.deepStrictEqual(interrupted.sort(), ['a.ts', 'b.ts']);
+		const resultsById = threadsState.allThreads[threadId]!.messages
+			.filter((message): message is ToolMessage => message.role === 'tool')
+			.reduce((counts, message) => counts.set(message.id, (counts.get(message.id) ?? 0) + 1), new Map<string, number>());
+		assert.strictEqual(resultsById.get('read-a'), 1);
+		assert.strictEqual(resultsById.get('read-b'), 1);
+		assert.ok(threadsState.allThreads[threadId]!.messages.every(message => message.role !== 'user' || !message.hidden));
+	});
+
+	test('non-ACP returned read-only terminal tool calls start concurrently', async () => {
+		const threadId = 'thread-parallel-read-only-terminal';
+		const threadsState: ThreadsState = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages: [],
+					state: {
+						currCheckpointIdx: null,
+						stagingSelections: [],
+						focusedMessageIdx: undefined,
+						linksOfMessageIdx: {},
+					},
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		const started: string[] = [];
+		let releaseCommands!: () => void;
+		let resolveBothStarted!: () => void;
+		const commandGate = new Promise<void>(resolve => { releaseCommands = resolve; });
+		const bothStarted = new Promise<void>(resolve => { resolveBothStarted = resolve; });
+
+		const _settingsService: any = {
+			state: {
+				globalSettings: {
+					chatMode: 'normal',
+					mcpAutoApprove: false,
+					useAcp: false,
+					autoApprove: { terminal: true },
+					disabledToolNames: [],
+				},
+			},
+		};
+		const _toolsService: any = {
+			validateParams: {
+				run_command: (p: any) => p,
+			},
+			callTool: {
+				run_command: async (params: any) => {
+					started.push(String(params.command));
+					if (started.length === 2) resolveBothStarted();
+					await commandGate;
+					return { result: { result: String(params.command) } };
+				},
+			},
+			stringOfResult: {
+				run_command: (_params: any, result: any) => String(result.result),
+			},
+		};
+		const engine = new ChatExecutionEngine(
+			{ abort: () => { }, sendLLMMessage: () => null } as any,
+			_toolsService,
+			_settingsService,
+			{} as any,
+			{} as any,
+			{ capture: () => { } } as any,
+			{} as any,
+			{} as any,
+			{} as any,
+			toolOutputStub,
+		);
+		(engine as any).toolErrMsgs = toolErrMsgs;
+		const streamState: ThreadStreamState = {};
+		const threadAccess = makeThreadAccess(threadsState, streamState, []);
+		const runReturnedToolCalls = pickMethod(engine as any, ['_runReturnedToolCalls']);
+
+		const runPromise = Promise.resolve(runReturnedToolCalls(threadId, [
+			{ id: 'terminal-a', name: 'run_command', rawParams: { command: 'git status --short' }, isDone: true, doneParams: ['command'] } as any,
+			{ id: 'terminal-b', name: 'run_command', rawParams: { command: 'openspec list --json' }, isDone: true, doneParams: ['command'] } as any,
+		], { registerToolCall: () => ({ isLoop: false }) } as any, threadAccess));
+		const observedStarted = await Promise.race([
+			bothStarted.then(() => started.slice()),
+			new Promise<string[]>(resolve => setTimeout(() => resolve(started.slice()), 25)),
+		]);
+		releaseCommands();
+		await runPromise;
+
+		assert.deepStrictEqual(observedStarted.sort(), ['git status --short', 'openspec list --json']);
+	});
+
+	test('non-ACP unrecognized terminal tool serializes parallel calls', async () => {
+		const threadId = 'thread-serialized-terminal';
+		const threadsState: ThreadsState = {
+			allThreads: {
+				[threadId]: {
+					id: threadId,
+					createdAt: new Date().toISOString(),
+					lastModified: new Date().toISOString(),
+					messages: [],
+					state: {
+						currCheckpointIdx: null,
+						stagingSelections: [],
+						focusedMessageIdx: undefined,
+						linksOfMessageIdx: {},
+					},
+					filesWithUserChanges: new Set(),
+				},
+			},
+			currentThreadId: threadId,
+		};
+		const events: string[] = [];
+		const _settingsService: any = {
+			state: {
+				globalSettings: {
+					chatMode: 'normal',
+					mcpAutoApprove: false,
+					useAcp: false,
+					autoApprove: { terminal: true },
+					disabledToolNames: [],
+				},
+			},
+		};
+		const _toolsService: any = {
+			validateParams: {
+				run_command: (p: any) => p,
+			},
+			callTool: {
+				run_command: async (params: any) => {
+					events.push(`start:${params.command}`);
+					await new Promise(resolve => setTimeout(resolve, 5));
+					events.push(`end:${params.command}`);
+					return { result: { result: String(params.command) } };
+				},
+			},
+			stringOfResult: {
+				run_command: (_params: any, result: any) => String(result.result),
+			},
+		};
+		const engine = new ChatExecutionEngine(
+			{ abort: () => { }, sendLLMMessage: () => null } as any,
+			_toolsService,
+			_settingsService,
+			{} as any,
+			{} as any,
+			{ capture: () => { } } as any,
+			{} as any,
+			{} as any,
+			{} as any,
+			toolOutputStub,
+		);
+		(engine as any).toolErrMsgs = toolErrMsgs;
+		const threadAccess = makeThreadAccess(threadsState, {}, []);
+		const runReturnedToolCalls = pickMethod(engine as any, ['_runReturnedToolCalls']);
+
+		await Promise.resolve(runReturnedToolCalls(threadId, [
+			{ id: 'terminal-a', name: 'run_command', rawParams: { command: 'git status --short' }, isDone: true, doneParams: ['command'] } as any,
+			{ id: 'terminal-b', name: 'run_command', rawParams: { command: 'npm test' }, isDone: true, doneParams: ['command'] } as any,
+			{ id: 'terminal-c', name: 'run_command', rawParams: { command: 'openspec list --json' }, isDone: true, doneParams: ['command'] } as any,
+		], { registerToolCall: () => ({ isLoop: false }) } as any, threadAccess));
+
+		assert.deepStrictEqual(events, [
+			'start:git status --short',
+			'end:git status --short',
+			'start:npm test',
+			'end:npm test',
+			'start:openspec list --json',
+			'end:openspec list --json',
+		]);
 	});
 
 	test('non-ACP mutating tool waits for pending read-only batch', async () => {

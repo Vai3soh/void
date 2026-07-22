@@ -7,6 +7,7 @@
 import assert from 'assert';
 import { URI } from '../../../../../base/common/uri.js';
 import { VSBuffer } from '../../../../../base/common/buffer.js';
+import { Event } from '../../../../../base/common/event.js';
 // eslint-disable-next-line local/code-import-patterns
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { ChatToolOutputManager } from '../ChatToolOutputManager.js';
@@ -14,6 +15,9 @@ import { ChatToolOutputManager } from '../ChatToolOutputManager.js';
 import { stableToolOutputsRelPath } from '../../../../../platform/void/common/toolOutputFileNames.js';
 import { normalizeTerminalCommandOutput } from '../../../../../platform/void/common/terminalToolOutput.js';
 import { computeTruncatedToolOutput } from '../../../../../platform/void/common/toolOutputTruncation.js';
+import { defaultGlobalSettings } from '../../../../../platform/void/common/voidSettingsTypes.js';
+import { type IVoidSettingsService, type VoidSettingsState } from '../../../../../platform/void/common/voidSettingsService.js';
+import { getTerminalOutputSavedTokens } from '../terminalOutputSavedTokens.js';
 
 suite('ChatToolOutputManager TRUNCATION_META consistency', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -40,7 +44,14 @@ suite('ChatToolOutputManager TRUNCATION_META consistency', () => {
 		].join('\n');
 	}
 
-	function makeServices(maxToolOutputLength: number) {
+	function makeServices(
+		maxToolOutputLength: number,
+		terminalOutputSettings: {
+			terminalOutputSummarization?: boolean;
+			terminalOutputHeadLines?: number;
+			terminalOutputTailLines?: number;
+		} = {}
+	) {
 		const files = new Map<string, string>();
 		const dirs = new Set<string>();
 		let writeCount = 0;
@@ -86,8 +97,42 @@ suite('ChatToolOutputManager TRUNCATION_META consistency', () => {
 			}
 		};
 
-		const settingsService: any = {
-			state: { globalSettings: { maxToolOutputLength } }
+		const settingsState: VoidSettingsState = {
+			settingsOfProvider: {},
+			modelSelectionOfFeature: { 'Chat': null, 'Ctrl+K': null, 'Autocomplete': null, 'Apply': null, 'SCM': null },
+			optionsOfModelSelection: { 'Chat': {}, 'Ctrl+K': {}, 'Autocomplete': {}, 'Apply': {}, 'SCM': {} },
+			overridesOfModel: {},
+			globalSettings: {
+				...defaultGlobalSettings,
+				maxToolOutputLength,
+				terminalOutputSummarization: false,
+				...terminalOutputSettings,
+			},
+			customProviders: {},
+			mcpUserStateOfName: {},
+			_modelOptions: [],
+		};
+		const settingsService: IVoidSettingsService = {
+			_serviceBrand: undefined,
+			state: settingsState,
+			waitForInitState: Promise.resolve(),
+			onDidChangeState: Event.None,
+			setSettingOfProvider: async () => { },
+			setModelSelectionOfFeature: async () => { },
+			setOptionsOfModelSelection: () => { },
+			setGlobalSetting: () => { },
+			setOverridesOfModel: async () => { },
+			dangerousSetState: async () => { },
+			resetState: async () => { },
+			setAutodetectedModels: () => { },
+			toggleModelHidden: () => { },
+			addModel: () => { },
+			deleteModel: () => false,
+			setCustomProviderSettings: async () => { },
+			addMCPUserStateOfNames: async () => { },
+			removeMCPUserStateOfNames: async () => { },
+			setMCPServerState: async () => { },
+			setToolDisabled: async () => { },
 		};
 
 		return { fileService, workspaceService, settingsService };
@@ -271,6 +316,283 @@ suite('ChatToolOutputManager TRUNCATION_META consistency', () => {
 	// -------------------------
 	// External agent-style (no footer, UI truncates & saves)
 	// -------------------------
+
+	function makeLargeTerminalOutput(suffix = 'exit status 0'): string {
+		const noise = Array.from({ length: 1800 }, (_, i) => {
+			const withinGroup = 'a'.repeat((i % 50) + 1);
+			const group = 'b'.repeat(Math.floor(i / 50) + 1);
+			return `noise-${withinGroup}-${group}-${'X'.repeat(70)}`;
+		});
+		return ['$ build', 'HEAD_SENTINEL', ...noise, 'TAIL_SENTINEL', suffix].join('\n');
+	}
+
+	test('terminal summarizer: summarizes 100k output, emits extended meta, and saves raw output', async () => {
+		const maxToolOutputLength = 4000;
+		const { fileService, workspaceService, settingsService } = makeServices(maxToolOutputLength, {
+			terminalOutputSummarization: true,
+			terminalOutputHeadLines: 3,
+			terminalOutputTailLines: 3,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+		const full = makeLargeTerminalOutput();
+
+		assert.ok(full.length > 100_000, 'sanity: fixture should exceed 100k characters');
+
+		const out = await mgr.processToolResult({ output: full, exitCode: 0 }, 'run_command');
+		const meta = parseMeta(out.content);
+
+		assert.ok(out.content.includes('$ build'));
+		assert.ok(out.content.includes('HEAD_SENTINEL'));
+		assert.ok(out.content.includes('TAIL_SENTINEL'));
+		assert.ok(out.content.includes('[... 1798 lines omitted ...]'));
+		assert.strictEqual(meta.summarizer, true);
+		assert.strictEqual(meta.originalLength, full.length);
+		assert.strictEqual(meta.originalLineCount, full.split('\n').length);
+		assert.strictEqual(meta.linesOmitted, 1798);
+		assert.strictEqual(typeof meta.logFilePath, 'string');
+		assert.strictEqual(out.displayContent, out.content);
+
+		const fileUri = toolOutputFileUri(meta.logFilePath);
+		assert.strictEqual(fileService.__debug.readFileString(fileUri), full);
+	});
+
+	test('terminal summarizer off: preserves prefix truncation and legacy footer', async () => {
+		const maxToolOutputLength = 1200;
+		const { fileService, workspaceService, settingsService } = makeServices(maxToolOutputLength, {
+			terminalOutputSummarization: false,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+		const full = makeLargeTerminalOutput();
+
+		const out = await mgr.processToolResult({ output: full, exitCode: 0 }, 'run_command');
+		const meta = parseMeta(out.content);
+
+		assert.ok(out.content.startsWith(`${full.slice(0, maxToolOutputLength)}...`));
+		assert.strictEqual(meta.summarizer, undefined);
+		assert.strictEqual(meta.linesOmitted, undefined);
+		assert.strictEqual(meta.originalLength, full.length);
+		assert.strictEqual(fileService.__debug.readFileString(toolOutputFileUri(meta.logFilePath)), full);
+	});
+
+	test('terminal summarizer: leaves short run_command output unchanged with UI equal to model content', async () => {
+		const { fileService, workspaceService, settingsService } = makeServices(4000, {
+			terminalOutputSummarization: true,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+		const full = '$ echo ready\nready\nexit status 0';
+
+		const out = await mgr.processToolResult({ output: full, exitCode: 0 }, 'run_command');
+
+		assert.strictEqual(out.content, full);
+		assert.strictEqual(out.displayContent, out.content);
+		assert.strictEqual(fileService.__debug.writeCount(), 0);
+	});
+
+	test('terminal summarizer: does not handle read_file output', async () => {
+		const maxToolOutputLength = 500;
+		const { fileService, workspaceService, settingsService } = makeServices(maxToolOutputLength, {
+			terminalOutputSummarization: true,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+		const full = makeLargeTerminalOutput();
+
+		const out = await mgr.processToolResult({
+			uri: { fsPath: '/abs/path/file.ts' },
+			startLine: 1,
+			totalNumLines: full.split('\n').length,
+			fileContents: full,
+		}, 'read_file');
+		const meta = parseMeta(out.content);
+
+		assert.strictEqual(meta.tool, 'read_file');
+		assert.strictEqual(meta.summarizer, undefined);
+		assert.ok(out.content.startsWith(full.slice(0, maxToolOutputLength)));
+		assert.strictEqual(fileService.__debug.writeCount(), 0);
+	});
+
+	test('terminal summarizer: recognizes its footer and does not summarize twice', async () => {
+		const { fileService, workspaceService, settingsService } = makeServices(4000, {
+			terminalOutputSummarization: true,
+			terminalOutputHeadLines: 3,
+			terminalOutputTailLines: 3,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+		const first = await mgr.processToolResult({ output: makeLargeTerminalOutput(), exitCode: 0 }, 'run_command');
+		const writesAfterFirstCall = fileService.__debug.writeCount();
+
+		const second = await mgr.processToolResult(first.content, 'run_command');
+
+		assert.strictEqual(second.content, first.content);
+		assert.strictEqual(second.displayContent, first.displayContent);
+		assert.strictEqual((second.content.match(/\[VOID\] TOOL OUTPUT TRUNCATED/g) ?? []).length, 1);
+		assert.strictEqual(fileService.__debug.writeCount(), writesAfterFirstCall);
+	});
+
+	test('terminal summarizer: run_command summarized display content equals model content', async () => {
+		const { fileService, workspaceService, settingsService } = makeServices(2000, {
+			terminalOutputSummarization: true,
+			terminalOutputHeadLines: 2,
+			terminalOutputTailLines: 2,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+
+		const out = await mgr.processToolResult({ output: makeLargeTerminalOutput(), exitCode: 0 }, 'run_command');
+
+		assert.strictEqual(out.displayContent, out.content);
+		assert.strictEqual(parseMeta(out.content).summarizer, true);
+	});
+
+	test('terminal summarizer: final content respects normal limit and preserves prefix, suffix, and exit status', async () => {
+		const maxToolOutputLength = 1600;
+		const { fileService, workspaceService, settingsService } = makeServices(maxToolOutputLength, {
+			terminalOutputSummarization: true,
+			terminalOutputHeadLines: 500,
+			terminalOutputTailLines: 500,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+
+		const out = await mgr.processToolResult({ output: makeLargeTerminalOutput('exit status 17'), exitCode: 17 }, 'run_command');
+		const meta = parseMeta(out.content);
+
+		assert.ok(out.content.length <= maxToolOutputLength);
+		assert.ok(out.content.startsWith('$ build\nHEAD_SENTINEL'));
+		assert.ok(out.content.includes('[... output omitted to fit character limit ...]'));
+		assert.ok(out.content.includes('TAIL_SENTINEL\nexit status 17'));
+		assert.strictEqual(meta.wasCharTruncated, true);
+	});
+
+	test('11.4 semantic preservation precedes the character cap and raw remains available from footer', async () => {
+		const maxToolOutputLength = 1600;
+		const { fileService, workspaceService, settingsService } = makeServices(maxToolOutputLength, {
+			terminalOutputSummarization: true,
+			terminalOutputHeadLines: 2,
+			terminalOutputTailLines: 2,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+		const uniqueLabel = (i: number): string => `${String.fromCharCode(65 + Math.floor(i / 26))}${String.fromCharCode(65 + i % 26)}`;
+		const full = [
+			'$ build',
+			'HEAD_SENTINEL',
+			...Array.from({ length: 40 }, (_, i) => `Error: middle failure ${uniqueLabel(i)} ${'x'.repeat(50)}`),
+			...Array.from({ length: 40 }, (_, i) => `ordinary middle output ${uniqueLabel(i)} ${'y'.repeat(50)}`),
+			'TAIL_SENTINEL',
+			'exit status 17',
+		].join('\n');
+
+		const out = await mgr.processToolResult({ output: full, exitCode: 17 }, 'run_command');
+		const meta = parseMeta(out.content);
+
+		assert.strictEqual(meta.preservedSemanticLines, 40);
+		assert.strictEqual(meta.linesOmitted, 40);
+		assert.strictEqual(meta.wasCharTruncated, true);
+		assert.ok(out.content.includes('[preserved: 40 semantic lines from middle]'));
+		assert.ok(out.content.includes('[... output omitted to fit character limit ...]'));
+		assert.ok(out.content.includes('TAIL_SENTINEL\nexit status 17'));
+		assert.strictEqual(fileService.__debug.readFileString(toolOutputFileUri(meta.logFilePath)), full);
+	});
+
+	test('terminal summarizer: preserves parseable footer when the limit is pathologically small', async () => {
+		const maxToolOutputLength = 20;
+		const { fileService, workspaceService, settingsService } = makeServices(maxToolOutputLength, {
+			terminalOutputSummarization: true,
+			terminalOutputHeadLines: 3,
+			terminalOutputTailLines: 3,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+
+		const out = await mgr.processToolResult({ output: makeLargeTerminalOutput(), exitCode: 0 }, 'run_command');
+		const meta = parseMeta(out.content);
+
+		assert.ok(out.content.length > maxToolOutputLength);
+		assert.ok(out.content.startsWith('[VOID] TOOL OUTPUT TRUNCATED'));
+		assert.strictEqual(meta.summarizer, true);
+		assert.strictEqual(meta.wasCharTruncated, true);
+	});
+
+	test('11.5 summarizer off with short terminal output keeps current behavior', async () => {
+		const { fileService, workspaceService, settingsService } = makeServices(4000, {
+			terminalOutputSummarization: false,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+		const full = '$ echo ready\nready\nexit status 0';
+
+		const out = await mgr.processToolResult({ output: full, exitCode: 0 }, 'run_command');
+
+		assert.strictEqual(out.content, full);
+		assert.strictEqual(out.displayContent, out.content);
+		assert.strictEqual(fileService.__debug.writeCount(), 0);
+	});
+
+	test('11.6 summarizer on with a non-terminal tool uses the existing truncation path', async () => {
+		const maxToolOutputLength = 500;
+		const { fileService, workspaceService, settingsService } = makeServices(maxToolOutputLength, {
+			terminalOutputSummarization: true,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+		const full = makeLargeTerminalOutput();
+
+		const out = await mgr.processToolResult({ text: full }, 'mcp_tool');
+		const meta = parseMeta(out.content);
+
+		assert.strictEqual(meta.summarizer, undefined);
+		assert.ok(!out.content.includes('[preserved:'));
+	});
+
+	test('11.7 summarizer footer format is the source of truth for the UI metric', async () => {
+		const { fileService, workspaceService, settingsService } = makeServices(2000, {
+			terminalOutputSummarization: true,
+			terminalOutputHeadLines: 2,
+			terminalOutputTailLines: 2,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+		const summarized = await mgr.processToolResult({ output: makeLargeTerminalOutput() }, 'run_command');
+		const legacy = makeTruncatedWithMeta('.void/tool_outputs/legacy.log');
+
+		assert.strictEqual(parseMeta(summarized.content).summarizer, true);
+		assert.ok((getTerminalOutputSavedTokens(summarized.content) ?? 0) > 0);
+		assert.strictEqual(parseMeta(legacy).summarizer, undefined);
+		assert.strictEqual(getTerminalOutputSavedTokens(legacy), null);
+	});
+
+	test('terminal summarizer: run_persistent_command alias uses summarizer with UI equal to model content', async () => {
+		const { fileService, workspaceService, settingsService } = makeServices(2000, {
+			terminalOutputSummarization: true,
+			terminalOutputHeadLines: 3,
+			terminalOutputTailLines: 3,
+		});
+		const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+
+		const out = await mgr.processToolResult({ output: makeLargeTerminalOutput(), exitCode: 0 }, 'run_persistent_command');
+
+		assert.strictEqual(parseMeta(out.content).summarizer, true);
+		assert.strictEqual(out.displayContent, out.content);
+	});
+
+	test('terminal summarizer: raw file and metrics include timeout, interrupt, and exit-status suffixes', async () => {
+		const suffixes = [
+			'Terminal command run, but was stopped by Void because it exceeded the configured terminal command timeout (1 minutes).',
+			'Terminal command was interrupted by the user.',
+			'exit status 17',
+		];
+
+		for (const suffix of suffixes) {
+			const { fileService, workspaceService, settingsService } = makeServices(2500, {
+				terminalOutputSummarization: true,
+				terminalOutputHeadLines: 3,
+				terminalOutputTailLines: 3,
+			});
+			const mgr = new ChatToolOutputManager(fileService, workspaceService, settingsService);
+			const full = makeLargeTerminalOutput(suffix);
+
+			const out = await mgr.processToolResult({ output: full }, 'run_command');
+			const meta = parseMeta(out.content);
+
+			assert.strictEqual(meta.originalLength, full.length);
+			assert.strictEqual(meta.originalLineCount, full.split('\n').length);
+			assert.ok(out.content.includes(suffix));
+			assert.strictEqual(fileService.__debug.readFileString(toolOutputFileUri(meta.logFilePath)), full);
+		}
+	});
 
 	test('external/terminal: stable logFilePath and only one file on repeated processing (no ids)', async () => {
 		const { fileService, workspaceService, settingsService } = makeServices(50);
@@ -768,7 +1090,7 @@ suite('ChatToolOutputManager TRUNCATION_META consistency', () => {
 			};
 
 			const settingsService: any = {
-				state: { globalSettings: { maxToolOutputLength } }
+				state: { globalSettings: { maxToolOutputLength, terminalOutputSummarization: false } }
 			};
 
 			return { fileService, workspaceService, settingsService };

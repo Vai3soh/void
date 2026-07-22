@@ -67,6 +67,11 @@ suite('chat_systemMessage - specialToolFormat', () => {
 		});
 
 		assert.ok(msg.includes('Parallel tool calls:'), 'parallel tool calls section must be present');
+		assert.ok(msg.includes('Independent run_command calls may be batched only when every command is strictly read-only.'), 'parallel terminal safety rule must be present');
+		assert.ok(msg.includes('unrecognized or potentially mutating commands are automatically serialized.'), 'terminal fallback behavior must be present');
+		assert.ok(msg.includes('Independent edit_file or rewrite_file calls for different objects may be batched.'), 'independent write batching rule must be present');
+		assert.ok(msg.includes('The runtime serializes mutating calls'), 'serialized write execution rule must be present');
+		assert.ok(msg.includes('Never batch multiple writes to the same object'), 'same-object write safety rule must be present');
 		assert.ok(
 			!msg.includes('!!!CRITICAL: YOU MUST USE XML TOOLS - NO EXCEPTIONS!!!'),
 			'openai-style with parallel tool calls must remain native'

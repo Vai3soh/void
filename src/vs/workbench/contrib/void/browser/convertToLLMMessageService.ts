@@ -120,6 +120,7 @@ const prepareOpenAIToolsMessages = (messages: SimpleLLMMessage[]): AnthropicOrOp
 
 	const newMessages: OpenAILLMChatMessage[] = [];
 	let lastAssistantWithToolCalls: Extract<OpenAILLMChatMessage, { role: 'assistant' }> | undefined;
+	let toolResultsAfterAssistant = true;
 
 	for (let i = 0; i < messages.length; i += 1) {
 		const currMsg = messages[i]
@@ -132,6 +133,7 @@ const prepareOpenAIToolsMessages = (messages: SimpleLLMMessage[]): AnthropicOrOp
 				const assistantMsg: Extract<OpenAILLMChatMessage, { role: 'assistant' }> = { role: 'assistant', content: currMsg.content };
 				newMessages.push(assistantMsg);
 				lastAssistantWithToolCalls = assistantMsg;
+				toolResultsAfterAssistant = false;
 			} else {
 				// allow-any-unicode-next-line
 				// Fallback for unexpected roles – treat as simple user message
@@ -141,18 +143,18 @@ const prepareOpenAIToolsMessages = (messages: SimpleLLMMessage[]): AnthropicOrOp
 			continue
 		}
 
+		if (!lastAssistantWithToolCalls) continue;
+
 		// edit previous assistant message to have called the tool
-		if (lastAssistantWithToolCalls?.role === 'assistant') {
-			lastAssistantWithToolCalls.tool_calls ??= [];
-			lastAssistantWithToolCalls.tool_calls.push({
-				type: 'function',
-				id: currMsg.id,
-				function: {
-					name: currMsg.name,
-					arguments: JSON.stringify(currMsg.rawParams)
-				}
-			})
-		}
+		lastAssistantWithToolCalls.tool_calls ??= [];
+		lastAssistantWithToolCalls.tool_calls.push({
+			type: 'function',
+			id: currMsg.id,
+			function: {
+				name: currMsg.name,
+				arguments: JSON.stringify(currMsg.rawParams)
+			}
+		})
 
 		// add the tool
 		newMessages.push({
@@ -160,6 +162,10 @@ const prepareOpenAIToolsMessages = (messages: SimpleLLMMessage[]): AnthropicOrOp
 			tool_call_id: currMsg.id,
 			content: currMsg.content,
 		})
+		toolResultsAfterAssistant = true;
+	}
+	if (lastAssistantWithToolCalls?.tool_calls?.length && !toolResultsAfterAssistant) {
+		lastAssistantWithToolCalls.tool_calls = undefined;
 	}
 	return newMessages
 
@@ -257,7 +263,8 @@ const prepareAnthropicToolsMessages = (messages: SimpleLLMMessage[], supportsAnt
 		}
 
 		if (currMsg.role === 'tool') {
-			if (lastAssistantWithToolUse?.role === 'assistant') {
+			if (!lastAssistantWithToolUse) continue;
+			if (lastAssistantWithToolUse.role === 'assistant') {
 				if (typeof lastAssistantWithToolUse.content === 'string') {
 					lastAssistantWithToolUse.content = [{ type: 'text', text: lastAssistantWithToolUse.content }];
 				}

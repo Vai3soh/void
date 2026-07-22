@@ -11,9 +11,8 @@ import { ModelSelection, ModelSelectionOptions } from '../../../../platform/void
 import { getModelCapabilities, getReservedOutputTokenSpace, getIsReasoningEnabledState } from '../../../../platform/void/common/modelInference.js';
 import { CHAT_HISTORY_COMPRESSION_SYSTEM_PROMPT, buildChatHistoryCompressionUserMessage } from '../common/prompt/prompts.js';
 import { collectProtectedSkillContent, messageHasProtectedSkillContent } from '../common/skills/agentSkillProtectedContext.js';
+import { CHARS_PER_TOKEN_ESTIMATE } from '../../../../platform/void/common/prompt/constants.js';
 
-
-const CHARS_PER_TOKEN_ESTIMATE = 4;
 const HISTORY_COMPRESSION_TAIL_MESSAGE_COUNT = 8;
 const HISTORY_COMPRESSION_TOOL_SNIPPET_CHARS = 400;
 

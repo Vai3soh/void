@@ -81,6 +81,10 @@ type SetModelSelectionOfFeatureFn = <K extends FeatureName>(
 
 type SetGlobalSettingFn = <T extends GlobalSettingName>(settingName: T, newVal: GlobalSettings[T]) => void;
 
+type StoredGlobalSettings = Omit<Partial<GlobalSettings>, 'autoApprove'> & {
+	autoApprove?: GlobalSettings['autoApprove'] | boolean;
+};
+
 type SetOptionsOfModelSelection = (featureName: FeatureName, providerName: string, modelName: string, newVal: Partial<ModelSelectionOptions>) => void
 
 
@@ -251,7 +255,7 @@ const defaultState = () => {
 
 
 export const IVoidSettingsService = createDecorator<IVoidSettingsService>('VoidSettingsService');
-class VoidSettingsService extends Disposable implements IVoidSettingsService {
+export class VoidSettingsService extends Disposable implements IVoidSettingsService {
 	_serviceBrand: undefined;
 
 	private readonly _onDidChangeState = new Emitter<void>();
@@ -321,7 +325,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 		let readS: VoidSettingsState
 		try {
 			readS = await this._readState();
-			const gs = readS.globalSettings as any;
+			const gs: StoredGlobalSettings = readS.globalSettings;
 			// 1.0.3 addition, remove when enough users have had this code run
 			if (gs.includeToolLintErrors === undefined) gs.includeToolLintErrors = true;
 			if (gs.applyAstInference === undefined) gs.applyAstInference = defaultGlobalSettings.applyAstInference;
@@ -355,6 +359,15 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			}
 			if (gs.maxToolOutputLength === undefined) {
 				gs.maxToolOutputLength = defaultGlobalSettings.maxToolOutputLength;
+			}
+			if (gs.terminalOutputSummarization === undefined) {
+				gs.terminalOutputSummarization = defaultGlobalSettings.terminalOutputSummarization;
+			}
+			if (gs.terminalOutputHeadLines === undefined) {
+				gs.terminalOutputHeadLines = defaultGlobalSettings.terminalOutputHeadLines;
+			}
+			if (gs.terminalOutputTailLines === undefined) {
+				gs.terminalOutputTailLines = defaultGlobalSettings.terminalOutputTailLines;
 			}
 			if (gs.notifyOnTruncation === undefined) {
 				gs.notifyOnTruncation = defaultGlobalSettings.notifyOnTruncation;

@@ -3,6 +3,8 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
+export const CHARS_PER_TOKEN_ESTIMATE = 4;
+
 export const MAX_DIRSTR_CHARS_TOTAL_BEGINNING = 20_000;
 export const MAX_DIRSTR_CHARS_TOTAL_TOOL = 20_000;
 export const MAX_DIRSTR_RESULTS_TOTAL_BEGINNING = 100;

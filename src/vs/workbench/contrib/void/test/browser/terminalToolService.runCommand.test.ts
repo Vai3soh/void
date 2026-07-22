@@ -31,9 +31,11 @@ suite('TerminalToolService.runCommand', () => {
 		readonly _onData = new Emitter<string>();
 		readonly onData = this._onData.event;
 		readonly onExit = new Emitter<void>().event;
+		private readonly _onDidAddCapability = new Emitter<{ id: TerminalCapability; capability: FakeCommandDetection }>();
+		private commandDetectionMounted: boolean;
 		readonly capabilities = {
-			get: (id: TerminalCapability) => id === TerminalCapability.CommandDetection ? this.cmdCap : undefined,
-			onDidAddCapability: (_listener: unknown): IDisposable => ({ dispose() { } }),
+			get: (id: TerminalCapability) => id === TerminalCapability.CommandDetection && this.commandDetectionMounted ? this.cmdCap : undefined,
+			onDidAddCapability: this._onDidAddCapability.event,
 		};
 		xterm = undefined;
 		disposed = false;
@@ -41,8 +43,17 @@ suite('TerminalToolService.runCommand', () => {
 		constructor(
 			private readonly output: string,
 			private readonly rawOutputFactory?: (command: string, output: string) => string,
-			private readonly commandDetectionOutputFactory?: (command: string, output: string, rawOutput: string) => string
-		) { }
+			private readonly commandDetectionOutputFactory?: (command: string, output: string, rawOutput: string) => string,
+			commandDetectionDelayMs = 0
+		) {
+			this.commandDetectionMounted = commandDetectionDelayMs === 0;
+			if (commandDetectionDelayMs > 0) {
+				setTimeout(() => {
+					this.commandDetectionMounted = true;
+					this._onDidAddCapability.fire({ id: TerminalCapability.CommandDetection, capability: this.cmdCap });
+				}, commandDetectionDelayMs);
+			}
+		}
 
 		async sendText(command: string): Promise<void> {
 			setTimeout(() => {
@@ -58,9 +69,9 @@ suite('TerminalToolService.runCommand', () => {
 		}
 	}
 
-	function makeService(output: string, rawOutputFactory?: (command: string, output: string) => string, commandDetectionOutputFactory?: (command: string, output: string, rawOutput: string) => string) {
+	function makeService(output: string, rawOutputFactory?: (command: string, output: string) => string, commandDetectionOutputFactory?: (command: string, output: string, rawOutput: string) => string, commandDetectionDelayMs = 0) {
 		const createdOptions: unknown[] = [];
-		const terminal = new FakeTerminal(output, rawOutputFactory, commandDetectionOutputFactory);
+		const terminal = new FakeTerminal(output, rawOutputFactory, commandDetectionOutputFactory, commandDetectionDelayMs);
 		const workspaceRoot = URI.file('/workspaces/void');
 
 		const terminalService: any = {
@@ -184,5 +195,16 @@ suite('TerminalToolService.runCommand', () => {
 		const second = await service.runCommand('true', { cwd: explicit, terminalId: 'term-explicit' });
 		await second.resPromise;
 		assert.strictEqual((createdOptions[1] as any).cwd, explicit);
+	});
+
+	test('waits for delayed command detection capability before sending command', async () => {
+		const command = 'echo ready';
+		const { service } = makeService('ready', undefined, undefined, 20);
+
+		const { resPromise } = await service.runCommand(command, { cwd: null, terminalId: 'term-delayed-capability' });
+		const res = await resPromise;
+
+		assert.strictEqual(res.resolveReason.type, 'done');
+		assert.strictEqual(res.result, `$ ${command}\nready\n(exit code 0)`);
 	});
 });

@@ -30,6 +30,7 @@ type StreamDeltaState = {
 };
 
 type RequestStreamDeltaState = {
+	attempt: number | undefined;
 	text: StreamDeltaState;
 	reasoning: StreamDeltaState;
 };
@@ -38,6 +39,7 @@ const STREAM_PREFIX_PROBE_LEN = 96;
 
 const emptyStreamDeltaState = (): StreamDeltaState => ({ totalLength: 0, prefix: '' });
 const emptyRequestStreamDeltaState = (): RequestStreamDeltaState => ({
+	attempt: undefined,
 	text: emptyStreamDeltaState(),
 	reasoning: emptyStreamDeltaState(),
 });
@@ -89,13 +91,13 @@ const toDeltaPayload = (
 		};
 	}
 
-	// Fallback: treat incoming as plain delta chunk.
+	// A cumulative snapshot with a different prefix starts a new stream attempt.
 	return {
 		payload: incoming,
-		isDelta: true,
+		isDelta: false,
 		next: {
-			totalLength: prev.totalLength + incoming.length,
-			prefix: prev.prefix || makePrefixProbe(incoming),
+			totalLength: incoming.length,
+			prefix: makePrefixProbe(incoming),
 		},
 	};
 };
@@ -214,11 +216,16 @@ export class LLMMessageChannel implements IServerChannel {
 			...(rest as any),
 			additionalTools,
 			onText: (p: any) => {
-				const prev = this._streamingTextStateByRequest[requestId] ?? emptyRequestStreamDeltaState();
+				const current = this._streamingTextStateByRequest[requestId] ?? emptyRequestStreamDeltaState();
+				const attempt = typeof p?.streamAttempt === 'number' ? p.streamAttempt : undefined;
+				const prev = attempt !== undefined && current.attempt !== undefined && attempt !== current.attempt
+					? emptyRequestStreamDeltaState()
+					: current;
 				const textDelta = toDeltaPayload(p?.fullText, prev.text);
 				const reasoningDelta = toDeltaPayload(p?.fullReasoning, prev.reasoning);
 
 				this._streamingTextStateByRequest[requestId] = {
+					attempt,
 					text: textDelta.next,
 					reasoning: reasoningDelta.next,
 				};

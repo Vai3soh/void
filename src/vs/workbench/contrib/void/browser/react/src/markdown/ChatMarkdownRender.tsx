@@ -82,17 +82,17 @@ const CodespanWithLink = ({ text, rawText, chatMessageLocation }: { text: string
 
 		if (link === undefined) {
 			chatThreadService.generateCodespanLink({ codespanStr: text, threadId })
-			  .then(newLink => {
-				if (newLink) {
-				  chatThreadService.addCodespanLink({
-					newLinkText: text,
-					newLinkLocation: newLink,
-					messageIdx,
-					threadId
-				  })
-				  setDidComputeCodespanLink(true)
-				}
-			  })
+				.then(newLink => {
+					if (newLink) {
+						chatThreadService.addCodespanLink({
+							newLinkText: text,
+							newLinkLocation: newLink,
+							messageIdx,
+							threadId
+						})
+						setDidComputeCodespanLink(true)
+					}
+				})
 		}
 
 		if (link?.displayText) {
@@ -493,36 +493,30 @@ const RenderToken = ({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ..
 	)
 }
 
-
-export const ChatMarkdownRender = ({ string, inPTag = false, chatMessageLocation, ...options }: { string: string, inPTag?: boolean, codeURI?: URI, chatMessageLocation: ChatMessageLocation | undefined } & RenderTokenOptions) => {
-	string = string.replaceAll('\n•', '\n\n•')
-	const tokens = marked.lexer(string); // https://marked.js.org/using_pro#renderer
-
-	// Infer codeURI for the next code block from preceding text tokens
+export const ChatMarkdownRender = React.memo(({ string, inPTag = false, chatMessageLocation, ...options }: { string: string, inPTag?: boolean, codeURI?: URI, chatMessageLocation: ChatMessageLocation | undefined } & RenderTokenOptions) => {
+	const processedString = string.replaceAll('\n•', '\n\n•')
+	const tokens = React.useMemo(() => marked.lexer(processedString), [processedString]);
 	const accessor = useAccessor()
 	const modelService: any = accessor.get('IModelService')
 	const commandBarService: any = accessor.get('IVoidCommandBarService')
 	const workspaceService: any = accessor.get('IWorkspaceContextService')
 
-	const getBase = (p: string) => p.split(/[\\\/]/).pop() || p
-	const sanitizeHint = (s: string) => {
+	const getBase = React.useCallback((p: string) => p.split(/[\\\/]/).pop() || p, [])
+	const sanitizeHint = React.useCallback((s: string) => {
 		let out = (s || '').trim()
-		// strip surrounding backticks/quotes
 		out = out.replace(/^\s*[`'\"]/, '').replace(/[`'\"]\s*$/, '')
-		// strip list bullets like "- ", "• ", "1. "
 		out = out.replace(/^\s*(?:[-•]|\d+\.)\s+/, '')
 		out = out.replace(/\(.*?\)\s*:?$/, '').replace(/[:;,]+$/, '')
 		return out.trim()
-	}
-	const resolveUriFromHint = (raw: string): URI | null => {
+	}, [])
+
+	const resolveUriFromHint = React.useCallback((raw: string): URI | null => {
 		const hint = sanitizeHint(raw)
 		if (!hint) return null
-		// absolute (unix/win)
 		const isWinAbs = /^[a-zA-Z]:[\\\/]/.test(hint)
 		if (isWinAbs || isAbsolute(hint)) {
 			try { return URI.file(hint) } catch { /* noop */ }
 		}
-		// contains path separators → workspace-relative join
 		if (/[\\\/]/.test(hint)) {
 			try {
 				const folders = workspaceService?.getWorkspace?.()?.folders ?? []
@@ -532,7 +526,6 @@ export const ChatMarkdownRender = ({ string, inPTag = false, chatMessageLocation
 				}
 			} catch { /* noop */ }
 		}
-		// bare filename → try open models then recent URIs
 		if (/^[\w.-]+\.[\w0-9.-]+$/.test(hint)) {
 			try {
 				const models: any[] = modelService?.getModels?.() ?? []
@@ -544,51 +537,56 @@ export const ChatMarkdownRender = ({ string, inPTag = false, chatMessageLocation
 			} catch { /* noop */ }
 		}
 		return null
-	}
+	}, [sanitizeHint, getBase, modelService, commandBarService, workspaceService]);
 
-	const elements: React.ReactNode[] = []
-	let pendingUri: URI | null = options.codeURI ?? null
+	const elements = React.useMemo(() => {
+		const out: React.ReactNode[] = []
+		let pendingUri: URI | null = options.codeURI ?? null
 
-	for (let index = 0; index < tokens.length; index += 1) {
-		const token = tokens[index] as any
-		let codeURIForThisToken: URI | undefined = undefined
+		for (let index = 0; index < tokens.length; index += 1) {
+			const token = tokens[index] as any
+			let codeURIForThisToken: URI | undefined = undefined
 
-		// If this token is a code block, pass the pendingUri once, then clear it
-		if (token.type === 'code') {
-			codeURIForThisToken = pendingUri ?? undefined
-			pendingUri = null
-		}
-		else {
-			// Try to infer URI from text-like tokens to apply to the next code block
-			let rawText: string | null = null
-			if (token.type === 'paragraph' || token.type === 'heading') rawText = token.text || token.raw || ''
-			else if (token.type === 'text') rawText = token.raw || token.text || ''
-			else if (token.type === 'list_item') rawText = token.text || ''
-			if (rawText) {
-				// find first plausible path/filename in the text
-				const match = rawText.match(/[`'\"]?([A-Za-z]:[\\\/][^\s:()]+|\/[^^\s:()]+|\.{0,2}\/[^^\s:()]+|(?:[\w.-]+[\\\/])+[\w.-]+\.[A-Za-z0-9.-]+|[\w.-]+\.[A-Za-z0-9.-]+)[`'\"]?/)
-				if (match && match[1]) {
-					const uri = resolveUriFromHint(match[1])
-					if (uri) pendingUri = uri
+			if (token.type === 'code') {
+				codeURIForThisToken = pendingUri ?? undefined
+				pendingUri = null
+			}
+			else {
+				let rawText: string | null = null
+				if (token.type === 'paragraph' || token.type === 'heading') rawText = token.text || token.raw || ''
+				else if (token.type === 'text') rawText = token.raw || token.text || ''
+				else if (token.type === 'list_item') rawText = token.text || ''
+				if (rawText) {
+					const match = rawText.match(/[`'\"]?([A-Za-z]:[\\\/][^\s:()]+|\/[^^\s:()]+|\.{0,2}\/[^^\s:()]+|(?:[\w.-]+[\\\/])+[\w.-]+\.[A-Za-z0-9.-]+|[\w.-]+\.[A-Za-z0-9.-]+)[`'\"]?/)
+					if (match && match[1]) {
+						const uri = resolveUriFromHint(match[1])
+						if (uri) pendingUri = uri
+					}
 				}
 			}
-		}
 
-		elements.push(
-			<RenderToken key={index}
-				token={token}
-				inPTag={inPTag}
-				chatMessageLocation={chatMessageLocation}
-				tokenIdx={index + ''}
-				codeURI={codeURIForThisToken}
-				{...options}
-			/>
-		)
-	}
+			out.push(
+				<RenderToken key={index}
+					token={token}
+					inPTag={inPTag}
+					chatMessageLocation={chatMessageLocation}
+					tokenIdx={index + ''}
+					codeURI={codeURIForThisToken}
+					{...options}
+				/>
+			)
+		}
+		return out
+	}, [tokens, inPTag, chatMessageLocation, options.codeURI, resolveUriFromHint])
 
 	return (
 		<>
 			{elements}
 		</>
 	)
-}
+}, (prevProps, nextProps) => {
+	return prevProps.string === nextProps.string &&
+		prevProps.inPTag === nextProps.inPTag &&
+		prevProps.chatMessageLocation === nextProps.chatMessageLocation &&
+		prevProps.codeURI === nextProps.codeURI
+});

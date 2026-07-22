@@ -1025,17 +1025,18 @@ export async function runStream({
 
 		didNotifyTruncation = true;
 
-		const isReasoningOnly = info.textLen === 0 && info.reasoningLen > 0;
+		const isReasoningOnly = info.kind === 'length' && info.textLen === 0 && info.reasoningLen > 0;
 		const why = info.kind === 'timeout' ? 'timeout' : 'token limit (finish_reason=length)';
 
-		const msg =
-			`LLM response was truncated: ${why}.\n` +
+		const msg = isReasoningOnly
+			? `The model spent its entire output limit on reasoning and did not produce a final answer. No automatic retry was attempted.\n` +
+			`Provider: ${String(info.provider)}. LLM: ${String(info.model)}.\n` +
+			`max_tokens/max_completion_tokens: ${info.maxTokens}. Received reasoning=${info.reasoningLen}.\n` +
+			`How to fix: increase max_tokens/max_completion_tokens, or reduce reasoning effort / disable reasoning.`
+			: `LLM response was truncated: ${why}.\n` +
 			`Provider: ${String(info.provider)}. LLM: ${String(info.model)}.\n` +
 			`max_tokens/max_completion_tokens: ${info.maxTokens}. Attempt: ${info.attempt}/${info.maxAttempts}.\n` +
 			`Received: text=${info.textLen}, reasoning=${info.reasoningLen}.\n` +
-			(isReasoningOnly
-				? `It appears the entire budget was consumed by reasoning, and the model didn't have time to produce a final answer.\n`
-				: ``) +
 			`How to fix: increase max_tokens/max_completion_tokens (or maxTokensCap for retries), or reduce reasoning effort / disable reasoning.`;
 
 		try {
@@ -1327,8 +1328,9 @@ export async function runStream({
 				// Check for truncation in non-stream path
 				const finishReason = choice?.finish_reason;
 				const hitLimit = (finishReason === 'length');
+				const isReasoningOnlyTruncation = hitLimit && !text && collectedReasoning.length > 0;
 
-				if (!toolCall && hitLimit && policy.enabled && attempt < policy.maxAttempts) {
+				if (!toolCall && hitLimit && !isReasoningOnlyTruncation && policy.enabled && attempt < policy.maxAttempts) {
 					const prev = getCurrentMaxTokens(currentOptions);
 					bumpMaxTokens(currentOptions, policy);
 					const next = getCurrentMaxTokens(currentOptions);
@@ -1593,6 +1595,7 @@ export async function runStream({
 						fullText: fullTextSoFar,
 						fullReasoning: fullReasoningSoFar,
 						...(toolCallInfos.length ? { toolCalls: toolCallInfos, toolCall: toolCallInfo } : {}),
+						streamAttempt: attempt,
 						...usagePayload,
 					});
 				}
@@ -1636,8 +1639,9 @@ export async function runStream({
 			// but only when there is NO tool call (tool calls are handled differently).
 			const hitLimit = (lastFinishReason === 'length');
 			const hitTimeout = abortedByTimeout;
+			const isReasoningOnlyTruncation = hitLimit && !fullTextSoFar && fullReasoningSoFar.length > 0;
 
-			if (!toolCall && (hitLimit || hitTimeout) && policy.enabled && attempt < policy.maxAttempts) {
+			if (!toolCall && !isReasoningOnlyTruncation && (hitLimit || hitTimeout) && policy.enabled && attempt < policy.maxAttempts) {
 				const prev = getCurrentMaxTokens(currentOptions);
 				bumpMaxTokens(currentOptions, policy);
 				const next = getCurrentMaxTokens(currentOptions);

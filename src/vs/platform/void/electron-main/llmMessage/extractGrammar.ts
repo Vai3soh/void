@@ -494,6 +494,78 @@ export const extractReasoningAndXMLToolsWrapper = (
 
 	let activeThinkTags: [string, string] | null = thinkTagsInit;
 
+	let incReasoning_lastInput = '';
+	let incReasoning_lastTags: [string, string] | null = null;
+	let incReasoning_lastCloseIdx = -1;
+	let incReasoning_lastReasoning = '';
+	let incReasoning_lastAfter = '';
+
+	const incReasoningFullRecompute = (s: string, tags: [string, string]) => {
+		const [openTag, closeTag] = tags;
+		const closeIdx = s.lastIndexOf(closeTag);
+		if (closeIdx >= 0) {
+			const beforeClose = s.slice(0, closeIdx);
+			incReasoning_lastAfter = s.slice(closeIdx + closeTag.length);
+			incReasoning_lastReasoning = beforeClose.split(openTag).join('').split(closeTag).join('');
+			incReasoning_lastCloseIdx = closeIdx;
+		} else {
+			incReasoning_lastReasoning = s.split(openTag).join('').split(closeTag).join('');
+			incReasoning_lastAfter = '';
+			incReasoning_lastCloseIdx = -1;
+		}
+		incReasoning_lastInput = s;
+		incReasoning_lastTags = tags;
+	};
+
+	const incSplitReasoning = (s: string, tags: [string, string] | null): { reasoning: string; after: string } => {
+		if (!s) return { reasoning: '', after: '' };
+		if (!tags) return { reasoning: s, after: '' };
+
+		const [openTag, closeTag] = tags;
+		const maxTagLen = Math.max(openTag.length, closeTag.length);
+
+		if (!incReasoning_lastTags || incReasoning_lastTags[0] !== openTag || incReasoning_lastTags[1] !== closeTag) {
+			incReasoningFullRecompute(s, tags);
+			return { reasoning: incReasoning_lastReasoning, after: incReasoning_lastAfter };
+		}
+
+		if (s === incReasoning_lastInput) {
+			return { reasoning: incReasoning_lastReasoning, after: incReasoning_lastAfter };
+		}
+
+		if (s.length < incReasoning_lastInput.length) {
+			incReasoningFullRecompute(s, tags);
+			return { reasoning: incReasoning_lastReasoning, after: incReasoning_lastAfter };
+		}
+
+		const searchFrom = incReasoning_lastCloseIdx >= 0
+			? incReasoning_lastCloseIdx + closeTag.length
+			: Math.max(0, incReasoning_lastInput.length - maxTagLen + 1);
+
+		const newCloseIdx = s.indexOf(closeTag, searchFrom);
+
+		if (newCloseIdx >= 0) {
+			incReasoningFullRecompute(s, tags);
+		} else {
+			if (incReasoning_lastCloseIdx >= 0) {
+				incReasoning_lastAfter = s.slice(incReasoning_lastCloseIdx + closeTag.length);
+			} else {
+				const newRegion = s.slice(Math.max(0, incReasoning_lastInput.length - maxTagLen));
+				const hasOpen = newRegion.indexOf(openTag) >= 0;
+				const hasClose = newRegion.indexOf(closeTag) >= 0;
+
+				if (!hasOpen && !hasClose) {
+					incReasoning_lastReasoning += s.slice(incReasoning_lastInput.length);
+				} else {
+					incReasoningFullRecompute(s, tags);
+				}
+			}
+		}
+
+		incReasoning_lastInput = s;
+		return { reasoning: incReasoning_lastReasoning, after: incReasoning_lastAfter };
+	};
+
 	const likelyContainsToolMarkup = (s: string): boolean => {
 		if (!s || s.indexOf('<') === -1) return false;
 		const lower = s.toLowerCase();
@@ -805,7 +877,31 @@ export const extractReasoningAndXMLToolsWrapper = (
 	const validToolCallsOf = (toolCalls?: RawToolCallObj[]): RawToolCallObj[] =>
 		Array.isArray(toolCalls) ? toolCalls.filter(isValidToolCall) : [];
 
+	let currentStreamAttempt: number | undefined;
+	const resetStreamingParseState = () => {
+		lastReasoningParseObservedLen = 0;
+		lastThinkDetectObservedLen = 0;
+		r_foundTag1 = false;
+		r_foundTag2 = false;
+		r_latestAddIdx = 0;
+		r_fullTextSoFar = '';
+		r_fullReasoningSoFar = '';
+		r_providerReasoningAcc = '';
+		lastReasoning = '';
+		latestToolCall = undefined;
+		activeThinkTags = thinkTagsInit;
+		incReasoning_lastInput = '';
+		incReasoning_lastTags = null;
+		incReasoning_lastCloseIdx = -1;
+		incReasoning_lastReasoning = '';
+		incReasoning_lastAfter = '';
+	};
+
 	const newOnText: OnText = (params) => {
+		if (params.streamAttempt !== undefined && currentStreamAttempt !== params.streamAttempt) {
+			currentStreamAttempt = params.streamAttempt;
+			resetStreamingParseState();
+		}
 		const rawFullText = params.fullText || '';
 		const providerReasoning = params.fullReasoning ?? undefined;
 		const incomingPlan = params.plan;
@@ -853,7 +949,7 @@ export const extractReasoningAndXMLToolsWrapper = (
 			}
 
 
-			const { reasoning, after } = splitProviderReasoning(r_providerReasoningAcc, activeThinkTags);
+			const { reasoning, after } = incSplitReasoning(r_providerReasoningAcc, activeThinkTags);
 			reasoningForSearch = reasoning;
 			textForXml = (textForXml || '') + (after || '');
 		} else {
@@ -886,7 +982,12 @@ export const extractReasoningAndXMLToolsWrapper = (
 			: { beforeText: textForXml };
 		let uiText = beforeText;
 		if (chatMode && chatMode !== 'normal') {
-			const shouldParseReasoning = shouldParseByIncrement(reasoningForSearch, lastReasoningParseObservedLen);
+			const reasoningContainsToolMarkup = likelyContainsToolMarkup(reasoningForSearch);
+			const shouldParseReasoning = reasoningContainsToolMarkup && (
+				shouldParseByIncrement(reasoningForSearch, lastReasoningParseObservedLen) ||
+				reasoningForSearch.length < lastReasoningParseObservedLen ||
+				latestToolCall !== undefined
+			);
 			lastReasoningParseObservedLen = reasoningForSearch.length;
 			const parsedR = shouldParseReasoning
 				? parseToolFromText(reasoningForSearch, { skipLikelihoodCheck: true })
@@ -925,6 +1026,7 @@ export const extractReasoningAndXMLToolsWrapper = (
 		onText({
 			fullText: uiText.trim(),
 			fullReasoning: uiReasoning,
+			streamAttempt: params.streamAttempt,
 			...(toolCallsForText.length ? { toolCalls: toolCallsForText, toolCall: toolCallsForText[0] } : {}),
 			plan: incomingPlan,
 			// propagate provider token usage unchanged
@@ -933,7 +1035,7 @@ export const extractReasoningAndXMLToolsWrapper = (
 	};
 
 	const newOnFinalMessage: OnFinalMessage = (params) => {
-
+		lastReasoningParseObservedLen = 0;
 		newOnText(params);
 
 		const providerReasoning = params.fullReasoning ?? '';

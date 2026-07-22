@@ -169,6 +169,8 @@ export type LLMPlan = {
 export type OnText = (p: {
 	fullText: string;
 	fullReasoning: string;
+	/** Internal generation attempt number, used to reset cumulative stream transport state. */
+	streamAttempt?: number;
 	toolCalls?: RawToolCallObj[];
 	toolCall?: RawToolCallObj;
 	plan?: LLMPlan;

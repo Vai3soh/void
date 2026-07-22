@@ -10,6 +10,8 @@ import { IWorkspaceContextService } from '../../../../platform/workspace/common/
 import { IVoidSettingsService } from '../../../../platform/void/common/voidSettingsService.js';
 import { defaultGlobalSettings } from '../../../../platform/void/common/voidSettingsTypes.js';
 import { computeTruncatedToolOutput } from '../../../../platform/void/common/toolOutputTruncation.js';
+import { summarizeTerminalOutput } from '../../../../platform/void/common/terminalOutputSummarizer.js';
+import { type SummarizerOptions, type SummarizerResult } from '../../../../platform/void/common/terminalOutputSummarizerTypes.js';
 import { type JsonObject, type JsonValue, type ToolOutputInput, getStringField, isJsonObject } from '../../../../platform/void/common/jsonTypes.js';
 
 import {
@@ -415,6 +417,50 @@ export class ChatToolOutputManager {
 		if (!fullText || fullText.length <= maxToolOutputLength) {
 			const displayContent = isRunCommand ? uiText : this._cleanContentForDisplay(uiText);
 			return { result: makeLeanResult(false), content: uiText, displayContent };
+		}
+
+		const globalSettings = this._settingsService.state.globalSettings;
+		const useSummarizer = globalSettings.terminalOutputSummarization !== false;
+		if (useSummarizer && isRunCommand) {
+			const headLines = globalSettings.terminalOutputHeadLines ?? defaultGlobalSettings.terminalOutputHeadLines;
+			const tailLines = globalSettings.terminalOutputTailLines ?? defaultGlobalSettings.terminalOutputTailLines;
+			const makeOptions = (maxOutputLength: number): SummarizerOptions => ({
+				headLines,
+				tailLines,
+				maxOutputLength,
+			});
+			const makeMeta = (summary: SummarizerResult): JsonObject => ({
+				logFilePath: stablePath,
+				originalLength: summary.originalLength,
+				originalLineCount: summary.originalLineCount,
+				linesOmitted: summary.linesOmitted,
+				preservedSemanticLines: summary.preservedSemanticLines,
+				wasCharTruncated: summary.wasCharTruncated,
+				maxChars: maxToolOutputLength,
+				summarizer: true,
+			});
+			const makeFooter = (summary: SummarizerResult): string => [
+				`[VOID] TOOL OUTPUT TRUNCATED, SEE TRUNCATION_META BELOW.`,
+				`Output was summarized (deduplicated, head/tail with semantic preservation).`,
+				`Full unsummarized output is available via read_file on logFilePath.`,
+				`TRUNCATION_META: ${JSON.stringify(makeMeta(summary))}`,
+			].join('\n');
+
+			const unbudgetedSummary = summarizeTerminalOutput(fullText, makeOptions(0));
+			const reservedFooter = makeFooter({ ...unbudgetedSummary, wasCharTruncated: false });
+			const bodyBudget = Math.max(0, maxToolOutputLength - reservedFooter.length - 2);
+			const summary = bodyBudget > 0
+				? summarizeTerminalOutput(fullText, makeOptions(bodyBudget))
+				: { ...unbudgetedSummary, text: '', wasCharTruncated: unbudgetedSummary.text.length > 0 };
+			const footer = makeFooter(summary);
+
+			await this._writeToolOutputsFileOverwrite(stablePath, fullText);
+			const finalText = summary.text ? `${summary.text}\n\n${footer}` : footer;
+			return {
+				result: makeLeanResult(true),
+				content: finalText,
+				displayContent: finalText,
+			};
 		}
 
 		const { truncatedBody, originalLength, needsTruncation, lineAfterTruncation } =
