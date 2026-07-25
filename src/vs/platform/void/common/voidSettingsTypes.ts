@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import { ModelOverrides } from './modelInference.js';
-import { ToolApprovalType } from './toolsServiceTypes.js';
+import type { ToolApprovalType } from './toolApprovalPolicy.js';
 import { VoidSettingsState, CustomProviderSettings } from './voidSettingsService.js'
 import { IDynamicProviderRegistryService, ProviderMeta } from './providerReg.js';
 
@@ -161,6 +161,10 @@ export type ChatMode = 'agent' | 'gather' | 'normal'
 
 export const DISABLE_TELEMETRY_KEY = 'void.settings.disableTelemetry';
 
+export type AutoApproveSettings = Partial<Record<ToolApprovalType, boolean>> & {
+	delete?: boolean;
+};
+
 export type GlobalSettings = {
 	autoRefreshModels: boolean;
 	enableAutocomplete: boolean;
@@ -169,7 +173,7 @@ export type GlobalSettings = {
 	enableFastApply: boolean;
 	applyAstInference: boolean;
 	chatMode: ChatMode;
-	autoApprove: { [approvalType in ToolApprovalType]?: boolean };
+	autoApprove: AutoApproveSettings;
 	mcpAutoApprove: boolean;
 	showInlineSuggestions: boolean;
 	includeToolLintErrors: boolean;

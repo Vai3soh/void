@@ -14,16 +14,17 @@ import { ILanguageModelToolsService } from '../../chat/common/languageModelTools
 import { IMetricsService } from '../../../../platform/void/common/metricsService.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { LLMLoopDetector, LOOP_DETECTED_MESSAGE } from '../../../../platform/void/common/loopGuard.js';
-import { getErrorMessage, RawToolCallObj, RawToolParamsObj, LLMTokenUsage, type OnText } from '../../../../platform/void/common/sendLLMMessageTypes.js';
+import { getErrorMessage, RawToolCallObj, RawToolParamsObj, LLMTokenUsage, type LLMError, type OnText } from '../../../../platform/void/common/sendLLMMessageTypes.js';
 import { isAToolName } from '../common/prompt/prompts.js';
-import { approvalTypeOfToolName, } from '../../../../platform/void/common/toolsServiceTypes.js';
-import { ChatMessage, ToolMessage, ChatAttachment } from '../../../../platform/void/common/chatThreadServiceTypes.js';
+import { getToolApprovalRequirement } from '../../../../platform/void/common/toolApprovalPolicy.js';
+import { ChatMessage, ChatAttachment } from '../../../../platform/void/common/chatThreadServiceTypes.js';
 import { ModelSelection, ModelSelectionOptions } from '../../../../platform/void/common/voidSettingsTypes.js';
 import { getModelCapabilities } from '../../../../platform/void/common/modelInference.js';
 import { type JsonObject, type JsonValue, isJsonObject, stringifyUnknown, toJsonObject } from '../../../../platform/void/common/jsonTypes.js';
 import { classifyToolCall, duplicateWriteTargetError } from '../../../../platform/void/common/toolExecutionPolicy.js';
 
 import { ChatHistoryCompressor, ThreadHistoryCompressionInfo } from './ChatHistoryCompressor.js';
+import { ToolTurnCoordinator, ToolTurnInvariantError, type ToolCallState, type ToolTurnState } from './ToolTurnCoordinator.js';
 import { ChatToolOutputManager } from './ChatToolOutputManager.js';
 import { IThreadStateAccess } from './ChatAcpHandler.js';
 import { IMCPService } from '../common/mcpService.js';
@@ -45,6 +46,19 @@ const toLiveReasoningPreview = (reasoning: string): string => {
 	return `${reasoning.slice(0, sectionLength)}\n\n… live reasoning preview truncated …\n\n${reasoning.slice(-sectionLength)}`;
 };
 
+type ActiveToolTurn = {
+	readonly coordinator: ToolTurnCoordinator;
+	readonly toolCallsById: ReadonlyMap<string, RawToolCallObj>;
+	readonly loopDetector: LLMLoopDetector;
+	readonly access: IThreadStateAccess;
+	readonly validatedParamsById: Map<string, unknown>;
+	readonly seenWriteTargets: Set<string>;
+	readonly registeredLoopCallIds: Set<string>;
+	readonly resultMessageStartIndex: number;
+	pendingToolCalls: RawToolCallObj[];
+	loopDetected: boolean;
+};
+
 export class ChatExecutionEngine {
 
 	private readonly toolErrMsgs = {
@@ -53,12 +67,7 @@ export class ChatExecutionEngine {
 		errWhenStringifying: (error: any) => `Tool call succeeded, but there was an error stringifying the output.\n${getErrorMessage(error)}`
 	};
 
-	// Pending tool calls from the current turn that are waiting for their approval queue.
-	// When LLM returns multiple tool calls in parallel, the first is set as
-	// tool_request, the rest are stored here. After Approve/Reject/Skip
-	// chatThreadService advances the queue. Only when the queue is empty
-	// a new LLM loop is started.
-	private readonly _pendingToolCallsByThread = new Map<string, RawToolCallObj[]>();
+	private readonly _toolTurnsByThread = new Map<string, ActiveToolTurn>();
 	private readonly _runningToolInterruptorsByThread = new Map<string, Map<string, () => void>>();
 	private readonly _stoppedToolIdsByThread = new Map<string, Set<string>>();
 	private readonly _runGenerationByThread = new Map<string, number>();
@@ -105,8 +114,39 @@ export class ChatExecutionEngine {
 
 	public stopThread(threadId: string): RawToolCallObj[] {
 		this._runGenerationByThread.set(threadId, this._currentRunGeneration(threadId) + 1);
-		const pending = this._pendingToolCallsByThread.get(threadId) ?? [];
-		this._pendingToolCallsByThread.delete(threadId);
+		const turn = this._toolTurnsByThread.get(threadId);
+		const pending = turn
+			? Array.from(turn.coordinator.state.calls.values())
+				.filter(call => call.phase === 'queued' || call.phase === 'awaiting-approval')
+				.map(call => turn.toolCallsById.get(call.id))
+				.filter((toolCall): toolCall is RawToolCallObj => toolCall !== undefined)
+			: [];
+		if (turn) {
+			turn.coordinator.interruptAll(this.toolErrMsgs.interrupted);
+			turn.coordinator.dispose();
+			this._toolTurnsByThread.delete(threadId);
+			for (const toolCall of pending) {
+				const existing = [...turn.access.getThreadMessages(threadId)].reverse()
+					.find(message => message.role === 'tool' && message.id === toolCall.id);
+				if (existing?.role !== 'tool' || existing.type !== 'tool_request') continue;
+				turn.access.updateLatestTool(threadId, {
+					role: 'tool',
+					type: 'tool_error',
+					params: existing.params,
+					result: this.toolErrMsgs.interrupted,
+					name: existing.name,
+					content: this.toolErrMsgs.interrupted,
+					displayContent: this.toolErrMsgs.interrupted,
+					id: existing.id,
+					rawParams: existing.rawParams
+				});
+			}
+		}
+		const unpersistedPending = pending.filter(toolCall => {
+			const existing = turn ? [...turn.access.getThreadMessages(threadId)].reverse()
+				.find(message => message.role === 'tool' && message.id === toolCall.id) : undefined;
+			return existing?.role !== 'tool' || existing.type !== 'tool_error';
+		});
 
 		const interruptors = this._runningToolInterruptorsByThread.get(threadId);
 		if (interruptors) {
@@ -117,7 +157,7 @@ export class ChatExecutionEngine {
 			this._runningToolInterruptorsByThread.delete(threadId);
 		}
 
-		return pending;
+		return unpersistedPending;
 	}
 
 	public interruptRunningTools(threadId: string): void {
@@ -131,22 +171,47 @@ export class ChatExecutionEngine {
 	}
 
 	private _stopPendingToolCalls(threadId: string, access: IThreadStateAccess): void {
-		const pending = this._pendingToolCallsByThread.get(threadId) ?? [];
-		this._pendingToolCallsByThread.delete(threadId);
+		const turn = this._toolTurnsByThread.get(threadId);
+		if (!turn) return;
+		const pending = Array.from(turn.coordinator.state.calls.values())
+			.filter(call => call.phase === 'queued' || call.phase === 'awaiting-approval')
+			.map(call => turn.toolCallsById.get(call.id))
+			.filter((toolCall): toolCall is RawToolCallObj => toolCall !== undefined);
+		turn.coordinator.interruptAll(this.toolErrMsgs.interrupted);
+		turn.coordinator.dispose();
+		this._toolTurnsByThread.delete(threadId);
 		for (const toolCall of pending) {
-			this._addToolErrorMessage(threadId, toolCall, this.toolErrMsgs.interrupted, access);
+			const existing = [...access.getThreadMessages(threadId)].reverse()
+				.find(message => message.role === 'tool' && message.id === toolCall.id);
+			if (existing?.role === 'tool' && existing.type === 'tool_request') {
+				access.updateLatestTool(threadId, {
+					role: 'tool',
+					type: 'tool_error',
+					params: existing.params,
+					result: this.toolErrMsgs.interrupted,
+					name: existing.name,
+					content: this.toolErrMsgs.interrupted,
+					displayContent: this.toolErrMsgs.interrupted,
+					id: existing.id,
+					rawParams: existing.rawParams
+				});
+			} else {
+				this._addToolErrorMessage(threadId, toolCall, this.toolErrMsgs.interrupted, access);
+			}
 		}
 	}
 
 	public clearThreadExecutionState(threadId: string): void {
-		this._pendingToolCallsByThread.delete(threadId);
+		this._toolTurnsByThread.get(threadId)?.coordinator.dispose();
+		this._toolTurnsByThread.delete(threadId);
 		this._runningToolInterruptorsByThread.delete(threadId);
 		this._stoppedToolIdsByThread.delete(threadId);
 		this._runGenerationByThread.delete(threadId);
 	}
 
 	public clearAllExecutionState(): void {
-		this._pendingToolCallsByThread.clear();
+		for (const turn of this._toolTurnsByThread.values()) turn.coordinator.dispose();
+		this._toolTurnsByThread.clear();
 		this._runningToolInterruptorsByThread.clear();
 		this._stoppedToolIdsByThread.clear();
 		this._runGenerationByThread.clear();
@@ -179,6 +244,10 @@ export class ChatExecutionEngine {
 
 	public readonly skippedToolCallIds = new Set<string>();
 
+	public getToolTurnState(threadId: string): ToolTurnState | undefined {
+		return this._toolTurnsByThread.get(threadId)?.coordinator.state;
+	}
+
 	constructor(
 		@ILLMMessageService private readonly _llmMessageService: ILLMMessageService,
 		@IToolsService private readonly _toolsService: IToolsService,
@@ -189,17 +258,17 @@ export class ChatExecutionEngine {
 		@IFileService private readonly _fileService: IFileService,
 		@IMCPService private readonly _mcpService: IMCPService,
 		private readonly _historyCompressor: ChatHistoryCompressor,
-		private readonly _toolOutputManager: ChatToolOutputManager
+		private readonly _toolOutputManager: ChatToolOutputManager,
+		private readonly _resumeToolTurn?: (threadId: string) => Promise<void>
 	) { }
 
 	public async runChatAgent(opts: {
 		threadId: string,
 		modelSelection: ModelSelection | null,
 		modelSelectionOptions: ModelSelectionOptions | undefined,
-		callThisToolFirst?: ToolMessage<any> & { type: 'tool_request' }
 	}, access: IThreadStateAccess) {
 
-		const { threadId, modelSelection, modelSelectionOptions, callThisToolFirst } = opts;
+		const { threadId, modelSelection, modelSelectionOptions } = opts;
 		const runGeneration = this._currentRunGeneration(threadId);
 
 		let interruptedWhenIdle = false;
@@ -223,125 +292,6 @@ export class ChatExecutionEngine {
 		});
 
 
-		if (callThisToolFirst) {
-			if (isAToolName(callThisToolFirst.name)) {
-				const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, {
-					preapproved: true,
-					unvalidatedToolParams: callThisToolFirst.rawParams,
-					validatedParams: callThisToolFirst.params
-				}, access);
-
-				if (interrupted) {
-					if (this._consumeToolStopped(threadId, callThisToolFirst.id)) {
-						this._addToolErrorMessage(threadId, {
-							id: callThisToolFirst.id,
-							name: callThisToolFirst.name,
-							rawParams: callThisToolFirst.rawParams,
-							isDone: true,
-							doneParams: []
-						}, this.toolErrMsgs.interrupted, access);
-						this._stopPendingToolCalls(threadId, access);
-						return;
-					}
-					if (this.skippedToolCallIds.delete(callThisToolFirst.id)) {
-
-					} else {
-						access.setStreamState(threadId, undefined);
-						access.addUserCheckpoint(threadId);
-						return;
-					}
-				}
-			} else {
-				// Dynamic tool (MCP)
-				if (isStopped()) {
-					this._addToolErrorMessage(threadId, {
-						id: callThisToolFirst.id,
-						name: callThisToolFirst.name,
-						rawParams: callThisToolFirst.rawParams,
-						isDone: true,
-						doneParams: []
-					}, this.toolErrMsgs.interrupted, access);
-					return;
-				}
-				if (this._isToolDisabled(callThisToolFirst.name)) {
-					const disabledError = this._disabledToolError(callThisToolFirst.name);
-					access.addMessageToThread(threadId, {
-						role: 'tool',
-						type: 'tool_error',
-						params: callThisToolFirst.rawParams as any,
-						result: disabledError,
-						name: callThisToolFirst.name as any,
-						content: disabledError,
-						displayContent: disabledError,
-						id: callThisToolFirst.id,
-						rawParams: callThisToolFirst.rawParams,
-					});
-				} else {
-					access.updateLatestTool(threadId, {
-						role: 'tool',
-						type: 'running_now',
-						params: callThisToolFirst.params as any,
-						name: callThisToolFirst.name as any,
-						content: 'running...',
-						displayContent: 'running...',
-						result: null,
-						id: callThisToolFirst.id,
-						rawParams: callThisToolFirst.rawParams
-					});
-
-					const exec = await this._runDynamicToolExec(
-						callThisToolFirst.name,
-						toJsonObject(callThisToolFirst.rawParams)
-					);
-
-					if (isStopped()) {
-						access.updateLatestTool(threadId, {
-							role: 'tool',
-							type: 'tool_error',
-							params: callThisToolFirst.params as any,
-							result: this.toolErrMsgs.interrupted,
-							name: callThisToolFirst.name as any,
-							content: this.toolErrMsgs.interrupted,
-							displayContent: this.toolErrMsgs.interrupted,
-							id: callThisToolFirst.id,
-							rawParams: callThisToolFirst.rawParams
-						});
-						this._stopPendingToolCalls(threadId, access);
-						return;
-					}
-
-					if (!exec.ok) {
-						access.updateLatestTool(threadId, {
-							role: 'tool',
-							type: 'tool_error',
-							params: callThisToolFirst.params as any,
-							result: exec.error,
-							name: callThisToolFirst.name as any,
-							content: exec.error,
-							displayContent: exec.error,
-							id: callThisToolFirst.id,
-							rawParams: callThisToolFirst.rawParams
-						});
-					} else {
-						const { result: processedResult, content, displayContent } =
-							await this._toolOutputManager.processToolResult(exec.value, callThisToolFirst.name);
-
-						access.updateLatestTool(threadId, {
-							role: 'tool',
-							type: 'success',
-							params: callThisToolFirst.params as any,
-							result: processedResult,
-							name: callThisToolFirst.name as any,
-							content,
-							displayContent: displayContent,
-							id: callThisToolFirst.id,
-							rawParams: callThisToolFirst.rawParams
-						});
-					}
-				}
-			}
-
-		}
 
 		if (isStopped()) {
 			this._stopPendingToolCalls(threadId, access);
@@ -350,14 +300,12 @@ export class ChatExecutionEngine {
 
 		access.setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' });
 
-		// If there are pending tool calls in this turn - do NOT start LLM loop.
-		// Wait for user Approve/Reject/Skip on the next tool call from pending.
-		// Only when all tool calls are processed, messages can be sent to the provider,
-		// otherwise LLM will see tool_request without tool_result and get confused.
-		if (this._pendingToolCallsByThread.has(threadId)) {
+		const activeToolTurn = this._toolTurnsByThread.get(threadId);
+		if (activeToolTurn && !activeToolTurn.coordinator.isTurnSettled) {
 			access.setStreamState(threadId, { isRunning: 'awaiting_user' });
 			return;
 		}
+		activeToolTurn?.coordinator.assertCanResumeLLM();
 
 		while (shouldSendAnotherMessage) {
 			shouldSendAnotherMessage = false;
@@ -452,7 +400,7 @@ export class ChatExecutionEngine {
 
 				type ResTypes =
 					| { type: 'llmDone'; toolCalls?: RawToolCallObj[]; toolCall?: RawToolCallObj; info: { fullText: string; fullReasoning: string; anthropicReasoning: any }; tokenUsage?: LLMTokenUsage }
-					| { type: 'llmError'; error?: { message: string; fullError: Error | null } }
+					| { type: 'llmError'; error: LLMError }
 					| { type: 'llmAborted' };
 
 				let resMessageIsDonePromise: (res: ResTypes) => void;
@@ -556,25 +504,29 @@ export class ChatExecutionEngine {
 				else if (llmRes.type === 'llmError') {
 					if (lastUsageForTurn) access.accumulateTokenUsage(threadId, lastUsageForTurn);
 
-					if (nAttempts < chatRetries) {
+					const { error } = llmRes;
+					const canRetry = error.providerHttp?.retryable !== false && error.providerHttp?.status !== 400;
+					if (canRetry && nAttempts < chatRetries) {
 						shouldRetryLLM = true;
 						access.setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor });
-						await timeout(retryDelay);
+						await timeout(error.providerHttp?.retryAfterMs ?? retryDelay);
 						if (isStopped()) {
 							return;
 						}
 						continue;
 					} else {
-						const { error } = llmRes;
-						const info = access.getStreamState(threadId).llmInfo;
-						access.addMessageToThread(threadId, {
-							role: 'assistant',
-							displayContent: info.displayContentSoFar,
-							reasoning: info.reasoningSoFar,
-							anthropicReasoning: null,
-							...(lastUsageForTurn ? { tokenUsage: lastUsageForTurn } : {}),
-						});
-						if (info.toolCallSoFar) access.addMessageToThread(threadId, { role: 'interrupted_streaming_tool', name: info.toolCallSoFar.name });
+						const streamState = access.getStreamState(threadId);
+						const info = streamState?.isRunning === 'LLM' ? streamState.llmInfo : undefined;
+						if (info && (info.displayContentSoFar || info.reasoningSoFar)) {
+							access.addMessageToThread(threadId, {
+								role: 'assistant',
+								displayContent: info.displayContentSoFar,
+								reasoning: info.reasoningSoFar,
+								anthropicReasoning: null,
+								...(lastUsageForTurn ? { tokenUsage: lastUsageForTurn } : {}),
+							});
+						}
+						if (info?.toolCallSoFar) access.addMessageToThread(threadId, { role: 'interrupted_streaming_tool', name: info.toolCallSoFar.name });
 
 						access.setStreamState(threadId, { isRunning: undefined, error });
 						access.addUserCheckpoint(threadId);
@@ -640,12 +592,15 @@ export class ChatExecutionEngine {
 		error: string,
 		access: IThreadStateAccess
 	): void {
+		const params = isAToolName(toolCall.name)
+			? this._toolsService.validateParams[toolCall.name](toolCall.rawParams)
+			: toolCall.rawParams;
 		access.addMessageToThread(threadId, {
 			role: 'tool',
 			type: 'tool_error',
-			params: toolCall.rawParams as any,
+			params,
 			result: error,
-			name: toolCall.name as any,
+			name: toolCall.name,
 			content: error,
 			displayContent: error,
 			id: toolCall.id,
@@ -661,223 +616,376 @@ export class ChatExecutionEngine {
 		loopDetector: LLMLoopDetector,
 		access: IThreadStateAccess
 	): Promise<{ awaitingUserApproval?: boolean; interrupted?: boolean; loopDetected?: boolean }> {
-		const runGeneration = this._currentRunGeneration(threadId);
-		const seenWriteTargets = new Set<string>();
-		let executedOrErrored = false;
-		let pendingParallelToolExecutions: Promise<{ toolCall: RawToolCallObj; awaitingUserApproval?: boolean; interrupted?: boolean }>[] = [];
+		const existingTurn = this._toolTurnsByThread.get(threadId);
+		if (existingTurn && !existingTurn.coordinator.isTurnSettled) {
+			return { awaitingUserApproval: existingTurn.coordinator.state.activeApprovalCallId !== undefined };
+		}
+		existingTurn?.coordinator.dispose();
 
-		const drainPendingParallelToolExecutions = async (): Promise<{ awaitingUserApproval?: boolean; interrupted?: boolean }> => {
-			if (!pendingParallelToolExecutions.length) return {};
+		const toolCallsById = new Map(toolCalls.map(toolCall => [toolCall.id, toolCall]));
+		const coordinator = new ToolTurnCoordinator({
+			threadId,
+			turnId: generateUuid(),
+			toolCalls: toolCalls.map(toolCall => ({
+				id: toolCall.id,
+				name: toolCall.name,
+				approval: this._requiresManualApproval(toolCall) ? 'manual' : 'none',
+			})),
+			log: event => console.debug('[Void][ToolTurnCoordinator]', JSON.stringify(event)),
+		});
+		const turn: ActiveToolTurn = {
+			coordinator,
+			toolCallsById,
+			loopDetector,
+			access,
+			validatedParamsById: new Map(),
+			seenWriteTargets: new Set(),
+			registeredLoopCallIds: new Set(),
+			resultMessageStartIndex: access.getThreadMessages(threadId).length,
+			pendingToolCalls: [...toolCalls],
+			loopDetected: false,
+		};
+		this._toolTurnsByThread.set(threadId, turn);
+
+		const result = await this._continueToolTurn(threadId, turn);
+		if (!result.awaitingUserApproval && !result.interrupted && !result.loopDetected) {
+			await coordinator.whenTurnSettled;
+			this._assertOneTerminalResultPerCall(turn);
+			coordinator.assertCanResumeLLM();
+			coordinator.dispose();
+			this._toolTurnsByThread.delete(threadId);
+		}
+		return result;
+	}
+
+	private _requiresManualApproval(toolCall: RawToolCallObj): boolean {
+		if (this._isToolDisabled(toolCall.name)) return false;
+		if (!isAToolName(toolCall.name)) return this._settingsService.state.globalSettings.mcpAutoApprove !== true;
+		const approvalRequirement = getToolApprovalRequirement(toolCall.name);
+		if (approvalRequirement.kind !== 'manual') return false;
+		if (approvalRequirement.category === 'terminal' && toolCall.name === 'run_command') {
+			const command = typeof toolCall.rawParams.command === 'string' ? toolCall.rawParams.command : '';
+			if (isDangerousTerminalCommand(command)) return true;
+		}
+		return this._settingsService.state.globalSettings.autoApprove[approvalRequirement.category] !== true;
+	}
+
+	private async _continueToolTurn(
+		threadId: string,
+		turn: ActiveToolTurn
+	): Promise<{ awaitingUserApproval?: boolean; interrupted?: boolean; loopDetected?: boolean }> {
+		const runGeneration = this._currentRunGeneration(threadId);
+		let pendingParallelToolExecutions: Promise<void>[] = [];
+		const drainPendingParallelToolExecutions = async (): Promise<boolean> => {
+			if (!pendingParallelToolExecutions.length) return false;
 			const batch = pendingParallelToolExecutions;
 			pendingParallelToolExecutions = [];
-			const results = await Promise.all(batch);
-			const stopped = this._isThreadExecutionStopped(threadId, runGeneration);
-			for (const result of results) {
-				if (result.interrupted) {
-					if (stopped && this._consumeToolStopped(threadId, result.toolCall.id)) {
-						executedOrErrored = true;
-						continue;
-					}
-					if (this.skippedToolCallIds.delete(result.toolCall.id)) {
-						executedOrErrored = true;
-						continue;
-					}
-					return { interrupted: true };
-				}
-				if (result.awaitingUserApproval) {
-					return { awaitingUserApproval: true };
-				}
-				executedOrErrored = true;
-			}
-			if (stopped) {
-				this._stopPendingToolCalls(threadId, access);
-				return { interrupted: true };
-			}
-			return {};
+			await Promise.all(batch);
+			return this._isThreadExecutionStopped(threadId, runGeneration);
 		};
 
-		for (let i = 0; i < toolCalls.length; i += 1) {
+		while (turn.pendingToolCalls.length > 0) {
 			if (this._isThreadExecutionStopped(threadId, runGeneration)) {
-				this._stopPendingToolCalls(threadId, access);
-				for (const remainingToolCall of toolCalls.slice(i)) {
-					this._addToolErrorMessage(threadId, remainingToolCall, this.toolErrMsgs.interrupted, access);
-				}
+				await drainPendingParallelToolExecutions();
+				this._stopPendingToolCalls(threadId, turn.access);
 				return { interrupted: true };
 			}
-			const toolCall = toolCalls[i];
-			const plan = classifyToolCall({ id: toolCall.id, name: toolCall.name, rawParams: toolCall.rawParams as Record<string, unknown> });
 
-			if (plan.kind !== 'read-only' && plan.kind !== 'read-only-terminal') {
-				const pendingResult = await drainPendingParallelToolExecutions();
-				if (pendingResult.interrupted || pendingResult.awaitingUserApproval) return pendingResult;
-			} else if (plan.kind === 'read-only-terminal' && this._settingsService.state.globalSettings.autoApprove.terminal !== true) {
-				const pendingResult = await drainPendingParallelToolExecutions();
-				if (pendingResult.interrupted || pendingResult.awaitingUserApproval) return pendingResult;
+			const toolCall = turn.pendingToolCalls[0];
+			const callState = turn.coordinator.state.calls.get(toolCall.id);
+			if (!callState) throw new ToolTurnInvariantError('unknown_tool_call');
+			const plan = classifyToolCall({ id: toolCall.id, name: toolCall.name, rawParams: toolCall.rawParams as Record<string, unknown> });
+			const canRunInParallel = callState.phase === 'queued'
+				&& !callState.requiresApproval
+				&& (plan.kind === 'read-only' || plan.kind === 'read-only-terminal');
+
+			if (!canRunInParallel && await drainPendingParallelToolExecutions()) {
+				this._stopPendingToolCalls(threadId, turn.access);
+				return { interrupted: true };
+			}
+
+			if (!turn.registeredLoopCallIds.has(toolCall.id)) {
+				turn.registeredLoopCallIds.add(toolCall.id);
+				const loopAfterTool = turn.loopDetector.registerToolCall(toolCall.name, toolCall.rawParams);
+				if (loopAfterTool.isLoop) {
+					turn.loopDetected = true;
+					turn.coordinator.interruptAll(LOOP_DETECTED_MESSAGE);
+					this._toolTurnsByThread.delete(threadId);
+					return { loopDetected: true };
+				}
+			}
+
+			if (callState.phase === 'awaiting-approval') {
+				turn.pendingToolCalls.shift();
+				if (!this._persistActiveToolRequest(turn, toolCall, callState)) continue;
+				turn.access.setStreamState(threadId, { isRunning: 'awaiting_user' });
+				return { awaitingUserApproval: true };
+			}
+			if (callState.phase !== 'queued') {
+				turn.pendingToolCalls.shift();
+				continue;
 			}
 
 			if (plan.kind === 'mutating') {
 				const target = plan.writeTarget;
-				if (!target || seenWriteTargets.has(target)) {
-					this._addToolErrorMessage(threadId, toolCall, duplicateWriteTargetError(target), access);
-					executedOrErrored = true;
+				if (!target || turn.seenWriteTargets.has(target)) {
+					turn.pendingToolCalls.shift();
+					const error = duplicateWriteTargetError(target);
+					this._addToolErrorMessage(threadId, toolCall, error, turn.access);
+					turn.coordinator.fail(toolCall.id, error);
 					continue;
 				}
-				seenWriteTargets.add(target);
+				turn.seenWriteTargets.add(target);
 			}
 
-			const loopAfterTool = loopDetector.registerToolCall(toolCall.name, toolCall.rawParams);
-			if (loopAfterTool.isLoop) {
-				const pendingResult = await drainPendingParallelToolExecutions();
-				if (pendingResult.interrupted || pendingResult.awaitingUserApproval) return pendingResult;
-				return { loopDetected: true };
+			turn.pendingToolCalls.shift();
+			const execution = this._executeCoordinatedToolCall(threadId, turn, toolCall, false);
+			if (canRunInParallel) {
+				pendingParallelToolExecutions.push(execution);
+			} else {
+				await execution;
 			}
+		}
 
-			if (isAToolName(toolCall.name)) {
-				const runBuiltInTool = async () => {
-					const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, {
-						preapproved: false,
-						unvalidatedToolParams: toolCall.rawParams
-					}, access);
-					return { toolCall, awaitingUserApproval, interrupted };
-				};
-
-				if (plan.kind === 'read-only' || (plan.kind === 'read-only-terminal' && this._settingsService.state.globalSettings.autoApprove.terminal === true)) {
-					pendingParallelToolExecutions.push(runBuiltInTool());
-					continue;
-				}
-
-				const { awaitingUserApproval, interrupted } = await runBuiltInTool();
-
-				if (interrupted) {
-					if (this._consumeToolStopped(threadId, toolCall.id)) {
-						this._addToolErrorMessage(threadId, toolCall, this.toolErrMsgs.interrupted, access);
-						for (const remainingToolCall of toolCalls.slice(i + 1)) {
-							this._addToolErrorMessage(threadId, remainingToolCall, this.toolErrMsgs.interrupted, access);
-						}
-						this._stopPendingToolCalls(threadId, access);
-						return { interrupted: true };
-					}
-					if (this.skippedToolCallIds.delete(toolCall.id)) {
-						executedOrErrored = true;
-						continue;
-					}
-					return { interrupted: true };
-				}
-
-				if (awaitingUserApproval) {
-					// Save remaining tool calls to pending buffer. After Approve/Reject/Skip
-					// chatThreadService will take the next one from here. Only when all tool calls
-					// are processed, a new LLM loop is started.
-					const remaining = toolCalls.slice(i + 1);
-					if (remaining.length) {
-						const existing = this._pendingToolCallsByThread.get(threadId) ?? [];
-						this._pendingToolCallsByThread.set(threadId, [...existing, ...remaining]);
-					}
-					return { awaitingUserApproval: true };
-				}
-
-				executedOrErrored = true;
-				continue;
-			}
-
-			if (this._isToolDisabled(toolCall.name)) {
-				this._addToolErrorMessage(threadId, toolCall, this._disabledToolError(toolCall.name), access);
-				executedOrErrored = true;
-				continue;
-			}
-
-			if (!this._settingsService.state.globalSettings.mcpAutoApprove) {
-				access.addMessageToThread(threadId, {
-					role: 'tool',
-					type: 'tool_request',
-					content: '(Awaiting user permission...)',
-					result: null,
-					name: toolCall.name as any,
-					params: toolCall.rawParams as any,
-					id: toolCall.id,
-					rawParams: toolCall.rawParams
-				});
-				// Save remaining tool calls to pending buffer (see comment above).
-				const remaining = toolCalls.slice(i + 1);
-				if (remaining.length) {
-					const existing = this._pendingToolCallsByThread.get(threadId) ?? [];
-					this._pendingToolCallsByThread.set(threadId, [...existing, ...remaining]);
-				}
+		if (await drainPendingParallelToolExecutions()) {
+			this._stopPendingToolCalls(threadId, turn.access);
+			return { interrupted: true };
+		}
+		if (turn.coordinator.state.activeApprovalCallId !== undefined) {
+			const activeId = turn.coordinator.state.activeApprovalCallId;
+			const activeToolCall = turn.toolCallsById.get(activeId);
+			const activeCallState = turn.coordinator.state.calls.get(activeId);
+			if (activeToolCall && activeCallState && this._persistActiveToolRequest(turn, activeToolCall, activeCallState)) {
+				turn.access.setStreamState(threadId, { isRunning: 'awaiting_user' });
 				return { awaitingUserApproval: true };
 			}
+			return this._continueToolTurn(threadId, turn);
+		}
+		return {};
+	}
 
-			access.updateLatestTool(threadId, {
+	private _persistActiveToolRequest(turn: ActiveToolTurn, toolCall: RawToolCallObj, callState: ToolCallState): boolean {
+		if (callState.toolRequestPersisted) return true;
+		let params: unknown = toolCall.rawParams;
+		if (isAToolName(toolCall.name)) {
+			try {
+				params = this._toolsService.validateParams[toolCall.name](toolCall.rawParams);
+				turn.validatedParamsById.set(toolCall.id, params);
+			} catch (error) {
+				const errorMessage = getErrorMessage(error);
+				turn.access.addMessageToThread(turn.coordinator.state.threadId, {
+					role: 'tool',
+					type: 'invalid_params',
+					rawParams: toolCall.rawParams,
+					result: null,
+					name: toolCall.name,
+					content: errorMessage,
+					id: toolCall.id
+				});
+				turn.coordinator.fail(toolCall.id, errorMessage);
+				return false;
+			}
+		}
+		turn.coordinator.markToolRequestPersisted(toolCall.id);
+		turn.access.addMessageToThread(turn.coordinator.state.threadId, {
+			role: 'tool',
+			type: 'tool_request',
+			content: '(Awaiting user permission...)',
+			result: null,
+			name: toolCall.name,
+			params: params as Record<string, unknown>,
+			id: toolCall.id,
+			rawParams: toolCall.rawParams
+		});
+		return true;
+	}
+
+	private async _executeCoordinatedToolCall(
+		threadId: string,
+		turn: ActiveToolTurn,
+		toolCall: RawToolCallObj,
+		preapproved: boolean
+	): Promise<void> {
+		if (!preapproved) turn.coordinator.startExecution(toolCall.id);
+		if (this._isToolDisabled(toolCall.name)) {
+			const disabledError = this._disabledToolError(toolCall.name);
+			this._addToolErrorMessage(threadId, toolCall, disabledError, turn.access);
+			turn.coordinator.fail(toolCall.id, disabledError);
+			return;
+		}
+		let validatedParams = turn.validatedParamsById.get(toolCall.id);
+		if (validatedParams === undefined) {
+			if (isAToolName(toolCall.name)) {
+				try {
+					validatedParams = this._toolsService.validateParams[toolCall.name](toolCall.rawParams);
+				} catch (error) {
+					const errorMessage = getErrorMessage(error);
+					turn.access.addMessageToThread(threadId, {
+						role: 'tool',
+						type: 'invalid_params',
+						rawParams: toolCall.rawParams,
+						result: null,
+						name: toolCall.name,
+						content: errorMessage,
+						id: toolCall.id
+					});
+					turn.coordinator.fail(toolCall.id, errorMessage);
+					return;
+				}
+			} else {
+				validatedParams = toolCall.rawParams;
+			}
+			turn.validatedParamsById.set(toolCall.id, validatedParams);
+		}
+		if (!isAToolName(toolCall.name)) {
+			turn.access.updateLatestTool(threadId, {
 				role: 'tool',
 				type: 'running_now',
-				name: toolCall.name as any,
-				params: toolCall.rawParams as any,
+				name: toolCall.name,
+				params: toolCall.rawParams,
 				content: 'running...',
 				displayContent: 'running...',
 				result: null,
 				id: toolCall.id,
 				rawParams: toolCall.rawParams
 			});
-
-			const exec = await this._runDynamicToolExec(
-				toolCall.name,
-				toJsonObject(toolCall.rawParams)
-			);
-
-			if (this._isThreadExecutionStopped(threadId, runGeneration)) {
-				access.updateLatestTool(threadId, {
-					role: 'tool',
-					type: 'tool_error',
-					params: toolCall.rawParams as any,
-					result: this.toolErrMsgs.interrupted,
-					name: toolCall.name as any,
-					content: this.toolErrMsgs.interrupted,
-					displayContent: this.toolErrMsgs.interrupted,
-					id: toolCall.id,
-					rawParams: toolCall.rawParams
-				});
-				for (const remainingToolCall of toolCalls.slice(i + 1)) {
-					this._addToolErrorMessage(threadId, remainingToolCall, this.toolErrMsgs.interrupted, access);
-				}
-				this._stopPendingToolCalls(threadId, access);
-				return { interrupted: true };
-			}
-
+			const exec = await this._runDynamicToolExec(toolCall.name, toJsonObject(toolCall.rawParams));
 			if (!exec.ok) {
-				access.updateLatestTool(threadId, {
+				turn.access.updateLatestTool(threadId, {
 					role: 'tool',
 					type: 'tool_error',
-					params: toolCall.rawParams as any,
+					params: toolCall.rawParams,
 					result: exec.error,
-					name: toolCall.name as any,
+					name: toolCall.name,
 					content: exec.error,
 					displayContent: exec.error,
 					id: toolCall.id,
 					rawParams: toolCall.rawParams
 				});
-			} else {
-				const { result: processedResult, content, displayContent } =
-					await this._toolOutputManager.processToolResult(exec.value, toolCall.name);
-
-				access.updateLatestTool(threadId, {
-					role: 'tool',
-					type: 'success',
-					params: toolCall.rawParams as any,
-					result: processedResult,
-					name: toolCall.name as any,
-					content,
-					displayContent,
-					id: toolCall.id,
-					rawParams: toolCall.rawParams
-				});
+				turn.coordinator.fail(toolCall.id, exec.error);
+				return;
 			}
-
-			executedOrErrored = true;
+			const { result, content, displayContent } = await this._toolOutputManager.processToolResult(exec.value, toolCall.name);
+			turn.access.updateLatestTool(threadId, {
+				role: 'tool',
+				type: 'success',
+				params: toolCall.rawParams,
+				result,
+				name: toolCall.name,
+				content,
+				displayContent,
+				id: toolCall.id,
+				rawParams: toolCall.rawParams
+			});
+			turn.coordinator.succeed(toolCall.id, result);
+			return;
 		}
+		const { interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, {
+			preapproved: true,
+			unvalidatedToolParams: toolCall.rawParams,
+			validatedParams
+		}, turn.access);
+		const currentCall = turn.coordinator.state.calls.get(toolCall.id);
+		if (!currentCall || currentCall.phase !== 'running') return;
+		if (interrupted) {
+			turn.coordinator.interrupt(toolCall.id, this.toolErrMsgs.interrupted);
+			return;
+		}
+		const terminalMessage = [...turn.access.getThreadMessages(threadId)].reverse()
+			.find(message => message.role === 'tool' && message.id === toolCall.id);
+		if (terminalMessage?.role === 'tool' && terminalMessage.type === 'success') {
+			turn.coordinator.succeed(toolCall.id, terminalMessage.result);
+		} else {
+			const message = terminalMessage?.role === 'tool' && terminalMessage.type === 'tool_error'
+				? terminalMessage.result
+				: 'Tool call did not produce a terminal result.';
+			turn.coordinator.fail(toolCall.id, message);
+		}
+	}
 
-		const pendingResult = await drainPendingParallelToolExecutions();
-		if (pendingResult.interrupted || pendingResult.awaitingUserApproval) return pendingResult;
+	public async approveToolCall(threadId: string, callId: string): Promise<void> {
+		const turn = this._toolTurnsByThread.get(threadId);
+		if (!turn) throw new ToolTurnInvariantError('unknown_tool_call');
+		const toolCall = turn.toolCallsById.get(callId);
+		if (!toolCall) throw new ToolTurnInvariantError('unknown_tool_call');
+		turn.coordinator.approve(callId);
+		await this._executeCoordinatedToolCall(threadId, turn, toolCall, true);
+		await this._continueToolTurn(threadId, turn);
+		await this._resumeSettledToolTurn(threadId, turn);
+	}
 
-		return executedOrErrored ? {} : {};
+	public async rejectToolCall(threadId: string, callId: string): Promise<void> {
+		const turn = this._toolTurnsByThread.get(threadId);
+		if (!turn) throw new ToolTurnInvariantError('unknown_tool_call');
+		turn.coordinator.reject(callId, this.toolErrMsgs.rejected);
+		const rejectedToolCall = turn.toolCallsById.get(callId);
+		if (!rejectedToolCall) throw new ToolTurnInvariantError('unknown_tool_call');
+		turn.access.updateLatestTool(threadId, {
+			role: 'tool',
+			type: 'rejected',
+			params: turn.validatedParamsById.get(callId) ?? rejectedToolCall.rawParams,
+			name: rejectedToolCall.name,
+			content: this.toolErrMsgs.rejected,
+			displayContent: this.toolErrMsgs.rejected,
+			result: null,
+			id: callId,
+			rawParams: rejectedToolCall.rawParams
+		});
+		await this._continueToolTurn(threadId, turn);
+		await this._resumeSettledToolTurn(threadId, turn);
+	}
+
+	public async skipToolCall(threadId: string, callId: string): Promise<void> {
+		const turn = this._toolTurnsByThread.get(threadId);
+		if (!turn) throw new ToolTurnInvariantError('unknown_tool_call');
+		turn.coordinator.skip(callId, 'User skipped this tool.');
+		const skippedToolCall = turn.toolCallsById.get(callId);
+		if (!skippedToolCall) throw new ToolTurnInvariantError('unknown_tool_call');
+		turn.access.updateLatestTool(threadId, {
+			role: 'tool',
+			type: 'skipped',
+			params: turn.validatedParamsById.get(callId) ?? skippedToolCall.rawParams,
+			name: skippedToolCall.name,
+			content: 'User skipped this tool.',
+			displayContent: 'User skipped this tool.',
+			result: null,
+			id: callId,
+			rawParams: skippedToolCall.rawParams
+		});
+		await this._continueToolTurn(threadId, turn);
+		await this._resumeSettledToolTurn(threadId, turn);
+	}
+
+	private _assertOneTerminalResultPerCall(turn: ActiveToolTurn): void {
+		const terminalMessageTypes = new Set(['success', 'tool_error', 'invalid_params', 'rejected', 'skipped']);
+		const resultCounts = new Map<string, number>();
+		for (const message of turn.access.getThreadMessages(turn.coordinator.state.threadId).slice(turn.resultMessageStartIndex)) {
+			if (message.role !== 'tool' || !turn.toolCallsById.has(message.id) || !terminalMessageTypes.has(message.type)) continue;
+			resultCounts.set(message.id, (resultCounts.get(message.id) ?? 0) + 1);
+		}
+		for (const callId of turn.toolCallsById.keys()) {
+			if (resultCounts.get(callId) !== 1) throw new ToolTurnInvariantError('llm_resume_before_tool_turn_settled');
+		}
+	}
+
+	private async _resumeSettledToolTurn(threadId: string, turn: ActiveToolTurn): Promise<void> {
+		if (!turn.coordinator.isTurnSettled || turn.loopDetected) {
+			if (turn.coordinator.state.activeApprovalCallId !== undefined) {
+				turn.access.setStreamState(threadId, { isRunning: 'awaiting_user' });
+			}
+			return;
+		}
+		await turn.coordinator.whenTurnSettled;
+		this._assertOneTerminalResultPerCall(turn);
+		turn.coordinator.assertCanResumeLLM();
+		turn.coordinator.dispose();
+		this._toolTurnsByThread.delete(threadId);
+		turn.access.setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' });
+		if (this._resumeToolTurn) {
+			await this._resumeToolTurn(threadId);
+		} else {
+			await this.runChatAgent({ threadId, ...turn.access.currentModelSelectionProps() }, turn.access);
+		}
 	}
 
 	private async _runToolCall(
@@ -968,10 +1076,10 @@ export class ChatExecutionEngine {
 			}
 
 			if (isAToolName(toolName)) {
-				const approvalType = approvalTypeOfToolName[toolName];
-				if (approvalType) {
-					let autoApprove = this._settingsService.state.globalSettings.autoApprove[approvalType];
-					if (approvalType === 'terminal' && toolName === 'run_command') {
+				const approvalRequirement = getToolApprovalRequirement(toolName);
+				if (approvalRequirement.kind === 'manual') {
+					let autoApprove = this._settingsService.state.globalSettings.autoApprove[approvalRequirement.category];
+					if (approvalRequirement.category === 'terminal' && toolName === 'run_command') {
 						try {
 							const cmd = (toolParams as any)?.command ?? String((opts.unvalidatedToolParams as any)?.command ?? '');
 							if (isDangerousTerminalCommand(cmd)) autoApprove = false;

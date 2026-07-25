@@ -7,6 +7,10 @@ import assert from 'assert';
 import { sendChatRouter, runStream, __test as implTestExports } from '../sendLLMMessage.impl.js';
 import { setDynamicModelService } from '../../../common/modelInference.js';
 import type { OnFinalMessage, OnText } from '../../../common/sendLLMMessageTypes.js';
+
+type ChatCompletionMessageParam = import('openai/resources/chat/completions').ChatCompletionMessageParam;
+import { availableTools } from '../../../common/toolsRegistry.js';
+import { toOpenAICompatibleTool } from '../toolSchemaConversion.js';
 // eslint-disable-next-line local/code-import-patterns
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 
@@ -714,6 +718,170 @@ suite('runStream (OpenAI-compatible)', () => {
 		assert.strictEqual(fin.toolCalls?.length, 2);
 		assert.strictEqual(fin.toolCall, fin.toolCalls![0]);
 		assert.deepStrictEqual(fin.toolCalls!.map(t => t.id), ['call_a', 'call_b']);
+	});
+
+	test('provider 429 without body keeps status, correlation metadata, redaction, and retryability', () => {
+		const metadata = implTestExports.providerHttpErrorMetadata({
+			status: 429,
+			headers: {
+				'authorization': 'Bearer secret',
+				'cookie': 'session=secret',
+				'x-oneapi-request-id': 'req-429',
+				'retry-after': '2',
+			},
+		});
+
+		assert.ok(metadata);
+		assert.strictEqual(metadata.status, 429);
+		assert.strictEqual(metadata.bodyPresent, false);
+		assert.strictEqual(metadata.requestId, 'req-429');
+		assert.strictEqual(metadata.retryable, true);
+		assert.strictEqual(metadata.retryAfterMs, 2000);
+		assert.strictEqual(metadata.safeHeaders.authorization, 'Bearer ***');
+		assert.strictEqual(metadata.safeHeaders.cookie, '***');
+		assert.strictEqual(metadata.safeHeaders['x-oneapi-request-id'], 'req-429');
+		assert.match(implTestExports.providerHttpErrorMessage(metadata), /Provider rate limit \(HTTP 429\)/);
+		assert.match(implTestExports.providerHttpErrorMessage(metadata), /Response body was absent/);
+	});
+
+	test('runStream retries 429 without body within limits but never retries unchanged 400', async () => {
+		class FakeAPIError extends Error {
+			constructor(readonly status: number, readonly headers: Record<string, string>) {
+				super(`${status} status code (no body)`);
+			}
+		}
+		implTestExports.setOpenAIModule({ default: class { }, APIError: FakeAPIError } as any);
+
+		let rateLimitAttempts = 0;
+		const rateLimitCaps = newCaptures();
+		await runStream({
+			openai: {
+				chat: {
+					completions: {
+						create: async () => {
+							rateLimitAttempts += 1;
+							if (rateLimitAttempts === 1) throw new FakeAPIError(429, { 'x-oneapi-request-id': 'req-first' });
+							return makeNonStreamResp({ content: 'ok' });
+						},
+					},
+				},
+			} as any,
+			options: { model: 'o4-mini', messages: [], stream: true } as any,
+			onText: rateLimitCaps.onText,
+			onFinalMessage: rateLimitCaps.onFinalMessage,
+			onError: (e) => assert.fail('onError ' + e.message),
+			_setAborter: () => { },
+			providerName: 'openAICompatible',
+			lengthRetryPolicy: { enabled: true, maxAttempts: 2 },
+		});
+		assert.strictEqual(rateLimitAttempts, 2);
+		assert.strictEqual(rateLimitCaps.getFinal()?.fullText, 'ok');
+
+		let badRequestAttempts = 0;
+		let terminalErrorMessage = '';
+		await runStream({
+			openai: {
+				chat: {
+					completions: {
+						create: async () => {
+							badRequestAttempts += 1;
+							throw new FakeAPIError(400, { 'x-oneapi-request-id': 'req-400' });
+						},
+					},
+				},
+			} as any,
+			options: { model: 'o4-mini', messages: [], stream: true } as any,
+			onText: () => { },
+			onFinalMessage: () => assert.fail('unexpected final'),
+			onError: (error) => { terminalErrorMessage = error.message; },
+			_setAborter: () => { },
+			providerName: 'openAICompatible',
+			lengthRetryPolicy: { enabled: true, maxAttempts: 2 },
+		});
+		assert.strictEqual(badRequestAttempts, 1);
+		assert.match(terminalErrorMessage, /Provider rejected the request \(HTTP 400\)/);
+	});
+
+	test('OpenAI-compatible preflight validates complete turns, tools, and arguments locally', () => {
+		const tools = (availableTools('agent') ?? []).map(tool => toOpenAICompatibleTool(tool));
+		assert.deepStrictEqual(tools.map(tool => tool.function.name), [
+			'read_file',
+			'ls_dir',
+			'get_dir_tree',
+			'edit_file',
+			'search_pathnames_only',
+			'search_for_files',
+			'search_in_file',
+			'read_lint_errors',
+			'activate_skill',
+			'rewrite_file',
+			'create_file_or_folder',
+			'delete_file_or_folder',
+			'run_command',
+		]);
+		assert.strictEqual(tools.length, 13);
+		const userMessage: ChatCompletionMessageParam = { role: 'user', content: 'read' };
+		const assistantMessage: ChatCompletionMessageParam = {
+			role: 'assistant',
+			content: '',
+			tool_calls: [{
+				type: 'function',
+				id: 'call-read',
+				function: { name: 'read_file', arguments: '{"uri":"./a.ts"}' },
+			}],
+		};
+		const toolMessage: ChatCompletionMessageParam = { role: 'tool', tool_call_id: 'call-read', content: 'ok' };
+		const messages: ChatCompletionMessageParam[] = [userMessage, assistantMessage, toolMessage];
+		const invalidAssistantMessage: ChatCompletionMessageParam = {
+			role: 'assistant',
+			content: '',
+			tool_calls: [{ type: 'function', id: 'call-read', function: { name: 'read_file', arguments: '{' } }],
+		};
+		const invalidMessages: ChatCompletionMessageParam[] = [userMessage, invalidAssistantMessage, toolMessage];
+		const valid = implTestExports.preflightOpenAICompatibleRequest({ model: 'test', messages, tools, stream: true });
+		assert.strictEqual(valid.diagnostics.preflightOk, true);
+		assert.strictEqual(valid.diagnostics.toolCallCount, 1);
+		assert.strictEqual(valid.diagnostics.toolResultCount, 1);
+
+		const missingDefinition = implTestExports.preflightOpenAICompatibleRequest({ model: 'test', messages, tools: [], stream: true });
+		assert.ok(missingDefinition.diagnostics.preflightIssueCodes.includes('missing_tool_definition'));
+		const invalidArguments = implTestExports.preflightOpenAICompatibleRequest({
+			model: 'test',
+			messages: invalidMessages,
+			tools,
+			stream: true,
+		});
+		assert.ok(invalidArguments.diagnostics.preflightIssueCodes.includes('invalid_tool_arguments_json'));
+	});
+
+	test('production-shaped boundary compacts only complete assistant-tool groups and preserves all definitions', () => {
+		const tools = (availableTools('agent') ?? []).map(tool => toOpenAICompatibleTool(tool));
+		const messages: ChatCompletionMessageParam[] = [{ role: 'developer', content: 'system' }, { role: 'user', content: 'start' }];
+		for (let index = 0; index < 24; index += 1) {
+			const id = `call-${index}`;
+			messages.push({
+				role: 'assistant',
+				content: '',
+				tool_calls: [{ type: 'function', id, function: { name: 'read_file', arguments: `{"uri":"./${index}.ts"}` } }],
+			});
+			messages.push({ role: 'tool', tool_call_id: id, content: 'x'.repeat(70_000) });
+		}
+		messages.push({ role: 'user', content: 'continue' });
+		const prepared = implTestExports.prepareOpenAICompatibleRequest({ model: 'test', messages, tools, stream: true }, {
+			contextWindow: 1_000_000,
+			reservedOutputTokens: 4_096,
+			hardByteLimit: 1_600_000,
+		});
+
+		assert.strictEqual(prepared.diagnostics.preflightOk, true);
+		assert.ok(prepared.diagnostics.compactedTurnGroupCount > 0);
+		assert.ok(prepared.diagnostics.serializedBytes <= 1_500_000);
+		assert.strictEqual(prepared.options.tools?.length, tools.length);
+		const ids = new Set<string>();
+		for (const message of prepared.options.messages) {
+			if (message.role === 'assistant') for (const call of message.tool_calls ?? []) ids.add(call.id);
+			if (message.role === 'tool') assert.ok(ids.has(message.tool_call_id));
+		}
 	});
 
 	test('E13: empty tool name -> no toolCall in final', async () => {

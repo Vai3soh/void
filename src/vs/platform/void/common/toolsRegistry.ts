@@ -6,9 +6,9 @@
 
 import {
 	ToolCallParams, ToolResultType,
-	approvalTypeOfToolName,
 	type SnakeCaseKeys, type ToolName
 } from './toolsServiceTypes.js';
+import { getToolApprovalRequirement } from './toolApprovalPolicy.js';
 import type { ChatMode } from './voidSettingsTypes.js';
 
 export type InternalToolInfo = {
@@ -188,7 +188,7 @@ export const availableTools = (chatMode: ChatMode) => {
 	const toolNamesForMode: ToolName[] | undefined =
 		chatMode === 'gather'
 			? (Object.keys(voidTools) as ToolName[]).filter(
-				toolName => !(toolName in approvalTypeOfToolName),
+				toolName => getToolApprovalRequirement(toolName).kind !== 'manual',
 			)
 			: chatMode === 'agent'
 				? (Object.keys(voidTools) as ToolName[])

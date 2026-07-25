@@ -29,6 +29,57 @@ export type ProviderRouting = {
 	[k: string]: any;
 };
 
+export type ProviderHttpErrorMetadata = {
+	kind: 'provider-http';
+	status: number;
+	bodyPresent: boolean;
+	safeHeaders: Record<string, string>;
+	requestId?: string;
+	retryable: boolean;
+	retryAfterMs?: number;
+	requestDiagnostics?: OpenAICompatibleRequestDiagnostics;
+};
+
+export type LLMError = {
+	message: string;
+	fullError: Error | null;
+	providerHttp?: ProviderHttpErrorMetadata;
+};
+
+export type OpenAICompatiblePreflightIssueCode =
+	| 'invalid_message_role_order'
+	| 'duplicate_tool_call_id'
+	| 'missing_tool_result'
+	| 'orphan_tool_result'
+	| 'duplicate_tool_result'
+	| 'invalid_tool_arguments_json'
+	| 'missing_tool_definition'
+	| 'incompatible_tool_definition'
+	| 'invalid_tool_schema'
+	| 'request_budget_exceeded';
+
+export type OpenAICompatiblePreflightIssue = {
+	code: OpenAICompatiblePreflightIssueCode;
+	messageIndex?: number;
+	toolCallId?: string;
+	toolName?: string;
+};
+
+export type OpenAICompatibleRequestDiagnostics = {
+	serializedBytes: number;
+	estimatedTokens: number;
+	contextWindow?: number;
+	reservedOutputTokens?: number;
+	estimatedInputBudget?: number;
+	messageCount: number;
+	toolDefinitionCount: number;
+	toolCallCount: number;
+	toolResultCount: number;
+	preflightOk: boolean;
+	preflightIssueCodes: OpenAICompatiblePreflightIssueCode[];
+	compactedTurnGroupCount: number;
+};
+
 export type DynamicRequestConfig = {
 	endpoint: string;
 	apiStyle: 'openai-compatible' | 'anthropic-style' | 'gemini-style' | 'disabled';
@@ -188,7 +239,7 @@ export type OnFinalMessage = (p: {
 	/** Final per-request token usage when the provider reports it. */
 	tokenUsage?: LLMTokenUsage;
 }) => void // id is tool_use_id
-export type OnError = (p: { message: string; fullError: Error | null }) => void
+export type OnError = (p: LLMError) => void
 export type OnAbort = () => void
 export type AbortRef = { current: (() => void) | null }
 

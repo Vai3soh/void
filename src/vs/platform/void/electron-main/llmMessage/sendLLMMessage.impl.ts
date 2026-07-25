@@ -30,6 +30,7 @@ const XML_TOOL_FORMAT_CORRECTION_PROMPT = [
 ].join(' ');
 
 type ChatCompletionCreateParamsStreaming = import('openai/resources/chat/completions').ChatCompletionCreateParamsStreaming;
+type ChatCompletionMessageParam = import('openai/resources/chat/completions').ChatCompletionMessageParam;
 type OpenAIChatCompletionTool = import('openai/resources/chat/completions/completions.js').ChatCompletionTool;
 type OpenAIClient = import('openai').OpenAI;
 type OpenAIClientOptions = import('openai').ClientOptions;
@@ -37,6 +38,10 @@ type GoogleGeminiTool = import('@google/genai').Tool;
 type GoogleThinkingConfig = import('@google/genai').ThinkingConfig;
 type AnthropicToolUseBlock = import('@anthropic-ai/sdk').Anthropic.ToolUseBlock;
 type AnthropicClientOptions = import('@anthropic-ai/sdk').ClientOptions;
+
+type OpenAICompatibleRequestDiagnostics = import('../../common/sendLLMMessageTypes.js').OpenAICompatibleRequestDiagnostics;
+type OpenAICompatiblePreflightIssue = import('../../common/sendLLMMessageTypes.js').OpenAICompatiblePreflightIssue;
+type ProviderHttpErrorMetadata = import('../../common/sendLLMMessageTypes.js').ProviderHttpErrorMetadata;
 
 type FetchForOpenAI = NonNullable<OpenAIClientOptions['fetch']>;
 type FetchForAnthropic = NonNullable<AnthropicClientOptions['fetch']>;
@@ -83,6 +88,11 @@ const toOpenAICompatibleFetchResponse = async (response: Response): Promise<Node
 
 const fetchForOpenAI: FetchForOpenAI = async (url, init): Promise<FetchResponseForOpenAI> => {
 	const response = await globalThis.fetch(String(url), init as GlobalFetchInit);
+	latestProviderHttpResponseMetadata = {
+		status: response.status,
+		headers: normalizeHeaders(response.headers),
+		bodyPresent: response.body !== null,
+	};
 	return toOpenAICompatibleFetchResponse(response);
 };
 const fetchForAnthropic: FetchForAnthropic = async (url, init) => {
@@ -109,20 +119,27 @@ const getGoogleGenAIModule = async () => googleGenAIModule ??= await import('@go
 let ollamaModule: (typeof import('ollama')) | undefined;
 const getOllamaModule = async () => ollamaModule ??= await import('ollama');
 
-const normalizeHeaders = (h: any): Record<string, string> => {
+const normalizeHeaders = (headers: unknown): Record<string, string> => {
 	try {
-		if (!h) return {};
-		// WHATWG Headers
-		if (typeof h.entries === 'function') return Object.fromEntries(Array.from(h.entries()));
-		// [ [k,v], ... ]
-		if (Array.isArray(h)) return Object.fromEntries(h);
-		// plain object
-		if (typeof h === 'object') return { ...h };
-		return { value: String(h) };
+		if (!headers) return {};
+		if (headers instanceof Headers) return Object.fromEntries(headers.entries());
+		if (Array.isArray(headers)) {
+			const entries = headers.filter((entry): entry is readonly [string, string] =>
+				Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string'
+			);
+			return Object.fromEntries(entries.map(([key, value]) => [key, String(value)]));
+		}
+		if (typeof headers === 'object') {
+			const entries = Object.entries(headers).map(([key, value]) => [key, String(value)] as const);
+			return Object.fromEntries(entries);
+		}
+		return { value: String(headers) };
 	} catch {
 		return {};
 	}
 };
+
+let latestProviderHttpResponseMetadata: { status: number; headers: Record<string, string>; bodyPresent: boolean } | undefined;
 
 let _fetchDebugInstalled = false;
 let _origFetchForDebugLogging: typeof globalThis.fetch | undefined;
@@ -161,6 +178,8 @@ const _redactHeaders = (headers: Record<string, string>): Record<string, string>
 		'api-key',
 		'x-goog-api-key',
 		'proxy-authorization',
+		'cookie',
+		'set-cookie',
 	]);
 
 	for (const [k, v] of Object.entries(out)) {
@@ -171,20 +190,52 @@ const _redactHeaders = (headers: Record<string, string>): Record<string, string>
 	return out;
 };
 
-const _shouldRedactKey = (key: string): boolean => {
-	return /(api[-_]?key|authorization|token$|secret|password|session)/i.test(key);
+const providerRequestIdHeaderNames = [
+	'x-oneapi-request-id',
+	'x-request-id',
+	'request-id',
+	'cf-ray',
+] as const;
+
+const safeProviderHeaderNames = new Set([
+	...providerRequestIdHeaderNames,
+	'retry-after',
+	'content-type',
+	'date',
+	'server',
+	'via',
+	'cache-control',
+	'x-ratelimit-limit',
+	'x-ratelimit-remaining',
+	'x-ratelimit-reset',
+	'x-new-api-version',
+]);
+
+const sensitiveProviderHeaderNames = new Set([
+	'authorization',
+	'proxy-authorization',
+	'x-api-key',
+	'api-key',
+	'x-goog-api-key',
+	'cookie',
+	'set-cookie',
+]);
+
+const _safeProviderHeaders = (headers: Record<string, string>): Record<string, string> => {
+	const safeHeaders: Record<string, string> = {};
+	for (const [key, value] of Object.entries(headers)) {
+		const normalizedKey = key.toLowerCase();
+		if (sensitiveProviderHeaderNames.has(normalizedKey)) {
+			safeHeaders[normalizedKey] = _redactHeaderValue(normalizedKey, value);
+		} else if (safeProviderHeaderNames.has(normalizedKey) || normalizedKey.startsWith('x-ratelimit-')) {
+			safeHeaders[normalizedKey] = value;
+		}
+	}
+	return safeHeaders;
 };
 
-const _deepRedact = (v: unknown): unknown => {
-	if (Array.isArray(v)) return v.map(_deepRedact);
-	if (!_isPlainObject(v)) return v;
-
-	const out: Record<string, unknown> = {};
-	for (const [k, val] of Object.entries(v)) {
-		if (_shouldRedactKey(k)) out[k] = '***';
-		else out[k] = _deepRedact(val);
-	}
-	return out;
+const _shouldRedactKey = (key: string): boolean => {
+	return /(api[-_]?key|authorization|token$|secret|password|session)/i.test(key);
 };
 
 const _redactUrl = (url: string): string => {
@@ -198,6 +249,34 @@ const _redactUrl = (url: string): string => {
 		return parsed.toString();
 	} catch {
 		return url.replace(/([?&](?:key|api[-_]?key|token|secret|password|authorization)=)[^&]*/gi, '$1***');
+	}
+};
+
+const _requestDiagnosticsFromSerializedBody = (body: string): OpenAICompatibleRequestDiagnostics | undefined => {
+	try {
+		const parsed = JSON.parse(body) as { messages?: unknown[]; tools?: unknown[] };
+		const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+		const tools = Array.isArray(parsed.tools) ? parsed.tools : [];
+		let toolCallCount = 0;
+		let toolResultCount = 0;
+		for (const message of messages) {
+			if (!_isPlainObject(message)) continue;
+			if (Array.isArray(message.tool_calls)) toolCallCount += message.tool_calls.length;
+			if (message.role === 'tool') toolResultCount += 1;
+		}
+		return {
+			serializedBytes: Buffer.byteLength(body, 'utf8'),
+			estimatedTokens: Math.ceil(body.length / 4),
+			messageCount: messages.length,
+			toolDefinitionCount: tools.length,
+			toolCallCount,
+			toolResultCount,
+			preflightOk: true,
+			preflightIssueCodes: [],
+			compactedTurnGroupCount: 0,
+		};
+	} catch {
+		return undefined;
 	}
 };
 
@@ -230,14 +309,9 @@ export function installDebugFetchLogging(logService: ILogService): void {
 					_logDebug(logService, `HTTP Headers`, hdrs);
 
 					if (init?.body) {
-						const bodyStr = (typeof init.body === 'string') ? init.body : '';
+						const bodyStr = typeof init.body === 'string' ? init.body : '';
 						if (bodyStr) {
-							try {
-								const parsed = JSON.parse(bodyStr);
-								_logDebug(logService, `HTTP Body (json, redacted)`, _deepRedact(parsed));
-							} catch {
-								_logDebug(logService, `HTTP Body (non-json)`, '[omitted]');
-							}
+							_logDebug(logService, 'HTTP Request Diagnostics', _requestDiagnosticsFromSerializedBody(bodyStr));
 						} else {
 							_logDebug(logService, `HTTP Body`, '[non-string body omitted]');
 						}
@@ -899,6 +973,7 @@ export interface RunStreamParams {
 	// NEW (optional)
 	notificationService?: INotificationService
 	notifyOnTruncation?: boolean
+	requestDiagnostics?: OpenAICompatibleRequestDiagnostics
 }
 
 export async function runStream({
@@ -919,6 +994,7 @@ export async function runStream({
 	lengthRetryPolicy = { enabled: true, maxAttempts: 2, maxTokensCap: 16384, increaseStrategy: 'add', step: 2000, factor: 1.5 },
 	notificationService,
 	notifyOnTruncation = true,
+	requestDiagnostics,
 }: RunStreamParams): Promise<void> {
 
 	const policy: Required<LengthRetryPolicy> = {
@@ -936,7 +1012,7 @@ export async function runStream({
 	const OpenAIApiError = openAIExports?.APIError;
 
 	let everHadAnyData = false;
-	let currentOptions: any = { ...options, stream: true };
+	let currentOptions: ChatCompletionCreateParamsStreaming = { ...options, stream: true };
 	let lastTokenUsage: LLMTokenUsage | undefined;
 
 	// ---------------- [LLM][debug][runStream] helpers ----------------
@@ -1708,7 +1784,7 @@ export async function runStream({
 			onError({ message: 'Void: Response from model was empty.', fullError: null });
 			return;
 
-		} catch (error: any) {
+		} catch (error: unknown) {
 			if (timeoutHandle) {
 				clearTimeout(timeoutHandle);
 				timeoutHandle = null;
@@ -1721,7 +1797,7 @@ export async function runStream({
 					const usagePayload = lastTokenUsage ? { tokenUsage: lastTokenUsage } : {};
 					__dbg('caught AbortError after tool completion; finalizing with toolCall', {
 						attempt,
-						toolName: (toolCall as any)?.name ?? null,
+						toolName: toolCall.name,
 					});
 					onFinalMessage({
 						fullText: fullTextSoFar,
@@ -1750,28 +1826,42 @@ export async function runStream({
 				return;
 			}
 
+			const errorRecord = _isPlainObject(error) ? error : {};
+			const errorCause = _isPlainObject(errorRecord.cause) ? errorRecord.cause : {};
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			const providerHttp = _providerHttpErrorMetadata(error, requestDiagnostics);
 			_logWarn(logService, 'runStream threw error', {
 				providerName,
 				attempt,
-				errorName: error?.name,
-				errorMessage: error?.message ?? String(error),
-				errorCode: error?.code,
+				errorName: error instanceof Error ? error.name : undefined,
+				errorMessage,
+				errorCode: errorRecord.code,
 				cause: {
-					name: error?.cause?.name,
-					message: error?.cause?.message,
-					code: error?.cause?.code,
+					name: errorCause.name,
+					message: errorCause.message,
+					code: errorCause.code,
 				},
-				stack: error?.stack,
+				providerHttp,
+				stack: error instanceof Error ? error.stack : undefined,
 			});
 
-			if (OpenAIApiError && error instanceof OpenAIApiError) {
-				if (error.status === 401) {
-					onError({ message: invalidApiKeyMessage(providerName), fullError: error });
+			if (providerHttp?.retryable && attempt < policy.maxAttempts) {
+				const backoffMs = Math.min(providerHttp.retryAfterMs ?? (500 * attempt), 30_000);
+				await sleep(backoffMs);
+				continue;
+			}
+
+			const fullError = error instanceof Error ? error : new Error(errorMessage);
+			if (providerHttp) {
+				if (providerHttp.status === 401) {
+					onError({ message: invalidApiKeyMessage(providerName), fullError, providerHttp });
 				} else {
-					onError({ message: `API Error: ${error.message}`, fullError: error });
+					onError({ message: _providerHttpErrorMessage(providerHttp), fullError, providerHttp });
 				}
+			} else if (OpenAIApiError && error instanceof OpenAIApiError && error.status === 401) {
+				onError({ message: invalidApiKeyMessage(providerName), fullError });
 			} else {
-				onError({ message: error?.message || String(error), fullError: error });
+				onError({ message: errorMessage, fullError });
 			}
 			return;
 		}
@@ -1818,8 +1908,294 @@ function createNativeTools(
 	};
 }
 
+type OpenAICompatibleRequestEnvelope = {
+	model: string;
+	messages: ChatCompletionMessageParam[];
+	stream: true;
+	tools?: OpenAIChatCompletionTool[];
+	tool_choice?: ChatCompletionCreateParamsStreaming['tool_choice'];
+	[key: string]: unknown;
+};
+
+type OpenAIToolTurnGroup = {
+	start: number;
+	end: number;
+};
+
+type OpenAICompatiblePreflightOptions = {
+	contextWindow?: number;
+	reservedOutputTokens?: number;
+	hardByteLimit?: number;
+};
+
+type OpenAICompatiblePreparedRequest = {
+	options: OpenAICompatibleRequestEnvelope;
+	diagnostics: OpenAICompatibleRequestDiagnostics;
+	issues: OpenAICompatiblePreflightIssue[];
+};
+
+const OPENAI_COMPATIBLE_COMPACTION_TARGET_BYTES = 1_500_000;
+const OPENAI_COMPATIBLE_ESTIMATED_CHARS_PER_TOKEN = 4;
+const OPENAI_COMPATIBLE_ESTIMATED_TOKEN_SAFETY_MARGIN = 1.1;
+
+const _isFunctionToolDefinition = (tool: OpenAIChatCompletionTool): boolean => {
+	if (tool.type !== 'function') return false;
+	if (!tool.function || typeof tool.function.name !== 'string' || !tool.function.name.trim()) return false;
+	const parameters = tool.function.parameters;
+	if (parameters === undefined) return true;
+	if (!_isPlainObject(parameters)) return false;
+	if (parameters.type !== undefined && parameters.type !== 'object') return false;
+	if (parameters.properties !== undefined && !_isPlainObject(parameters.properties)) return false;
+	if (parameters.required !== undefined && !Array.isArray(parameters.required)) return false;
+	return true;
+};
+
+const _toolDefinitionsByName = (tools: readonly OpenAIChatCompletionTool[]): Map<string, OpenAIChatCompletionTool> => {
+	const definitions = new Map<string, OpenAIChatCompletionTool>();
+	for (const tool of tools) {
+		if (tool.type !== 'function') continue;
+		definitions.set(tool.function.name, tool);
+	}
+	return definitions;
+};
+
+const _isCompatibleToolDefinition = (tool: OpenAIChatCompletionTool, argumentsValue: unknown): boolean => {
+	if (!_isFunctionToolDefinition(tool)) return false;
+	const parameters = tool.function.parameters;
+	if (parameters === undefined || !_isPlainObject(parameters)) return true;
+	if (!_isPlainObject(argumentsValue)) return false;
+	const properties = _isPlainObject(parameters.properties) ? parameters.properties : {};
+	const required = Array.isArray(parameters.required)
+		? parameters.required.filter((value): value is string => typeof value === 'string')
+		: [];
+	for (const requiredKey of required) {
+		if (!(requiredKey in argumentsValue)) return false;
+	}
+	if (parameters.additionalProperties === false) {
+		for (const argumentKey of Object.keys(argumentsValue)) {
+			if (!(argumentKey in properties)) return false;
+		}
+	}
+	return true;
+};
+
+const _findOpenAIToolTurnGroups = (messages: readonly ChatCompletionMessageParam[]): OpenAIToolTurnGroup[] => {
+	const groups: OpenAIToolTurnGroup[] = [];
+	for (let index = 0; index < messages.length; index += 1) {
+		const message = messages[index];
+		if (message.role !== 'assistant' || !message.tool_calls?.length) continue;
+		const callIds = new Set(message.tool_calls.map(call => call.id));
+		let end = index;
+		for (let resultIndex = index + 1; resultIndex < messages.length; resultIndex += 1) {
+			const resultMessage = messages[resultIndex];
+			if (resultMessage.role !== 'tool' || !callIds.has(resultMessage.tool_call_id)) break;
+			end = resultIndex;
+		}
+		groups.push({ start: index, end });
+		index = end;
+	}
+	return groups;
+};
+
+const _countOpenAICompatibleRequest = (messages: readonly ChatCompletionMessageParam[], tools: readonly OpenAIChatCompletionTool[]) => {
+	let toolCallCount = 0;
+	let toolResultCount = 0;
+	for (const message of messages) {
+		if (message.role === 'assistant') toolCallCount += message.tool_calls?.length ?? 0;
+		if (message.role === 'tool') toolResultCount += 1;
+	}
+	return {
+		messageCount: messages.length,
+		toolDefinitionCount: tools.length,
+		toolCallCount,
+		toolResultCount,
+	};
+};
+
+const _preflightOpenAICompatibleRequest = (
+	options: OpenAICompatibleRequestEnvelope,
+	preflightOptions: OpenAICompatiblePreflightOptions = {},
+	compactedTurnGroupCount = 0
+): OpenAICompatiblePreparedRequest => {
+	const issues: OpenAICompatiblePreflightIssue[] = [];
+	const tools = options.tools ?? [];
+	const definitions = _toolDefinitionsByName(tools);
+	const callInfoById = new Map<string, { name: string; messageIndex: number; resultCount: number }>();
+	let openCallIds = new Set<string>();
+
+	for (const [toolIndex, tool] of tools.entries()) {
+		if (!_isFunctionToolDefinition(tool)) {
+			issues.push({ code: 'invalid_tool_schema', messageIndex: toolIndex, toolName: tool.function?.name });
+		}
+	}
+
+	for (let messageIndex = 0; messageIndex < options.messages.length; messageIndex += 1) {
+		const message = options.messages[messageIndex];
+		if (message.role === 'assistant' && message.tool_calls?.length) {
+			if (openCallIds.size > 0) issues.push({ code: 'invalid_message_role_order', messageIndex });
+			openCallIds = new Set<string>();
+			for (const call of message.tool_calls) {
+				if (!call.id || callInfoById.has(call.id)) {
+					issues.push({ code: 'duplicate_tool_call_id', messageIndex, toolCallId: call.id, toolName: call.function.name });
+					continue;
+				}
+				let parsedArguments: unknown;
+				try {
+					parsedArguments = JSON.parse(call.function.arguments);
+				} catch {
+					issues.push({ code: 'invalid_tool_arguments_json', messageIndex, toolCallId: call.id, toolName: call.function.name });
+				}
+				const definition = definitions.get(call.function.name);
+				if (!definition) {
+					issues.push({ code: 'missing_tool_definition', messageIndex, toolCallId: call.id, toolName: call.function.name });
+				} else if (parsedArguments !== undefined && !_isCompatibleToolDefinition(definition, parsedArguments)) {
+					issues.push({ code: 'incompatible_tool_definition', messageIndex, toolCallId: call.id, toolName: call.function.name });
+				}
+				callInfoById.set(call.id, { name: call.function.name, messageIndex, resultCount: 0 });
+				openCallIds.add(call.id);
+			}
+			continue;
+		}
+		if (message.role === 'tool') {
+			const callInfo = callInfoById.get(message.tool_call_id);
+			if (!callInfo || !openCallIds.has(message.tool_call_id)) {
+				issues.push({ code: 'orphan_tool_result', messageIndex, toolCallId: message.tool_call_id });
+				continue;
+			}
+			callInfo.resultCount += 1;
+			if (callInfo.resultCount > 1) {
+				issues.push({ code: 'duplicate_tool_result', messageIndex, toolCallId: message.tool_call_id, toolName: callInfo.name });
+			}
+			openCallIds.delete(message.tool_call_id);
+			continue;
+		}
+		if (openCallIds.size > 0) {
+			issues.push({ code: 'invalid_message_role_order', messageIndex });
+			for (const callId of openCallIds) {
+				const callInfo = callInfoById.get(callId);
+				issues.push({ code: 'missing_tool_result', messageIndex: callInfo?.messageIndex, toolCallId: callId, toolName: callInfo?.name });
+			}
+			openCallIds = new Set<string>();
+		}
+	}
+	for (const callId of openCallIds) {
+		const callInfo = callInfoById.get(callId);
+		issues.push({ code: 'missing_tool_result', messageIndex: callInfo?.messageIndex, toolCallId: callId, toolName: callInfo?.name });
+	}
+
+	const serialized = JSON.stringify(options, null, 2);
+	const serializedBytes = Buffer.byteLength(serialized, 'utf8');
+	const estimatedTokens = Math.ceil((serialized.length / OPENAI_COMPATIBLE_ESTIMATED_CHARS_PER_TOKEN) * OPENAI_COMPATIBLE_ESTIMATED_TOKEN_SAFETY_MARGIN);
+	const estimatedInputBudget = preflightOptions.contextWindow !== undefined
+		? Math.max(0, preflightOptions.contextWindow - (preflightOptions.reservedOutputTokens ?? 0))
+		: undefined;
+	if (
+		(preflightOptions.hardByteLimit !== undefined && serializedBytes > preflightOptions.hardByteLimit)
+		|| (estimatedInputBudget !== undefined && estimatedTokens > estimatedInputBudget)
+	) {
+		issues.push({ code: 'request_budget_exceeded' });
+	}
+	const counts = _countOpenAICompatibleRequest(options.messages, tools);
+	return {
+		options,
+		issues,
+		diagnostics: {
+			serializedBytes,
+			estimatedTokens,
+			contextWindow: preflightOptions.contextWindow,
+			reservedOutputTokens: preflightOptions.reservedOutputTokens,
+			estimatedInputBudget,
+			...counts,
+			preflightOk: issues.length === 0,
+			preflightIssueCodes: Array.from(new Set(issues.map(issue => issue.code))),
+			compactedTurnGroupCount,
+		},
+	};
+};
+
+const _compactOpenAICompatibleRequest = (
+	options: OpenAICompatibleRequestEnvelope,
+	preflightOptions: OpenAICompatiblePreflightOptions,
+	targetBytes: number
+): OpenAICompatiblePreparedRequest => {
+	let messages = [...options.messages];
+	let compactedTurnGroupCount = 0;
+	while (true) {
+		const prepared = _preflightOpenAICompatibleRequest({ ...options, messages }, preflightOptions, compactedTurnGroupCount);
+		if (prepared.diagnostics.serializedBytes <= targetBytes) return prepared;
+		const removableGroup = _findOpenAIToolTurnGroups(messages)
+			.find(group => group.start > 1 && group.end < messages.length - 2);
+		if (!removableGroup) return prepared;
+		messages = [
+			...messages.slice(0, removableGroup.start),
+			...messages.slice(removableGroup.end + 1),
+		];
+		compactedTurnGroupCount += 1;
+	}
+};
+
+const _prepareOpenAICompatibleRequest = (
+	options: OpenAICompatibleRequestEnvelope,
+	preflightOptions: OpenAICompatiblePreflightOptions
+): OpenAICompatiblePreparedRequest => {
+	const initial = _preflightOpenAICompatibleRequest(options, preflightOptions);
+	const onlyBudgetIssue = initial.issues.length > 0 && initial.issues.every(issue => issue.code === 'request_budget_exceeded');
+	if (!onlyBudgetIssue) return initial;
+	const targetBytes = Math.min(
+		preflightOptions.hardByteLimit ?? OPENAI_COMPATIBLE_COMPACTION_TARGET_BYTES,
+		OPENAI_COMPATIBLE_COMPACTION_TARGET_BYTES
+	);
+	return _compactOpenAICompatibleRequest(options, preflightOptions, targetBytes);
+};
+
+const _providerHttpErrorMetadata = (
+	error: unknown,
+	requestDiagnostics?: OpenAICompatibleRequestDiagnostics
+): ProviderHttpErrorMetadata | undefined => {
+	if (!_isPlainObject(error)) return undefined;
+	const statusValue = error.status ?? latestProviderHttpResponseMetadata?.status;
+	if (typeof statusValue !== 'number') return undefined;
+	const normalizedHeaders = normalizeHeaders(error.headers ?? latestProviderHttpResponseMetadata?.headers);
+	const safeHeaders = _safeProviderHeaders(normalizedHeaders);
+	const requestId = providerRequestIdHeaderNames
+		.map(headerName => normalizedHeaders[headerName])
+		.find((value): value is string => typeof value === 'string' && value.length > 0);
+	const retryAfterRaw = normalizedHeaders['retry-after'];
+	let retryAfterMs: number | undefined;
+	if (retryAfterRaw) {
+		const seconds = Number(retryAfterRaw);
+		if (Number.isFinite(seconds) && seconds >= 0) retryAfterMs = seconds * 1000;
+		else {
+			const timestamp = Date.parse(retryAfterRaw);
+			if (Number.isFinite(timestamp)) retryAfterMs = Math.max(0, timestamp - Date.now());
+		}
+	}
+	const bodyPresent = error.error !== undefined;
+	return {
+		kind: 'provider-http',
+		status: statusValue,
+		bodyPresent,
+		safeHeaders,
+		requestId,
+		retryable: statusValue === 408 || statusValue === 409 || statusValue === 429 || statusValue >= 500,
+		retryAfterMs,
+		requestDiagnostics,
+	};
+};
+
+const _providerHttpErrorMessage = (metadata: ProviderHttpErrorMetadata): string => {
+	const classification = metadata.status === 429
+		? 'Provider rate limit'
+		: metadata.status === 400
+			? 'Provider rejected the request'
+			: 'Provider HTTP error';
+	const requestId = metadata.requestId ? ` Request ID: ${metadata.requestId}.` : '';
+	const body = metadata.bodyPresent ? '' : ' Response body was absent.';
+	return `${classification} (HTTP ${metadata.status}).${body}${requestId}`;
+};
 
 const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
+	latestProviderHttpResponseMetadata = undefined;
 	const {
 		messages,
 		separateSystemMessage,
@@ -1995,7 +2371,38 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 
 	}
 
-	let processedMessages = messages as any;
+	const toOpenAICompatibleMessage = (message: LLMChatMessage): ChatCompletionMessageParam | undefined => {
+		if (!_isPlainObject(message) || !('content' in message)) return undefined;
+		const contentValue = message.content;
+		if (message.role === 'system' || message.role === 'developer') {
+			return typeof contentValue === 'string' ? { role: message.role, content: contentValue } : undefined;
+		}
+		if (message.role === 'user') {
+			if (typeof contentValue === 'string') return { role: 'user', content: contentValue };
+			if (Array.isArray(contentValue) && contentValue.every(part =>
+				_isPlainObject(part) && (part.type === 'text' || part.type === 'image_url')
+			)) {
+				return { role: 'user', content: contentValue as import('openai/resources/chat/completions').ChatCompletionContentPart[] };
+			}
+			return undefined;
+		}
+		if (message.role === 'assistant') {
+			const content = typeof contentValue === 'string'
+				? contentValue
+				: Array.isArray(contentValue)
+					? contentValue.filter(part => _isPlainObject(part) && part.type === 'text') as import('openai/resources/chat/completions').ChatCompletionContentPartText[]
+					: '';
+			const toolCalls = 'tool_calls' in message ? message.tool_calls : undefined;
+			return { role: 'assistant', content, tool_calls: toolCalls };
+		}
+		if (message.role === 'tool') {
+			return { role: 'tool', content: message.content, tool_call_id: message.tool_call_id };
+		}
+		return undefined;
+	};
+	let processedMessages: ChatCompletionMessageParam[] = messages
+		.map(toOpenAICompatibleMessage)
+		.filter((message): message is ChatCompletionMessageParam => message !== undefined);
 	if (separateSystemMessage) {
 		processedMessages = [
 			{ role: 'system', content: separateSystemMessage },
@@ -2008,12 +2415,7 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 		processedMessages = applyCacheControlOpenAIStyle(processedMessages, true);
 	}
 
-	type ChatCreateParamsWithExtras =
-		ChatCompletionCreateParamsStreaming &
-		Record<string, unknown> &
-		Partial<{ max_tokens: number; max_completion_tokens: number }>;
-
-	const options: ChatCreateParamsWithExtras = {
+	const options: OpenAICompatibleRequestEnvelope = {
 		model: modelForRequest,
 		messages: processedMessages,
 		stream: true,
@@ -2051,6 +2453,37 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 	}
 
 	// Do not set max_tokens/max_completion_tokens by default.
+
+	const reservedOutputTokens = (() => {
+		const configured = typeof options.max_completion_tokens === 'number'
+			? options.max_completion_tokens
+			: typeof options.max_tokens === 'number'
+				? options.max_tokens
+				: undefined;
+		if (typeof configured === 'number' && configured >= 0) return configured;
+		return getReservedOutputTokenSpace(providerName, modelName_, {
+			isReasoningEnabled: reasoningInfo !== null,
+			overridesOfModel,
+		}) ?? 0;
+	})();
+	const contextWindow = baseCaps.contextWindow > reservedOutputTokens
+		? baseCaps.contextWindow
+		: undefined;
+	const preflightOptions: OpenAICompatiblePreflightOptions = {
+		contextWindow,
+		reservedOutputTokens,
+	};
+	const preparedRequest = _prepareOpenAICompatibleRequest(options, preflightOptions);
+	params.logService?.debug?.('[LLM][debug] OpenAI-compatible request diagnostics', preparedRequest.diagnostics);
+	if (!preparedRequest.diagnostics.preflightOk) {
+		const issueCodes = preparedRequest.diagnostics.preflightIssueCodes.join(', ');
+		onError({
+			message: `Void blocked an invalid OpenAI-compatible request before send: ${issueCodes}.`,
+			fullError: new Error(`OpenAI-compatible request preflight failed: ${issueCodes}`),
+		});
+		return;
+	}
+	const sendOptions = preparedRequest.options;
 
 	let onText = onTextInput;
 	let onFinalMessage = onFinalMessageInput;
@@ -2160,7 +2593,7 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 				? 1
 				: 0;
 		let xmlRepairRetriesUsed = 0;
-		let messagesForRun: any[] = Array.isArray(processedMessages) ? [...processedMessages] : [];
+		let messagesForRun: ChatCompletionMessageParam[] = [...sendOptions.messages];
 		let xmlRepairCarryText = '';
 		let xmlRepairCarryReasoning = '';
 		let currentRunAborter: (() => void) | null = null;
@@ -2291,7 +2724,7 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 
 			await runStream({
 				openai,
-				options: { ...options, messages: messagesForRun },
+				options: { ...sendOptions, messages: messagesForRun },
 				onText: onTextWithXmlRepairCarry,
 				onFinalMessage: onFinalWithXmlRepairGate,
 				onError: onErrorForRun,
@@ -2308,6 +2741,7 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 
 				notificationService: params.notificationService,
 				notifyOnTruncation: notifyOnTruncation ?? true,
+				requestDiagnostics: preparedRequest.diagnostics,
 			});
 
 			if (hadRunError || !shouldRetryForXmlRepair) {
@@ -2988,6 +3422,11 @@ export const listModelsRouter = async <T>(params: ListParams_Internal<T>) => {
 };
 
 export const __test = {
+	preflightOpenAICompatibleRequest: _preflightOpenAICompatibleRequest,
+	prepareOpenAICompatibleRequest: _prepareOpenAICompatibleRequest,
+	providerHttpErrorMetadata: _providerHttpErrorMetadata,
+	providerHttpErrorMessage: _providerHttpErrorMessage,
+	safeProviderHeaders: _safeProviderHeaders,
 	setAnthropicModule(mod: any) {
 		if (mod && mod.default) {
 			anthropicModule = mod as any;

@@ -25,18 +25,19 @@ const { promisify } = require('node:util');
 
 /**
  * @type {{
- * run: string;
- * grep: string;
- * runGlob: string;
- * voidQuick: boolean;
- * browser: string;
- * reporter: string;
- * 'reporter-options': string;
- * tfs: string;
- * build: boolean;
- * debug: boolean;
- * sequential: boolean;
- * help: boolean;
+ * [key: string]: unknown;
+ * run?: string | string[];
+ * grep?: string;
+ * runGlob?: string;
+ * voidQuick?: boolean;
+ * browser?: string | string[];
+ * reporter?: string;
+ * 'reporter-options'?: string;
+ * tfs?: string;
+ * build?: boolean;
+ * debug?: boolean;
+ * sequential?: boolean;
+ * help?: boolean;
  * }}
 */
 const args = minimist(process.argv.slice(2), {
@@ -53,19 +54,6 @@ const args = minimist(process.argv.slice(2), {
 		runGlob: ['glob', 'runGrep'],
 		debug: ['debug-browser'],
 		help: 'h'
-	},
-	describe: {
-		build: 'run with build output (out-build)',
-		run: 'only run tests matching <relative_file_path>',
-		grep: 'only run tests matching <pattern>',
-		voidQuick: 'run curated Void/ACP browser tests',
-		debug: 'do not run browsers headless',
-		sequential: 'only run suites for a single browser at a time',
-		browser: 'browsers in which tests should run',
-		reporter: 'the mocha reporter',
-		'reporter-options': 'the mocha reporter options',
-		tfs: 'tfs',
-		help: 'show the help'
 	}
 });
 
@@ -92,12 +80,13 @@ const isDebug = !!args.debug;
 const withReporter = (function () {
 	if (args.tfs) {
 		{
+			const tfs = args.tfs;
 			return (browserType, runner) => {
 				new mocha.reporters.Spec(runner);
 				new MochaJUnitReporter(runner, {
 					reporterOptions: {
-						testsuitesTitle: `${args.tfs} ${process.platform}`,
-						mochaFile: process.env.BUILD_ARTIFACTSTAGINGDIRECTORY ? path.join(process.env.BUILD_ARTIFACTSTAGINGDIRECTORY, `test-results/${process.platform}-${process.arch}-${browserType}-${args.tfs.toLowerCase().replace(/[^\w]/g, '-')}-results.xml`) : undefined
+						testsuitesTitle: `${tfs} ${process.platform}`,
+						mochaFile: process.env.BUILD_ARTIFACTSTAGINGDIRECTORY ? path.join(process.env.BUILD_ARTIFACTSTAGINGDIRECTORY, `test-results/${process.platform}-${process.arch}-${browserType}-${tfs.toLowerCase().replace(/[^\w]/g, '-')}-results.xml`) : undefined
 					}
 				});
 			};
@@ -117,16 +106,22 @@ const voidQuickBrowserTests = [
 	'src/vs/platform/void/common/test/requestParamsUi.test.ts',
 	'src/vs/platform/void/common/test/modelInference.test.ts',
 	'src/vs/platform/void/common/test/dynamicModelService.test.ts',
+	'src/vs/platform/void/common/test/toolApprovalPolicy.test.ts',
 	'src/vs/platform/void/common/test/toolExecutionPolicy.test.ts',
+	'src/vs/workbench/contrib/void/browser/test/ToolTurnCoordinator.test.ts',
+	'src/vs/workbench/contrib/void/browser/test/ChatExecutionEngine.toolTurn.test.ts',
+	'src/vs/workbench/contrib/void/browser/test/SidebarChatToolApproval.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/voidQuickRegistration.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/toolsServicePath.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/chatSystemMessage.specialToolFormat.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/acpProcessArgs.test.ts',
-	'src/vs/workbench/contrib/void/test/browser/chatThreadService.test.ts',
 	'src/vs/workbench/contrib/acp/test/browser/acpService.test.ts',
+	'src/vs/workbench/contrib/acp/test/browser/AcpHostCallbacksService.approvalQueue.test.ts',
 	'src/vs/workbench/contrib/acp/test/browser/AcpHostCallbacksService.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/editCodeService.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/chatAcpNormalizeReadFileArgs.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/chatThreadService.nonAcpToAcpSwitch.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/chatThreadService.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/chatThreadService.modelConfigSwitch.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/terminalToolService.runCommand.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/toolsServiceSearchInFile.test.ts',
@@ -374,7 +369,7 @@ class EchoRunner extends events.EventEmitter {
 
 	constructor(event, title = '') {
 		super();
-		createStatsCollector(this);
+		createStatsCollector(/** @type {import('mocha').Runner} */ (/** @type {unknown} */ (this)));
 		event.on('start', () => this.emit('start'));
 		event.on('end', () => this.emit('end'));
 		event.on('suite', (suite) => this.emit('suite', EchoRunner.deserializeSuite(suite, title)));

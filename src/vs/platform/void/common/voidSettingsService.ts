@@ -326,20 +326,17 @@ export class VoidSettingsService extends Disposable implements IVoidSettingsServ
 		try {
 			readS = await this._readState();
 			const gs: StoredGlobalSettings = readS.globalSettings;
-			// 1.0.3 addition, remove when enough users have had this code run
 			if (gs.includeToolLintErrors === undefined) gs.includeToolLintErrors = true;
 			if (gs.applyAstInference === undefined) gs.applyAstInference = defaultGlobalSettings.applyAstInference;
 
-			// autoapprove is now an obj not a boolean (1.2.5)
 			if (typeof gs.autoApprove === 'boolean') gs.autoApprove = {};
+			if (gs.autoApprove?.delete === undefined) gs.autoApprove = { ...gs.autoApprove, delete: false };
 
-			// 1.3.5 add source control feature
 			if (readS.modelSelectionOfFeature && !readS.modelSelectionOfFeature['SCM']) {
 				readS.modelSelectionOfFeature['SCM'] = deepClone(readS.modelSelectionOfFeature['Chat'])
 				readS.optionsOfModelSelection['SCM'] = deepClone(readS.optionsOfModelSelection['Chat'])
 			}
 
-			// Loop guard thresholds (added later): backfill from defaults if missing.
 			if (gs.loopGuardMaxTurnsPerPrompt === undefined) {
 				gs.loopGuardMaxTurnsPerPrompt = defaultGlobalSettings.loopGuardMaxTurnsPerPrompt;
 			}
@@ -350,7 +347,6 @@ export class VoidSettingsService extends Disposable implements IVoidSettingsServ
 				gs.loopGuardMaxSameToolCall = defaultGlobalSettings.loopGuardMaxSameToolCall;
 			}
 
-			// Chat retries and tool output limits (added later)
 			if (gs.chatRetries === undefined) {
 				gs.chatRetries = defaultGlobalSettings.chatRetries;
 			}

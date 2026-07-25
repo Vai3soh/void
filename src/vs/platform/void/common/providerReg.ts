@@ -114,7 +114,7 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		registerProviderConfigResolver((providerSlug) => {
 			this.logService.debug(`[DEBUG registerProviderConfigResolver] Called with providerSlug: "${providerSlug}"`);
 			const cfg = this.settingsService.state.customProviders?.[providerSlug];
-			this.logService.debug(`[DEBUG registerProviderConfigResolver] cfg:`, cfg);
+			this.logService.debug(`[DEBUG registerProviderConfigResolver] cfg:`, cfg ? Object.fromEntries(Object.entries(cfg).filter(([key]) => key !== 'apiKey')) : cfg);
 			if (!cfg) {
 				this.logService.debug(`[DEBUG registerProviderConfigResolver] No config found, returning null`);
 				return null;
@@ -835,7 +835,7 @@ export class DynamicProviderRegistryService implements IDynamicProviderRegistryS
 		const base = getModelApiConfiguration(modelIdForTransportDefaults);
 
 		this.logService.debug(`[DEBUG getRequestConfigForModel] base:`, JSON.stringify(base, null, 2));
-		this.logService.debug(`[DEBUG getRequestConfigForModel] cp(usedSlug="${usedSlug}"):`, cp);
+		this.logService.debug(`[DEBUG getRequestConfigForModel] cp(usedSlug="${usedSlug}"):`, cp ? Object.fromEntries(Object.entries(cp).filter(([key]) => key !== 'apiKey')) : cp);
 
 		const endpoint = (cp?.endpoint && cp.endpoint.trim()) || base.endpoint;
 		this.logService.debug(`[DEBUG getRequestConfigForModel] final endpoint: "${endpoint}"`);

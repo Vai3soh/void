@@ -99,4 +99,38 @@ suite('Terminal output settings', () => {
 		assert.strictEqual(settingsService.state.globalSettings.terminalOutputTailLines, 50);
 		assert.strictEqual(settingsService.state.globalSettings.maxToolOutputLength, 12345);
 	});
+
+	test('delete auto-approval defaults to false and is independent from edits', async () => {
+		assert.strictEqual(defaultGlobalSettings.autoApprove.delete, undefined);
+		assert.strictEqual(defaultGlobalSettings.autoApprove.edits, undefined);
+
+		const storageService = store.add(new InMemoryStorageService());
+		await storageService.initialize();
+		const legacyState = {
+			settingsOfProvider: {},
+			modelSelectionOfFeature: { 'Chat': null, 'Ctrl+K': null, 'Autocomplete': null, 'Apply': null, 'SCM': null },
+			globalSettings: { ...defaultGlobalSettings, autoApprove: { edits: true } },
+			optionsOfModelSelection: { 'Chat': {}, 'Ctrl+K': {}, 'Autocomplete': {}, 'Apply': {}, 'SCM': {} },
+			overridesOfModel: {},
+			customProviders: {},
+			_modelOptions: [],
+			mcpUserStateOfName: {},
+		};
+		storageService.store(
+			VOID_SETTINGS_STORAGE_KEY,
+			JSON.stringify(legacyState),
+			StorageScope.APPLICATION,
+			StorageTarget.USER
+		);
+
+		const settingsService = store.add(new VoidSettingsService(
+			storageService,
+			new TestEncryptionService(),
+			new TestMetricsService()
+		));
+		await settingsService.waitForInitState;
+
+		assert.strictEqual(settingsService.state.globalSettings.autoApprove.edits, true);
+		assert.strictEqual(settingsService.state.globalSettings.autoApprove.delete, false);
+	});
 });

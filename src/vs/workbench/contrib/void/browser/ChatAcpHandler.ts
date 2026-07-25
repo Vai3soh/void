@@ -14,8 +14,10 @@ import { IVoidModelService } from '../common/voidModelService.js';
 import { IDirectoryStrService } from '../../../../platform/void/common/directoryStrService.js';
 import { IAcpService, IAcpUserMessage, IAcpChatMessage, IAcpMessageChunk } from '../../../../platform/acp/common/iAcpService.js';
 import { getErrorMessage, RawToolCallObj, LLMTokenUsage } from '../../../../platform/void/common/sendLLMMessageTypes.js';
+import type { ToolMessage, AnyToolName, ChatAttachment, StagingSelectionItem, ChatMessage } from '../../../../platform/void/common/chatThreadServiceTypes.js';
+import type { ModelSelection, ModelSelectionOptions } from '../../../../platform/void/common/voidSettingsTypes.js';
 import { chat_userMessageContent, isAToolName, ToolName } from '../common/prompt/prompts.js';
-import { AnyToolName, ChatAttachment, StagingSelectionItem, ChatMessage } from '../../../../platform/void/common/chatThreadServiceTypes.js';
+import type { ThreadStreamState, ThreadType } from './chatThreadService.js';
 import { IEditCodeService } from './editCodeServiceInterface.js';
 import { ChatHistoryCompressor } from './ChatHistoryCompressor.js';
 import { ChatToolOutputManager } from './ChatToolOutputManager.js';
@@ -23,6 +25,7 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { IAgentSkillsService } from '../common/skills/agentSkillsService.js';
 import { formatAgentSkillsCatalogForExternalAcp } from '../common/skills/agentSkillsPrompt.js';
 import { AgentSkillActiveMetadata } from '../common/skills/agentSkillsTypes.js';
+import { getToolApprovalRequirement } from '../../../../platform/void/common/toolApprovalPolicy.js';
 
 const _snakeToCamel = (s: string) => s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 const _normalizeFsPath = (p: string) => String(p ?? '').replace(/\\/g, '/').replace(/\/+$/g, '');
@@ -294,17 +297,17 @@ const _diffsToPatchUnified = (diffs: Array<{ path: string; oldText?: string; new
 
 export interface IThreadStateAccess {
 	getThreadMessages(threadId: string): ChatMessage[];
-	getThreadState(threadId: string): any;
-	getStreamState(threadId: string): any;
-	setStreamState(threadId: string, state: any): void;
+	getThreadState(threadId: string): ThreadType['state'];
+	getStreamState(threadId: string): ThreadStreamState[string];
+	setStreamState(threadId: string, state: ThreadStreamState[string]): void;
 	addMessageToThread(threadId: string, message: ChatMessage): void;
 	editMessageInThread(threadId: string, idx: number, message: ChatMessage): void;
-	updateLatestTool(threadId: string, tool: any): void;
-	setThreadState(threadId: string, state: any): void;
+	updateLatestTool(threadId: string, tool: ToolMessage<AnyToolName>): void;
+	setThreadState(threadId: string, state: Partial<ThreadType['state']>): void;
 	markSkillActive(threadId: string, name: string, metadata: AgentSkillActiveMetadata): void;
-	accumulateTokenUsage(threadId: string, usage: any): void;
+	accumulateTokenUsage(threadId: string, usage: LLMTokenUsage): void;
 	addUserCheckpoint(threadId: string): void;
-	currentModelSelectionProps(): { modelSelection: any; modelSelectionOptions: any };
+	currentModelSelectionProps(): { modelSelection: ModelSelection | null; modelSelectionOptions: ModelSelectionOptions | undefined };
 }
 
 export class ChatAcpHandler extends Disposable {
@@ -756,17 +759,6 @@ export class ChatAcpHandler extends Disposable {
 				});
 
 				const prev = access.getStreamState(threadId)?.llmInfo;
-				access.updateLatestTool(threadId, {
-					role: 'tool',
-					type: 'running_now',
-					name: (isAToolName(normName) ? normName : (normName as any)),
-					params: paramsForUi,
-					content: 'running...',
-					displayContent: 'running...',
-					result: null,
-					id,
-					rawParams: args ?? {}
-				});
 				access.setStreamState(threadId, {
 					isRunning: 'LLM',
 					llmInfo: {
@@ -786,6 +778,9 @@ export class ChatAcpHandler extends Disposable {
 				if (!id) return;
 
 				const existing = this._getExistingToolMsgById(threadId, id, access);
+				const callInfoForProgress = this._acpToolCallInfoByKey.get(this._acpToolKey(threadId, id));
+				const announcedName = normalizeAcpToolName(String(callInfoForProgress?.name ?? tp.name ?? 'tool'));
+				if (!existing && getToolApprovalRequirement(announcedName).kind !== 'none') return;
 				const prevLen =
 					(typeof existing?.displayContent === 'string' ? existing.displayContent.length : 0)
 					|| (typeof existing?.content === 'string' ? existing.content.length : 0);

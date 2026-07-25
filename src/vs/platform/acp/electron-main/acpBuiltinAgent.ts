@@ -32,6 +32,8 @@ import { LLMLoopDetector, LOOP_DETECTED_MESSAGE } from '../../void/common/loopGu
 import { computeTruncatedToolOutput } from '../../void/common/toolOutputTruncation.js';
 import { stableToolOutputsRelPath } from '../../void/common/toolOutputFileNames.js';
 import { normalizeTerminalCommandOutput, normalizeTerminalCwdLabel } from '../../void/common/terminalToolOutput.js';
+import { getToolApprovalRequirement, type ToolApprovalType } from '../../void/common/toolApprovalPolicy.js';
+import { classifyToolCall } from '../../void/common/toolExecutionPolicy.js';
 import { resolveAcpAgentAddress, type AcpAgentAddress } from '../common/acpAgentAddress.js';
 
 type Stream = ConstructorParameters<typeof AgentSideConnection>[1];
@@ -183,6 +185,8 @@ interface GetLLMConfigResponse {
 	additionalTools?: AdditionalToolInfo[] | null;
 	disabledStaticTools?: string[] | null;
 	disabledDynamicTools?: string[] | null;
+	autoApprove?: { [approvalType in ToolApprovalType]?: boolean };
+	mcpAutoApprove?: boolean;
 }
 
 interface ExecuteWithTextResponse {
@@ -238,6 +242,14 @@ interface OnFinalMessagePayload {
 
 type OAIFunctionCall = { id: string; name: string; args: Record<string, unknown> };
 
+type AcpToolCallPhase = 'queued' | 'awaiting-permission' | 'running' | 'succeeded' | 'failed' | 'skipped';
+
+type AcpToolCallState = {
+	readonly id: string;
+	readonly name: string;
+	phase: AcpToolCallPhase;
+};
+
 type LLMMessage = {
 	role: 'system' | 'user' | 'assistant' | 'tool';
 	content: string;
@@ -256,11 +268,9 @@ type SessionState = {
 
 	cancelled?: boolean;
 	aborter?: (() => void) | null;
-	// Track the most recent tool call that is awaiting a tool result.
-	// This lets us handle UI "skip" that arrives as a separate user message
-	// without scanning message history.
-	pendingToolCall?: { id: string; name: string } | null;
-	pendingToolCallsById?: Record<string, { id: string; name: string }>;
+	pendingToolCallsById: Record<string, { id: string; name: string }>;
+	toolCallStatesById: Record<string, AcpToolCallState>;
+	activePermissionCallId?: string;
 	messages: LLMMessage[];
 	// Last LLM token usage snapshot for the most recent sendChatRouter turn in this session.
 	// Used to aggregate per-prompt usage and send it back to the host via PromptResponse._meta.
@@ -283,6 +293,8 @@ type SessionState = {
 		additionalTools?: AdditionalToolInfo[] | null;
 		disabledStaticTools?: string[] | null;
 		disabledDynamicTools?: string[] | null;
+		autoApprove: { [approvalType in ToolApprovalType]?: boolean };
+		mcpAutoApprove: boolean;
 	};
 };
 
@@ -429,8 +441,8 @@ class VoidPipelineAcpAgent implements Agent {
 
 		this.sessions.set(sessionId, {
 			cancelled: false,
-			pendingToolCall: null,
 			pendingToolCallsById: {},
+			toolCallStatesById: {},
 			messages,
 			threadId: threadIdFromMeta,
 			clientSystemPrompt,
@@ -453,6 +465,8 @@ class VoidPipelineAcpAgent implements Agent {
 				disabledDynamicTools: Array.isArray(cfg?.disabledDynamicTools)
 					? cfg.disabledDynamicTools.map(v => String(v ?? '').trim()).filter(Boolean)
 					: null,
+				autoApprove: cfg?.autoApprove ?? {},
+				mcpAutoApprove: cfg?.mcpAutoApprove === true,
 			}
 		});
 
@@ -473,7 +487,7 @@ class VoidPipelineAcpAgent implements Agent {
 				sessionId: sid,
 				threadId: s.threadId,
 				messagesInHistory: s.messages.length,
-				pendingToolCall: s.pendingToolCall,
+				activePermissionCallId: s.activePermissionCallId,
 			});
 		} else {
 			this.log?.debug?.('[ACP Agent][cancel] unknown session', { sessionId: sid });
@@ -591,6 +605,8 @@ class VoidPipelineAcpAgent implements Agent {
 					disabledDynamicTools: Array.isArray(cfg.disabledDynamicTools)
 						? cfg.disabledDynamicTools.map(v => String(v ?? '').trim()).filter(Boolean)
 						: old.disabledDynamicTools ?? null,
+					autoApprove: cfg.autoApprove ?? old.autoApprove,
+					mcpAutoApprove: cfg.mcpAutoApprove ?? old.mcpAutoApprove,
 				};
 				this.log?.debug?.(`[ACP Agent] refreshed llmCfg from settings`, JSON.stringify({
 					oldProvider: old.providerName,
@@ -657,7 +673,9 @@ class VoidPipelineAcpAgent implements Agent {
 		let consumedAsSkip = false;
 		const normalizedUserText = (userText ?? '').trim().toLowerCase();
 
-		const firstPendingToolCall = state.pendingToolCall ?? Object.values(state.pendingToolCallsById ?? {})[0] ?? null;
+		const firstPendingToolCall = state.activePermissionCallId
+			? state.pendingToolCallsById[state.activePermissionCallId] ?? null
+			: Object.values(state.pendingToolCallsById)[0] ?? null;
 		if (normalizedUserText === 'skip' && firstPendingToolCall?.id) {
 			consumedAsSkip = true;
 			const { id: pendingId, name: pendingName } = firstPendingToolCall;
@@ -685,8 +703,9 @@ class VoidPipelineAcpAgent implements Agent {
 				tool_call_id: pendingId,
 				content: skipModelText(pendingName || 'tool')
 			});
-			state.pendingToolCall = null;
-			if (state.pendingToolCallsById) delete state.pendingToolCallsById[pendingId];
+			state.activePermissionCallId = undefined;
+			delete state.pendingToolCallsById[pendingId];
+			if (state.toolCallStatesById[pendingId]) state.toolCallStatesById[pendingId].phase = 'skipped';
 		}
 
 		// Normal path: push user message into model history
@@ -714,6 +733,7 @@ class VoidPipelineAcpAgent implements Agent {
 			});
 
 			if (state.cancelled) {
+				this._closeCancelledToolCalls(state);
 				this.log?.debug?.('[ACP Agent][prompt] CANCELLED - returning', {
 					sessionId: sid,
 					turn: turnCount,
@@ -795,6 +815,17 @@ class VoidPipelineAcpAgent implements Agent {
 				return resp as PromptResponse;
 			}
 
+			// One assistant turn may contain multiple calls. Register the complete batch before
+			// scheduling reads or issuing the first manual permission request.
+			const uniqueToolCallIds = new Set<string>();
+			for (const call of toolCalls) {
+				if (!call.id || uniqueToolCallIds.has(call.id)) {
+					throw new Error(`ACP tool batch contains duplicate or empty tool call id: ${call.id}`);
+				}
+				uniqueToolCallIds.add(call.id);
+				state.toolCallStatesById[call.id] = { id: call.id, name: call.name, phase: 'queued' };
+			}
+
 			// Track whether any tool call in this turn was approved by the user.
 			// If ALL tool calls were rejected/skipped, we end the turn without
 			// another LLM call - otherwise the model would re-try the rejected
@@ -804,12 +835,8 @@ class VoidPipelineAcpAgent implements Agent {
 
 			const pendingReadOnlyToolExecutions: Promise<void>[] = [];
 			const isAcpReadOnlyToolCall = (toolCall: OAIFunctionCall): boolean => {
-				return toolCall.name === 'read_file'
-					|| toolCall.name === 'ls_dir'
-					|| toolCall.name === 'get_dir_tree'
-					|| toolCall.name === 'search_pathnames_only'
-					|| toolCall.name === 'search_for_files'
-					|| toolCall.name === 'search_in_file';
+				const executionKind = classifyToolCall({ id: toolCall.id, name: toolCall.name, args: toolCall.args }).kind;
+				return executionKind === 'read-only' || executionKind === 'read-only-terminal';
 			};
 			const drainPendingReadOnlyToolExecutions = async (): Promise<void> => {
 				if (!pendingReadOnlyToolExecutions.length) return;
@@ -848,6 +875,8 @@ class VoidPipelineAcpAgent implements Agent {
 						tool_call_id: String(toolCall.id || 'acp_plan'),
 						content: 'ok'
 					});
+					state.toolCallStatesById[toolCall.id].phase = 'succeeded';
+					anyApproved = true;
 					return;
 				}
 
@@ -868,12 +897,15 @@ class VoidPipelineAcpAgent implements Agent {
 					args: toolCall.args,
 				});
 
-				// Track pending tool call BEFORE awaiting any UI action
-				state.pendingToolCall = { id: String(toolCall.id), name: String(toolCall.name) };
-				state.pendingToolCallsById ??= {};
 				state.pendingToolCallsById[String(toolCall.id)] = { id: String(toolCall.id), name: String(toolCall.name) };
 
-				// ACP tool_call
+				const approvalRequirement = getToolApprovalRequirement(toolCall.name);
+				const requiresPermission = approvalRequirement.kind === 'manual'
+					? state.llmCfg.autoApprove[approvalRequirement.category] !== true
+					: approvalRequirement.kind === 'dynamic-policy' && !state.llmCfg.mcpAutoApprove;
+
+				// ACP transport status is not approval state: builtin calls with no manual policy
+				// are announced in progress and never make a permission round trip.
 				await this.conn.sessionUpdate({
 					sessionId: sid,
 					update: {
@@ -881,52 +913,59 @@ class VoidPipelineAcpAgent implements Agent {
 						toolCallId: toolCall.id,
 						title: toolCall.name,
 						kind: 'other',
-						status: 'pending',
+						status: requiresPermission ? 'pending' : 'in_progress',
 						rawInput: { name: toolCall.name, args: toolCall.args }
 					}
 				} as any);
 
-				// Request permission
-				this.log?.debug?.('[ACP Agent][prompt] requesting permission', {
-					sessionId: sid,
-					turn: turnCount,
-					toolCallId: toolCall.id,
-					toolName: toolCall.name,
-				});
+				let isAllow = true;
 
-				const perm = await this.conn.requestPermission({
-					sessionId: sid,
-					toolCall: {
-						toolCallId: toolCall.id,
-						rawInput: { name: toolCall.name, args: toolCall.args ?? {} },
-						title: toolCall.name
-					},
-					options: [
-						{ optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
-						{ optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }
-					]
-				} as any);
-
-				if (state.cancelled) {
-					this.log?.debug?.('[ACP Agent][prompt] CANCELLED after permission request', {
+				if (requiresPermission) {
+					state.toolCallStatesById[toolCall.id].phase = 'awaiting-permission';
+					state.activePermissionCallId = String(toolCall.id);
+					this.log?.debug?.('[ACP Agent][prompt] requesting permission', {
 						sessionId: sid,
 						turn: turnCount,
+						toolCallId: toolCall.id,
+						toolName: toolCall.name,
 					});
-					return;
+
+					const perm = await this.conn.requestPermission({
+						sessionId: sid,
+						toolCall: {
+							toolCallId: toolCall.id,
+							rawInput: { name: toolCall.name, args: toolCall.args ?? {} },
+							title: toolCall.name
+						},
+						options: [
+							{ optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+							{ optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }
+						]
+					} as any);
+					state.activePermissionCallId = undefined;
+
+					if (state.cancelled) {
+						this._closeCancelledToolCalls(state);
+						this.log?.debug?.('[ACP Agent][prompt] CANCELLED after permission request', {
+							sessionId: sid,
+							turn: turnCount,
+						});
+						return;
+					}
+
+					const outcome = (perm as { outcome?: { outcome?: string; optionId?: string } } | undefined)?.outcome;
+					const selected = outcome?.outcome === 'selected';
+					const optionId = selected ? String(outcome?.optionId ?? '') : '';
+					isAllow = optionId === 'allow_once' || optionId === 'allow_always';
+
+					this.log?.debug?.('[ACP Agent][prompt] permission result', {
+						sessionId: sid,
+						turn: turnCount,
+						optionId,
+						isAllow,
+						outcome,
+					});
 				}
-
-				const outcome = (perm as any)?.outcome;
-				const selected = outcome?.outcome === 'selected';
-				const optionId = selected ? String(outcome?.optionId ?? '') : '';
-				const isAllow = optionId === 'allow_once' || optionId === 'allow_always';
-
-				this.log?.debug?.('[ACP Agent][prompt] permission result', {
-					sessionId: sid,
-					turn: turnCount,
-					optionId,
-					isAllow,
-					outcome: outcome,
-				});
 
 				if (!isAllow) {
 					// Treat non-allow as "skipped" (this is how ACP Skip is implemented via rejectLatestToolRequest)
@@ -948,12 +987,14 @@ class VoidPipelineAcpAgent implements Agent {
 						tool_call_id: String(toolCall.id),
 						content: skipModelText(toolName)
 					});
-					state.pendingToolCall = null;
-					if (state.pendingToolCallsById) delete state.pendingToolCallsById[String(toolCall.id)];
+					delete state.pendingToolCallsById[String(toolCall.id)];
+					state.toolCallStatesById[toolCall.id].phase = 'skipped';
 					return;
 				}
 
-				// Mark that at least one tool call was approved - see anyApproved check after the loop.
+				state.toolCallStatesById[toolCall.id].phase = 'running';
+
+				// Mark that at least one tool call will execute - see anyApproved check after the loop.
 				anyApproved = true;
 
 				// in_progress
@@ -1161,7 +1202,10 @@ class VoidPipelineAcpAgent implements Agent {
 					};
 				}
 
-				if (state.cancelled) return;
+				if (state.cancelled) {
+					this._closeCancelledToolCalls(state);
+					return;
+				}
 
 				await this.conn.sessionUpdate({
 					sessionId: sid,
@@ -1190,8 +1234,8 @@ class VoidPipelineAcpAgent implements Agent {
 					tool_call_id: String(toolCall.id),
 					content: textOut
 				});
-				state.pendingToolCall = null;
-				if (state.pendingToolCallsById) delete state.pendingToolCallsById[String(toolCall.id)];
+				delete state.pendingToolCallsById[String(toolCall.id)];
+				state.toolCallStatesById[toolCall.id].phase = status === 'failed' ? 'failed' : 'succeeded';
 
 				this.log?.debug?.('[ACP Agent][prompt] continuing loop after tool result', {
 					sessionId: sid,
@@ -1212,6 +1256,7 @@ class VoidPipelineAcpAgent implements Agent {
 					state_cancelled: state.cancelled,
 				});
 				if (state.cancelled) {
+					this._closeCancelledToolCalls(state);
 					this.log?.debug?.('[ACP Agent][prompt] CANCELLED before toolCall', { sessionId: sid, index: _i });
 					break;
 				}
@@ -1229,6 +1274,28 @@ class VoidPipelineAcpAgent implements Agent {
 				});
 			}
 			await drainPendingReadOnlyToolExecutions();
+			if (state.cancelled) {
+				this._closeCancelledToolCalls(state);
+				return { stopReason: 'cancelled' };
+			}
+
+			const unsettledToolCalls = toolCalls.filter(call => {
+				const phase = state.toolCallStatesById[call.id]?.phase;
+				return phase !== 'succeeded' && phase !== 'failed' && phase !== 'skipped';
+			});
+			if (unsettledToolCalls.length > 0) {
+				throw new Error(`ACP tool batch did not settle every call id: ${unsettledToolCalls.map(call => call.id).join(', ')}`);
+			}
+			const resultCounts = new Map<string, number>();
+			for (const message of state.messages) {
+				if (message.role !== 'tool' || !message.tool_call_id || !uniqueToolCallIds.has(message.tool_call_id)) continue;
+				resultCounts.set(message.tool_call_id, (resultCounts.get(message.tool_call_id) ?? 0) + 1);
+			}
+			for (const call of toolCalls) {
+				if (resultCounts.get(call.id) !== 1) {
+					throw new Error(`ACP tool batch expected exactly one result for call id: ${call.id}`);
+				}
+			}
 
 			// If ALL tool calls in this turn were rejected/skipped (none approved),
 			// end the turn without another LLM call. This prevents the model from
@@ -1276,6 +1343,22 @@ class VoidPipelineAcpAgent implements Agent {
 		this.emitError(safeguardMsg);
 	}
 
+	private _closeCancelledToolCalls(state: SessionState): void {
+		for (const callState of Object.values(state.toolCallStatesById)) {
+			if (callState.phase === 'succeeded' || callState.phase === 'failed' || callState.phase === 'skipped') continue;
+			callState.phase = 'failed';
+			if (!state.messages.some(message => message.role === 'tool' && message.tool_call_id === callState.id)) {
+				state.messages.push({
+					role: 'tool',
+					tool_call_id: callState.id,
+					content: 'Tool call was cancelled before completion.'
+				});
+			}
+			delete state.pendingToolCallsById[callState.id];
+		}
+		state.activePermissionCallId = undefined;
+	}
+
 	private async executeTerminalCommandWithStreaming(toolCall: ToolCall): Promise<ToolCallUpdate> {
 		const argsObj = (toolCall.args ?? {}) as Record<string, any>;
 
@@ -1308,10 +1391,7 @@ class VoidPipelineAcpAgent implements Agent {
 		// Resolve ACP sessionId (best effort)
 		let sessionId =
 			Array.from(this.sessions.entries())
-				.find(([, s]) =>
-					String(s?.pendingToolCall?.id ?? '') === String(toolCall.id)
-					|| !!s?.pendingToolCallsById?.[String(toolCall.id)]
-				)?.[0]
+				.find(([, s]) => !!s.pendingToolCallsById[String(toolCall.id)])?.[0]
 			?? Array.from(this.sessions.keys())[0];
 		if (!sessionId) sessionId = 'unknown_session';
 

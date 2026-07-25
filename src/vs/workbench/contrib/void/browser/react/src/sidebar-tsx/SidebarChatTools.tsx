@@ -11,9 +11,12 @@ import { AlertTriangle, Ban, ChevronRight, CircleEllipsis } from 'lucide-react';
 
 import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
 import { VoidSwitch } from '../util/inputs.js';
-import { ToolName, toolNames } from '../../../../common/prompt/prompts.js';
-import { approvalTypeOfToolName } from '../../../../../../../platform/void/common/toolsServiceTypes.js';
+import { ToolName, toolNames, isAToolName } from '../../../../common/prompt/prompts.js';
+import { getToolApprovalRequirement } from '../../../../../../../platform/void/common/toolApprovalPolicy.js';
+import { shouldRenderToolRequestApprovalControls } from '../../../sidebarChatToolApproval.js';
 import { isDangerousTerminalCommand } from '../../../../common/toolsService.js';
+
+export { shouldRenderToolRequestApprovalControls } from '../../../sidebarChatToolApproval.js';
 
 import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { ChatMessage, ToolMessage, } from '../../../../../../../platform/void/common/chatThreadServiceTypes.js';
@@ -473,8 +476,10 @@ export const ToolHeaderWrapper = ({
 	);
 };
 
-export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolCallId }: { toolName: ToolName; threadId: string; toolCallId: string }) => {
+export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolCallId }: { toolName: string; threadId: string; toolCallId: string }) => {
 	const accessor = useAccessor();
+	const threadMessages = accessor.get('IChatThreadService').state.allThreads[threadId]?.messages ?? [];
+	const shouldRenderControls = shouldRenderToolRequestApprovalControls(toolName, toolCallId, threadMessages);
 	const chatThreadsService = accessor.get('IChatThreadService');
 	const metricsService = accessor.get('IMetricsService');
 	const voidSettingsService = accessor.get('IVoidSettingsService');
@@ -517,12 +522,15 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolCallId 
 	const [showSkipButton, setShowSkipButton] = useState(false);
 
 	useEffect(() => {
+		if (!shouldRenderControls) return;
 		const timeoutId = setTimeout(() => {
 			setShowSkipButton(true);
 		}, 10000);
 
 		return () => clearTimeout(timeoutId);
-	}, []);
+	}, [shouldRenderControls]);
+
+	if (!shouldRenderControls) return null;
 
 	const approveButton = (
 		<button
@@ -572,7 +580,8 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolCallId 
 		</button>
 	);
 
-	const approvalType = approvalTypeOfToolName[toolName];
+	const approvalRequirement = getToolApprovalRequirement(toolName);
+	const approvalType = approvalRequirement.kind === 'manual' ? approvalRequirement.category : undefined;
 	let alwaysRequireManualApproval = false;
 	if (approvalType === 'terminal' && toolName === 'run_command') {
 		try {
@@ -630,7 +639,7 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolCallId 
 			<span className='text-void-fg-3 text-xs'>Auto-approve</span>
 		</div>);
 
-	const shouldShowSkipButton = approvalTypeOfToolName[toolName] !== undefined || showSkipButton;
+	const shouldShowSkipButton = (isAToolName(toolName) && approvalRequirement.kind === 'manual') || showSkipButton;
 
 	return <div className="flex gap-2 mx-0.5 items-center">
 		{approveButton}

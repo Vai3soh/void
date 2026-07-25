@@ -83,21 +83,6 @@ export type ToolResultType = {
 
 export type ToolName = keyof ToolResultType
 
-export const approvalTypeOfToolName: Partial<{ [T in ToolName]?: 'edits' | 'terminal' }> = {
-	'create_file_or_folder': 'edits',
-	'delete_file_or_folder': 'edits',
-	'rewrite_file': 'edits',
-	'edit_file': 'edits',
-	'run_command': 'terminal',
-}
-
-// {{add: define new type for approval types}}
-export type ToolApprovalType = NonNullable<(typeof approvalTypeOfToolName)[keyof typeof approvalTypeOfToolName]>;
-
-export const toolApprovalTypes = new Set<ToolApprovalType>(
-	Object.values(approvalTypeOfToolName).filter((v): v is ToolApprovalType => v !== undefined)
-)
-
 export type SnakeCase<S extends string> =
 	S extends 'URI' ? 'uri'
 	: S extends `${infer Prefix}URI` ? `${SnakeCase<Prefix>}_uri`

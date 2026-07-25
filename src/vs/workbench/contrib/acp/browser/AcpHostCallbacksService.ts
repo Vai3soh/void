@@ -14,7 +14,7 @@ import { IChatThreadService } from '../../void/browser/chatThreadService.js';
 import { normalizeAcpToolName } from '../../void/browser/ChatAcpHandler.js';
 import { IVoidSettingsService } from '../../../../platform/void/common/voidSettingsService.js';
 import { defaultGlobalSettings } from '../../../../platform/void/common/voidSettingsTypes.js';
-import { approvalTypeOfToolName } from '../../../../platform/void/common/toolsServiceTypes.js';
+import { getToolApprovalRequirement } from '../../../../platform/void/common/toolApprovalPolicy.js';
 import { isAToolName } from '../../void/common/prompt/prompts.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { computeTruncatedToolOutput } from '../../../../platform/void/common/toolOutputTruncation.js';
@@ -388,6 +388,74 @@ export class AcpHostCallbacksService {
 		return { text: s.slice(0, maxChars), didTruncateForMax: true, savedPath };
 	}
 
+	private readonly _permissionQueueByThread = new Map<string, Array<{
+		readonly toolCallId: string;
+		readonly name: string;
+		readonly rawArgs: Record<string, unknown>;
+		readonly chat: IChatThreadService;
+		readonly resolve: (decision: 'approved' | 'rejected' | 'skipped') => void;
+		readonly disposeDecisionListener: () => void;
+	}>>();
+	private readonly _activePermissionCallIdByThread = new Map<string, string>();
+
+	private _activateNextPermissionRequest(threadId: string): void {
+		if (this._activePermissionCallIdByThread.has(threadId)) return;
+		const queue = this._permissionQueueByThread.get(threadId);
+		const next = queue?.[0];
+		if (!next) {
+			this._permissionQueueByThread.delete(threadId);
+			return;
+		}
+		this._activePermissionCallIdByThread.set(threadId, next.toolCallId);
+		next.chat.enqueueToolRequestFromAcp(threadId, {
+			id: next.toolCallId,
+			name: next.name,
+			rawParams: next.rawArgs
+		});
+	}
+
+	private _enqueuePermissionRequest(
+		threadId: string,
+		toolCallId: string,
+		name: string,
+		rawArgs: Record<string, unknown>,
+		chat: IChatThreadService
+	): Promise<'approved' | 'rejected' | 'skipped'> {
+		return new Promise(resolve => {
+			const queue = this._permissionQueueByThread.get(threadId) ?? [];
+			if (queue.some(item => item.toolCallId === toolCallId)) {
+				resolve('rejected');
+				return;
+			}
+			const decisionListener = chat.onExternalToolDecision(({ threadId: decisionThreadId, toolCallId: decisionCallId, decision }) => {
+				if (decisionThreadId !== threadId || decisionCallId !== toolCallId) return;
+				this._resolvePermissionRequest(threadId, toolCallId, decision);
+			});
+			queue.push({
+				toolCallId,
+				name,
+				rawArgs,
+				chat,
+				resolve,
+				disposeDecisionListener: () => decisionListener.dispose(),
+			});
+			this._permissionQueueByThread.set(threadId, queue);
+			this._activateNextPermissionRequest(threadId);
+		});
+	}
+
+	private _resolvePermissionRequest(threadId: string, toolCallId: string, decision: 'approved' | 'rejected' | 'skipped'): void {
+		if (this._activePermissionCallIdByThread.get(threadId) !== toolCallId) return;
+		const queue = this._permissionQueueByThread.get(threadId);
+		const active = queue?.[0];
+		if (!active || active.toolCallId !== toolCallId) return;
+		queue?.shift();
+		this._activePermissionCallIdByThread.delete(threadId);
+		active.disposeDecisionListener();
+		active.resolve(decision);
+		this._activateNextPermissionRequest(threadId);
+	}
+
 	private readonly _terminalStateById = new Map<string, {
 		done: boolean;
 		exitCode: number | null;
@@ -675,14 +743,14 @@ export class AcpHostCallbacksService {
 				}
 
 				const isBuiltin = isAToolName(normName);
-				const approvalType = isBuiltin ? approvalTypeOfToolName[normName] : undefined;
+				const approvalRequirement = getToolApprovalRequirement(normName);
 
-				if (isBuiltin && !approvalType) {
+				if (isBuiltin && approvalRequirement.kind === 'none') {
 					return { outcome: { outcome: 'selected', optionId: 'allow_once' } };
 				}
 
-				if (isBuiltin && approvalType) {
-					const autoApprove = !!(autos as any)[approvalType];
+				if (isBuiltin && approvalRequirement.kind === 'manual') {
+					const autoApprove = autos[approvalRequirement.category] === true;
 					if (autoApprove) {
 						return { outcome: { outcome: 'selected', optionId: 'allow_once' } };
 					}
@@ -692,20 +760,7 @@ export class AcpHostCallbacksService {
 					return { outcome: { outcome: 'selected', optionId: 'allow_once' } };
 				}
 
-				chat.enqueueToolRequestFromAcp(threadId, {
-					id: toolCallId,
-					name: normName,
-					rawParams: rawArgs
-				});
-
-				const decision = await new Promise<'approved' | 'rejected' | 'skipped'>((resolve) => {
-					const disposable = chat.onExternalToolDecision(({ threadId: t, toolCallId: id, decision }) => {
-						if (t === threadId && id === toolCallId) {
-							disposable.dispose();
-							resolve(decision);
-						}
-					});
-				});
+				const decision = await this._enqueuePermissionRequest(threadId, toolCallId, normName, rawArgs, chat);
 
 				return decision === 'approved'
 					? { outcome: { outcome: 'selected', optionId: 'allow_once' } }

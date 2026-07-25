@@ -17,7 +17,7 @@ import { ChatMarkdownRender } from '../markdown/ChatMarkdownRender.js';
 import { WarningBox } from './WarningBox.js';
 import { os } from '../../../../../../../platform/void/common/helpers/systemInfo.js';
 import { IconLoading } from '../sidebar-tsx/SidebarChatUI.js';
-import { ToolApprovalType, toolApprovalTypes } from '../../../../../../../platform/void/common/toolsServiceTypes.js';
+import { getToolApprovalSettingLabel, type ToolApprovalType, toolApprovalTypes } from '../../../../../../../platform/void/common/toolApprovalPolicy.js';
 import Severity from '../../../../../../../base/common/severity.js';
 import type { RequestParamsConfig, ParameterInjectionMode } from '../../../../../../../platform/void/common/sendLLMMessageTypes.js';
 import { computeRequestParamsTemplate, filterSupportedParams } from '../../../../../../../platform/void/common/requestParams.js';
@@ -2331,7 +2331,7 @@ export const Settings = () => {
 													{[...toolApprovalTypes].map((approvalType) => {
 														return (
 															<div key={approvalType} className="flex items-center gap-x-2 my-2">
-																<ToolApprovalTypeSwitch size='xs' approvalType={approvalType} desc={`Auto-approve ${approvalType}`} />
+																<ToolApprovalTypeSwitch size='xs' approvalType={approvalType} desc={getToolApprovalSettingLabel(approvalType)} />
 															</div>
 														)
 													})}

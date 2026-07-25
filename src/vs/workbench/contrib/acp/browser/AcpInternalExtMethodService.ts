@@ -916,6 +916,8 @@ export class AcpInternalExtMethodService {
 				additionalTools,
 				disabledStaticTools,
 				disabledDynamicTools,
+				autoApprove: st.globalSettings.autoApprove ?? {},
+				mcpAutoApprove: st.globalSettings.mcpAutoApprove === true,
 			};
 		}
 
