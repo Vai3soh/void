@@ -25,7 +25,7 @@ suite('terminalOutputClassifier', () => {
 		assert.ok(result.classificationEvidence.commandMarkerCount > 0);
 		assert.ok(result.classificationEvidence.contentMarkerCount > 0);
 		assert.ok(result.classificationEvidence.contentRanges.some(range => range.startLine === 4));
-		assert.ok(result.evidence.nativeSummaryLines.includes('====== 1 failed, 40 passed ======'));
+		assert.ok(result.evidence.nativeSummaries.some(summary => summary.text === '====== 1 failed, 40 passed ======'));
 	});
 
 	test('jest output selects test', () => {
@@ -226,8 +226,8 @@ suite('terminalOutputClassifier', () => {
 		const nativeSummary = 'Tests: 10 passed, 2 failed, 12 total';
 		const exitStatus = 'exit status 1';
 		const result = classifyTerminalOutput('npm test', [nativeSummary, exitStatus].join('\n'));
-		assert.deepStrictEqual(result.evidence.nativeSummaryLines, [nativeSummary]);
-		assert.deepStrictEqual(result.evidence.statusLines, [exitStatus]);
+		assert.deepStrictEqual(result.evidence.nativeSummaries.map(summary => summary.text), [nativeSummary]);
+		assert.deepStrictEqual(result.evidence.statuses.map(status => status.text), [exitStatus]);
 		assert.ok(result.evidence.protectedRanges.some(range => range.startLine === 1));
 		assert.ok(result.evidence.protectedRanges.some(range => range.startLine === 2));
 	});

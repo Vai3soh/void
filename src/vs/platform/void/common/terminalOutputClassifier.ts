@@ -11,21 +11,18 @@
  * and collected evidence. No VS Code service dependencies.
  */
 
+import { terminalOutputLines } from './terminalOutputSummaryModel.js';
 import type {
 	ClassificationResult,
-	CountFact,
 	DiagnosticBlock,
+	NativeSummaryEvidence,
 	ProfileClassificationEvidence,
 	SourceRange,
+	StatusEvidence,
 	SummaryConfidence,
 	SummaryEvidence,
 	TerminalOutputProfile,
 } from './terminalOutputSummaryTypes.js';
-
-function linesOf(raw: string): string[] {
-	if (!raw) { return []; }
-	return raw.split(/\r\n|\r|\n/);
-}
 
 const NEGATIVE_PATTERNS: readonly RegExp[] = [
 	/\.(mp3|mp4|wav|ogg|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot)\b/i,
@@ -120,24 +117,12 @@ const PROFILE_MARKERS: Record<TerminalOutputProfile, ProfileMarkers> = {
 		],
 	},
 	'search-listing': {
-		commandMarkers: [
-			/^\s*(?:grep|rg|find|ls|tree|cat|head|tail|wc)(?:\s|$)/i,
-		],
-		contentMarkers: [
-			/^\s*\S+:\d+(?::\d+)?:/,
-			/\b\d+\s+matches?\b/i,
-			/\b\d+\s+files?\b/i,
-			/^[-dbclps][-rwx]{9}\b/,
-		],
-		uniqueMarkers: [
-			/^\s*\S+:\d+:\d+:/,
-			/\b\d+\s+matches?\b/i,
-		],
+		commandMarkers: [/^\s*(?:grep|rg|find|ls|tree|cat|head|tail|wc)(?:\s|$)/i],
+		contentMarkers: [/^\s*\S+:\d+(?::\d+)?:/, /\b\d+\s+matches?\b/i, /\b\d+\s+files?\b/i, /^[-dbclps][-rwx]{9}\b/],
+		uniqueMarkers: [/^\s*\S+:\d+:\d+:/, /\b\d+\s+matches?\b/i],
 	},
 	'version-control': {
-		commandMarkers: [
-			/^\s*(?:git|hg|svn)(?:\s|$)/i,
-		],
+		commandMarkers: [/^\s*(?:git|hg|svn)(?:\s|$)/i],
 		contentMarkers: [
 			/\b(?:On branch|Your branch is)\b/,
 			/\bcommit\s+[0-9a-f]{7,40}\b/i,
@@ -149,79 +134,68 @@ const PROFILE_MARKERS: Record<TerminalOutputProfile, ProfileMarkers> = {
 			/^index\s+[0-9a-f]+\.\.[0-9a-f]+\b/i,
 			/^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@/,
 		],
-		uniqueMarkers: [
-			/\b(?:On branch|Your branch is)\b/,
-			/^diff\s+--git\b/,
-			/\bcommit\s+[0-9a-f]{40}\b/i,
-		],
+		uniqueMarkers: [/\b(?:On branch|Your branch is)\b/, /^diff\s+--git\b/, /\bcommit\s+[0-9a-f]{40}\b/i],
 	},
 	'logs': {
-		commandMarkers: [
-			/^\s*(?:journalctl|kubectl\s+logs?|docker\s+logs?|tail\s+-f)(?:\s|$)/i,
-		],
-		contentMarkers: [
-			/^\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}/,
-			/\b(?:INFO|WARN|ERROR|DEBUG|TRACE|FATAL)\b/,
-			/\b(?:stdout|stderr|level|component|logger)\b/i,
-		],
-		uniqueMarkers: [
-			/^\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}/,
-		],
+		commandMarkers: [/^\s*(?:journalctl|kubectl\s+logs?|docker\s+logs?|tail\s+-f)(?:\s|$)/i],
+		contentMarkers: [/^\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}/, /\b(?:INFO|WARN|ERROR|DEBUG|TRACE|FATAL)\b/, /\b(?:stdout|stderr|level|component|logger)\b/i],
+		uniqueMarkers: [/^\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}/],
 	},
-	'generic': {
-		commandMarkers: [],
-		contentMarkers: [],
-		uniqueMarkers: [],
-	},
+	'generic': { commandMarkers: [], contentMarkers: [], uniqueMarkers: [] },
 };
 
-function collectEvidence(rawLines: readonly string[]): SummaryEvidence {
-	const nativeSummaryLines: string[] = [];
-	const statusLines: string[] = [];
-	const countFacts: CountFact[] = [];
+function collectEvidence(rawOutput: string): SummaryEvidence {
+	const nativeSummaries: NativeSummaryEvidence[] = [];
+	const statuses: StatusEvidence[] = [];
 	const diagnostics: DiagnosticBlock[] = [];
 	const protectedRanges: SourceRange[] = [];
-
+	const rawLines = terminalOutputLines(rawOutput);
 	const nativeSummaryRe = /\b(\d+\s+(passed|failed|skipped|errors?|warnings?)|BUILD\s+(SUCCESSFUL|FAILED)|Tests?:.*\b(passed|failed|total)\b|test\s+result:\s*(ok|FAILED)|added\s+\d+\s+packages?|found\s+\d+\s+vulnerabilit)/i;
-	const statusRe = /\b(exit\s+(code|status)|exited\s+with(?:\s+code)?)\s*[:=]?\s*-?\d+\b/i;
+	const statusRe = /\b(exit\s+(code|status)|exited\s+with(?:\s+code)?)\s*[:=]?\s*(-?\d+)\b/i;
 
-	for (let i = 0; i < rawLines.length; i++) {
-		const line = rawLines[i];
+	for (const rawLine of rawLines) {
+		const line = rawLine.text;
 		const trimmed = line.trim();
-		const sourceRange = { startLine: i + 1, endLine: i + 1 };
+		const statusMatch = statusRe.exec(trimmed);
 
 		if (nativeSummaryRe.test(trimmed)) {
-			nativeSummaryLines.push(line);
-			protectedRanges.push(sourceRange);
+			nativeSummaries.push({ kind: 'native-summary', text: line, sourceRange: rawLine.sourceRange, confidence: 'medium' });
+			protectedRanges.push(rawLine.sourceRange);
 		}
 
-		if (statusRe.test(trimmed)) {
-			statusLines.push(line);
-			protectedRanges.push(sourceRange);
+		if (statusMatch) {
+			const exitCode = Number(statusMatch[3]);
+			statuses.push({
+				kind: 'process-status',
+				text: line,
+				sourceRange: rawLine.sourceRange,
+				confidence: 'high',
+				status: exitCode === 0 ? 'success' : 'failure',
+			});
+			protectedRanges.push(rawLine.sourceRange);
 		}
 
 		if (isKeywordDiagnostic(trimmed) || isKeywordWarning(trimmed)) {
+			const severity = isKeywordWarning(trimmed) && !isKeywordDiagnostic(trimmed) ? 'warning' : 'error';
 			diagnostics.push({
+				kind: 'diagnostic',
+				identity: trimmed,
 				file: undefined,
 				line: undefined,
 				column: undefined,
 				code: undefined,
 				message: trimmed,
-				severity: isKeywordDiagnostic(trimmed) ? 'error' : 'warning',
-				contextLines: [],
-				sourceRange,
+				verbatim: line,
+				severity,
+				contextLines: [line],
+				sourceRange: rawLine.sourceRange,
+				contextRange: rawLine.sourceRange,
 			});
-			protectedRanges.push(sourceRange);
+			protectedRanges.push(rawLine.sourceRange);
 		}
 	}
 
-	return {
-		nativeSummaryLines,
-		statusLines,
-		countFacts,
-		diagnostics,
-		protectedRanges,
-	};
+	return { nativeSummaries, statuses, countFacts: [], diagnostics, aggregates: [], protectedRanges };
 }
 
 interface MarkerMatches {
@@ -232,9 +206,7 @@ interface MarkerMatches {
 function matchCommandPatterns(command: string, patterns: readonly RegExp[]): number {
 	let count = 0;
 	for (const pattern of patterns) {
-		if (pattern.test(command.trim())) {
-			count++;
-		}
+		if (pattern.test(command.trim())) { count++; }
 	}
 	return count;
 }
@@ -242,7 +214,6 @@ function matchCommandPatterns(command: string, patterns: readonly RegExp[]): num
 function matchContentPatterns(lines: readonly string[], patterns: readonly RegExp[]): MarkerMatches {
 	let patternCount = 0;
 	const lineNumbers = new Set<number>();
-
 	for (const pattern of patterns) {
 		let patternMatched = false;
 		for (let i = 0; i < lines.length; i++) {
@@ -251,15 +222,9 @@ function matchContentPatterns(lines: readonly string[], patterns: readonly RegEx
 				lineNumbers.add(i + 1);
 			}
 		}
-		if (patternMatched) {
-			patternCount++;
-		}
+		if (patternMatched) { patternCount++; }
 	}
-
-	return {
-		patternCount,
-		ranges: [...lineNumbers].sort((a, b) => a - b).map(line => ({ startLine: line, endLine: line })),
-	};
+	return { patternCount, ranges: [...lineNumbers].sort((a, b) => a - b).map(line => ({ startLine: line, endLine: line })) };
 }
 
 interface ProfileScore {
@@ -272,16 +237,11 @@ interface ProfileScore {
 	score: number;
 }
 
-function scoreProfile(
-	profile: Exclude<TerminalOutputProfile, 'generic'>,
-	command: string,
-	rawLines: readonly string[],
-): ProfileScore {
+function scoreProfile(profile: Exclude<TerminalOutputProfile, 'generic'>, command: string, rawLines: readonly string[]): ProfileScore {
 	const markers = PROFILE_MARKERS[profile];
 	const commandMarkerCount = matchCommandPatterns(command, markers.commandMarkers);
 	const content = matchContentPatterns(rawLines, markers.contentMarkers);
 	const uniqueContent = matchContentPatterns(rawLines, markers.uniqueMarkers);
-
 	return {
 		profile,
 		commandMarkerCount,
@@ -296,24 +256,13 @@ function scoreProfile(
 function confidenceOf(score: ProfileScore): SummaryConfidence {
 	const hasCommandAndContent = score.commandMarkerCount > 0 && score.contentMarkerCount > 0;
 	const hasStrongContent = score.uniqueContentMarkerCount > 0 && score.contentMarkerCount > 1;
-	if ((hasCommandAndContent && score.uniqueContentMarkerCount > 0) || hasStrongContent) {
-		return 'high';
-	}
-	if (hasCommandAndContent || score.uniqueContentMarkerCount > 0) {
-		return 'medium';
-	}
+	if ((hasCommandAndContent && score.uniqueContentMarkerCount > 0) || hasStrongContent) { return 'high'; }
+	if (hasCommandAndContent || score.uniqueContentMarkerCount > 0) { return 'medium'; }
 	return 'low';
 }
 
 function emptyClassificationEvidence(): ProfileClassificationEvidence {
-	return {
-		commandMarkerCount: 0,
-		contentMarkerCount: 0,
-		uniqueContentMarkerCount: 0,
-		contentRanges: [],
-		uniqueContentRanges: [],
-		ambiguousProfiles: [],
-	};
+	return { commandMarkerCount: 0, contentMarkerCount: 0, uniqueContentMarkerCount: 0, contentRanges: [], uniqueContentRanges: [], ambiguousProfiles: [] };
 }
 
 /**
@@ -322,35 +271,18 @@ function emptyClassificationEvidence(): ProfileClassificationEvidence {
  * otherwise insufficient evidence.
  */
 export function classifyTerminalOutput(command: string, rawOutput: string): ClassificationResult {
-	const rawLines = linesOf(rawOutput);
-	const evidence = collectEvidence(rawLines);
-	const profiles: readonly Exclude<TerminalOutputProfile, 'generic'>[] = [
-		'test',
-		'build-diagnostics',
-		'package-manager',
-		'search-listing',
-		'version-control',
-		'logs',
-	];
+	const rawLines = terminalOutputLines(rawOutput).map(line => line.text);
+	const evidence = collectEvidence(rawOutput);
+	const profiles: readonly Exclude<TerminalOutputProfile, 'generic'>[] = ['test', 'build-diagnostics', 'package-manager', 'search-listing', 'version-control', 'logs'];
 	const scores = profiles.map(profile => scoreProfile(profile, command, rawLines));
-	const candidates = scores
-		.filter(score => score.contentMarkerCount > 0)
-		.sort((a, b) => b.score - a.score);
+	const candidates = scores.filter(score => score.contentMarkerCount > 0).sort((a, b) => b.score - a.score);
 	const best = candidates[0];
 
 	if (!best) {
-		return {
-			profile: 'generic',
-			confidence: 'low',
-			adapter: 'generic',
-			classificationEvidence: emptyClassificationEvidence(),
-			evidence,
-		};
+		return { profile: 'generic', confidence: 'low', adapter: 'generic', classificationEvidence: emptyClassificationEvidence(), evidence };
 	}
 
-	const tiedProfiles = candidates
-		.filter(candidate => candidate.score === best.score)
-		.map(candidate => candidate.profile);
+	const tiedProfiles = candidates.filter(candidate => candidate.score === best.score).map(candidate => candidate.profile);
 	const confidence = confidenceOf(best);
 	const isAmbiguous = tiedProfiles.length > 1;
 

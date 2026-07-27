@@ -33,12 +33,12 @@ export type TerminalOutputProfile =
 export type SummaryReason = 'hard-limit' | 'verbose';
 
 /**
- * Confidence level assigned by the classifier (or adapter) to the selected profile.
+ * Confidence level assigned by the classifier, adapter, or extracted fact.
  */
 export type SummaryConfidence = 'high' | 'medium' | 'low';
 
 /**
- * 1-based range of source lines in the original (normalized) raw output.
+ * 1-based range of source lines in the original normalized raw output.
  */
 export interface SourceRange {
 	/** 1-based inclusive start line. */
@@ -47,71 +47,152 @@ export interface SourceRange {
 	endLine: number;
 }
 
+/** One source line before any lossy reduction. */
+export interface TerminalOutputLine {
+	text: string;
+	lineNumber: number;
+	sourceRange: SourceRange;
+}
+
+export type CountFactKind =
+	| 'total'
+	| 'passed'
+	| 'failed'
+	| 'skipped'
+	| 'pending'
+	| 'ignored'
+	| 'measured'
+	| 'filtered-out'
+	| 'xfailed'
+	| 'xpassed'
+	| 'errors'
+	| 'warnings'
+	| 'added'
+	| 'removed'
+	| 'changed'
+	| 'vulnerabilities'
+	| 'matches'
+	| 'files'
+	| 'paths'
+	| 'commits'
+	| 'staged'
+	| 'unstaged'
+	| 'untracked'
+	| 'insertions'
+	| 'deletions'
+	| 'events';
+
+export type CountFactScope =
+	| 'tests'
+	| 'test-suites'
+	| 'packages'
+	| 'diagnostics'
+	| 'dependencies'
+	| 'search-results'
+	| 'paths'
+	| 'version-control'
+	| 'log-events'
+	| 'generic';
+
 /**
- * A single typed count fact extracted from native output (e.g. "10 passed").
- * The value is `undefined` when the count is referenced but could not be parsed
- * from the raw evidence - NEVER fabricated as zero.
+ * A typed count extracted from native output. `undefined` means that the native
+ * output referenced the count but did not contain a parseable exact value.
  */
 export interface CountFact {
-	/** Human-readable name of the count (e.g. "passed", "failed", "warnings"). */
-	name: string;
-	/** Exact integer value when parsed; `undefined` when present but unparseable. */
+	kind: CountFactKind;
+	scope: CountFactScope;
 	value: number | undefined;
-	/** Where in the raw output this fact was derived from. */
+	sourceRange: SourceRange;
+	confidence: SummaryConfidence;
+}
+
+/** Verbatim source evidence which must never be paraphrased by the pipeline. */
+export interface VerbatimEvidence {
+	text: string;
+	sourceRange: SourceRange;
+	confidence: SummaryConfidence;
+}
+
+export interface NativeSummaryEvidence extends VerbatimEvidence {
+	kind: 'native-summary';
+}
+
+export type TerminalProcessStatus = 'success' | 'failure' | 'unknown';
+
+export interface StatusEvidence extends VerbatimEvidence {
+	kind: 'process-status';
+	status: TerminalProcessStatus;
+}
+
+export interface DurationEvidence extends VerbatimEvidence {
+	/** Exact parsed duration. Unknown or malformed duration remains undefined. */
+	milliseconds: number | undefined;
+}
+
+export type SummarySeverity = 'fatal' | 'error' | 'warning' | 'info';
+export type DiagnosticKind = 'diagnostic' | 'failure';
+
+/**
+ * A diagnostic or failure identity and its bounded context. `verbatim` is the
+ * exact primary source line; `message` is an exact substring extracted from it.
+ */
+export interface DiagnosticBlock {
+	kind: DiagnosticKind;
+	identity: string;
+	file: string | undefined;
+	line: number | undefined;
+	column: number | undefined;
+	code: string | undefined;
+	message: string;
+	verbatim: string;
+	severity: SummarySeverity;
+	contextLines: readonly string[];
+	sourceRange: SourceRange;
+	contextRange: SourceRange;
+}
+
+export type AggregateKind = 'exact-line' | 'adapter-signature';
+
+/** A representative source sample retained by an aggregate or summary. */
+export interface RepresentativeSample {
+	text: string;
 	sourceRange: SourceRange;
 }
 
 /**
- * A block of summary content: can be a verbatim snippet, a diagnostic, an
- * aggregate marker, or a sample block.
+ * An exact aggregate. Generic aggregates use `exact-line` and may only contain
+ * byte-identical (after trailing-whitespace normalization) signatures. Profile
+ * adapters may use a domain-specific `adapter-signature` without claiming that
+ * distinct sample text is identical.
  */
-export type SummaryBlockKind = 'status' | 'native-summary' | 'diagnostic' | 'warning' | 'aggregate' | 'sample' | 'overview';
+export interface SummaryAggregate {
+	kind: AggregateKind;
+	signature: string;
+	count: number;
+	sourceRanges: readonly SourceRange[];
+	samples: readonly RepresentativeSample[];
+}
+
+/**
+ * A block of summary content. The renderer consumes these blocks by priority;
+ * source ranges always refer to the normalized raw output.
+ */
+export type SummaryBlockKind = 'status' | 'native-summary' | 'failure' | 'diagnostic' | 'warning' | 'aggregate' | 'sample' | 'overview' | 'diff';
 
 export interface SummaryBlock {
 	kind: SummaryBlockKind;
-	/** User-visible lines in the summary for this block. */
 	lines: readonly string[];
-	/** 1-based source range(s) this block covers. May be empty for synthetic markers. */
 	sourceRanges: readonly SourceRange[];
-	/** If true, this block MUST survive budget reduction (e.g. failure identity). */
 	protected: boolean;
 }
 
-/**
- * A single diagnostic (error/warning from a build, lint, or test run).
- */
-export interface DiagnosticBlock {
-	/** File path from raw output (may be undefined for project-level diagnostics). */
-	file: string | undefined;
-	/** 1-based line number in the file, if present. */
-	line: number | undefined;
-	/** 1-based column number in the file, if present. */
-	column: number | undefined;
-	/** Diagnostic code/rule identifier (e.g. "TS2345", "no-unused-vars"). */
-	code: string | undefined;
-	/** The primary diagnostic message. */
-	message: string;
-	/** Severity: "error" or "warning". */
-	severity: 'error' | 'warning';
-	/** Raw lines providing context (code frame, note, help). */
-	contextLines: readonly string[];
-	/** Source range in the raw output for this diagnostic and its context. */
-	sourceRange: SourceRange;
-}
-
-/**
- * Evidence collected before reduction.
- */
+/** Evidence collected before reduction. */
 export interface SummaryEvidence {
-	/** Raw output lines that look like a native final summary. */
-	nativeSummaryLines: readonly string[];
-	/** Raw output lines indicating process exit/final status. */
-	statusLines: readonly string[];
-	/** Count facts extracted so far (may be extended by adapters). */
+	nativeSummaries: readonly NativeSummaryEvidence[];
+	statuses: readonly StatusEvidence[];
 	countFacts: readonly CountFact[];
-	/** Diagnostic blocks identified before reduction. */
 	diagnostics: readonly DiagnosticBlock[];
-	/** Ranges in the raw output that must not be touched by generic reduction. */
+	aggregates: readonly SummaryAggregate[];
 	protectedRanges: readonly SourceRange[];
 }
 
@@ -128,36 +209,51 @@ export interface ProfileClassificationEvidence {
 	ambiguousProfiles: readonly TerminalOutputProfile[];
 }
 
-/**
- * Result of profile classification.
- */
+/** Result of profile classification. */
 export interface ClassificationResult {
 	profile: TerminalOutputProfile;
 	confidence: SummaryConfidence;
-	/** Human-readable label for the selected family adapter. */
 	adapter: string;
-	/** Marker evidence supporting the selected profile. */
 	classificationEvidence: ProfileClassificationEvidence;
-	/** Structured raw evidence collected before reduction. */
 	evidence: SummaryEvidence;
 }
 
-/**
- * Full typed summary model produced by the pipeline.
- */
+/** Full typed summary model produced by the pipeline. */
 export interface TerminalOutputSummary {
 	profile: TerminalOutputProfile;
 	adapter: string;
 	confidence: SummaryConfidence;
-	status: 'success' | 'failure' | 'unknown';
+	command: string;
+	status: TerminalProcessStatus;
+	nativeSummaries: readonly NativeSummaryEvidence[];
+	statusEvidence: readonly StatusEvidence[];
 	counts: readonly CountFact[];
+	durations: readonly DurationEvidence[];
+	diagnostics: readonly DiagnosticBlock[];
+	aggregates: readonly SummaryAggregate[];
+	samples: readonly RepresentativeSample[];
 	blocks: readonly SummaryBlock[];
 	protectedRanges: readonly SourceRange[];
 }
 
-/**
- * Measured evidence that a short output is verbose rather than already compact.
- */
+export interface TerminalOutputSummaryInput {
+	profile: TerminalOutputProfile;
+	adapter: string;
+	confidence: SummaryConfidence;
+	command: string;
+	status: TerminalProcessStatus;
+	nativeSummaries?: readonly NativeSummaryEvidence[];
+	statusEvidence?: readonly StatusEvidence[];
+	counts?: readonly CountFact[];
+	durations?: readonly DurationEvidence[];
+	diagnostics?: readonly DiagnosticBlock[];
+	aggregates?: readonly SummaryAggregate[];
+	samples?: readonly RepresentativeSample[];
+	additionalBlocks?: readonly SummaryBlock[];
+	protectedRanges?: readonly SourceRange[];
+}
+
+/** Measured evidence that a short output is verbose rather than compact. */
 export interface TerminalOutputVerboseEvidence {
 	rawLineCount: number;
 	repeatNoiseRatio: number;
@@ -167,10 +263,7 @@ export interface TerminalOutputVerboseEvidence {
 	profileConfidence: SummaryConfidence;
 }
 
-/**
- * Fully rendered candidate evaluated by the adaptive policy. `text` includes
- * all model-facing summary overhead, so savings are measured truthfully.
- */
+/** Fully rendered candidate evaluated by the adaptive policy. */
 export interface TerminalOutputSummaryCandidate {
 	summary: TerminalOutputSummary;
 	text: string;
@@ -178,28 +271,18 @@ export interface TerminalOutputSummaryCandidate {
 	verboseEvidence: TerminalOutputVerboseEvidence;
 }
 
-/**
- * Result of the adaptive policy decision.
- */
+/** Result of the adaptive policy decision. */
 export type AdaptiveDecision =
 	| { kind: 'pass-through' }
 	| { kind: 'verbose'; candidate: TerminalOutputSummaryCandidate; savedChars: number }
 	| { kind: 'hard-limit'; candidate: TerminalOutputSummaryCandidate | undefined };
 
-/**
- * Options for the summary pipeline, extending the legacy summarizer options
- * with quality-upgrade fields.
- */
+/** Options for the summary pipeline. */
 export interface SummaryPipelineOptions {
-	/** Raw output as a single string. */
 	rawOutput: string;
-	/** Command that produced this output (e.g. "npm test", "git push"). */
 	command: string;
-	/** Hard character limit for the model-facing result. */
 	maxToolOutputLength: number;
-	/** Hint for how many head lines to sample when budget allows. */
 	headLines: number;
-	/** Hint for how many tail lines to sample when budget allows. */
 	tailLines: number;
 }
 
