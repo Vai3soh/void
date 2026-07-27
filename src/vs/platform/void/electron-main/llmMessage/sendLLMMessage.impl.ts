@@ -1094,6 +1094,7 @@ export async function runStream({
 		maxAttempts: number;
 		textLen: number;
 		reasoningLen: number;
+		toolCallCount: number;
 	}) => {
 		if (!notifyOnTruncation) return;
 		if (didNotifyTruncation) return;
@@ -1101,7 +1102,7 @@ export async function runStream({
 
 		didNotifyTruncation = true;
 
-		const isReasoningOnly = info.kind === 'length' && info.textLen === 0 && info.reasoningLen > 0;
+		const isReasoningOnly = info.kind === 'length' && info.textLen === 0 && info.reasoningLen > 0 && info.toolCallCount === 0;
 		const why = info.kind === 'timeout' ? 'timeout' : 'token limit (finish_reason=length)';
 
 		const msg = isReasoningOnly
@@ -1112,7 +1113,7 @@ export async function runStream({
 			: `LLM response was truncated: ${why}.\n` +
 			`Provider: ${String(info.provider)}. LLM: ${String(info.model)}.\n` +
 			`max_tokens/max_completion_tokens: ${info.maxTokens}. Attempt: ${info.attempt}/${info.maxAttempts}.\n` +
-			`Received: text=${info.textLen}, reasoning=${info.reasoningLen}.\n` +
+			`Received: text=${info.textLen}, reasoning=${info.reasoningLen}, tool_calls=${info.toolCallCount}.\n` +
 			`How to fix: increase max_tokens/max_completion_tokens (or maxTokensCap for retries), or reduce reasoning effort / disable reasoning.`;
 
 		try {
@@ -1389,6 +1390,7 @@ export async function runStream({
 
 				const toolCallsFinal = buildToolCalls();
 				const toolCall = toolCallsFinal[0] ?? null;
+				const hasIncompleteToolCall = toolAccByIdx.size > toolCallsFinal.length;
 
 				__dbg('non-stream end', {
 					attempt,
@@ -1396,6 +1398,7 @@ export async function runStream({
 					reasoningLen: collectedReasoning?.length ?? 0,
 					hasToolCall: !!toolCall,
 					toolName: (toolCall as any)?.name ?? null,
+					hasIncompleteToolCall,
 					sawToolCallsStructured,
 					sawXmlToolTagInText,
 					sawXmlToolTagInReasoning,
@@ -1404,9 +1407,10 @@ export async function runStream({
 				// Check for truncation in non-stream path
 				const finishReason = choice?.finish_reason;
 				const hitLimit = (finishReason === 'length');
-				const isReasoningOnlyTruncation = hitLimit && !text && collectedReasoning.length > 0;
+				const hasTruncatedToolCall = hitLimit && toolAccByIdx.size > 0;
+				const isReasoningOnlyTruncation = hitLimit && !text && collectedReasoning.length > 0 && !hasTruncatedToolCall;
 
-				if (!toolCall && hitLimit && !isReasoningOnlyTruncation && policy.enabled && attempt < policy.maxAttempts) {
+				if ((!toolCall || hasTruncatedToolCall) && hitLimit && !isReasoningOnlyTruncation && policy.enabled && attempt < policy.maxAttempts) {
 					const prev = getCurrentMaxTokens(currentOptions);
 					bumpMaxTokens(currentOptions, policy);
 					const next = getCurrentMaxTokens(currentOptions);
@@ -1415,7 +1419,7 @@ export async function runStream({
 					continue;
 				}
 
-				if (!toolCall && hitLimit) {
+				if (hitLimit) {
 					notifyTruncationOnce({
 						kind: 'length',
 						model: String((currentOptions as any)?.model ?? ''),
@@ -1425,6 +1429,7 @@ export async function runStream({
 						maxAttempts: policy.maxAttempts,
 						textLen: (text ?? '').length,
 						reasoningLen: (collectedReasoning ?? '').length,
+						toolCallCount: toolAccByIdx.size,
 					});
 				}
 
@@ -1690,6 +1695,7 @@ export async function runStream({
 
 			const toolCallsFinal = buildToolCalls();
 			const toolCall = toolCallsFinal[0] ?? null;
+			const hasIncompleteToolCall = toolAccByIdx.size > toolCallsFinal.length;
 			const usagePayload = lastTokenUsage ? { tokenUsage: lastTokenUsage } : {};
 
 			__dbg('attempt end', {
@@ -1707,17 +1713,19 @@ export async function runStream({
 				sawXmlToolTagInText,
 				sawXmlToolTagInReasoning,
 				hasFinalToolCall: !!toolCall,
+				hasIncompleteToolCall,
 				finalToolName: (toolCall as any)?.name ?? null,
 				hasUsage: !!lastTokenUsage,
 			});
 
-			// IMPORTANT: retry on length/timeout EVEN IF we already got partial output,
-			// but only when there is NO tool call (tool calls are handled differently).
+			// Retry truncated text and incomplete tool calls. A complete tool call can still be
+			// returned when the provider reports length after emitting other partial output.
 			const hitLimit = (lastFinishReason === 'length');
 			const hitTimeout = abortedByTimeout;
-			const isReasoningOnlyTruncation = hitLimit && !fullTextSoFar && fullReasoningSoFar.length > 0;
+			const hasTruncatedToolCall = hitLimit && toolAccByIdx.size > 0;
+			const isReasoningOnlyTruncation = hitLimit && !fullTextSoFar && fullReasoningSoFar.length > 0 && !hasTruncatedToolCall;
 
-			if (!toolCall && !isReasoningOnlyTruncation && (hitLimit || hitTimeout) && policy.enabled && attempt < policy.maxAttempts) {
+			if ((!toolCall || hasTruncatedToolCall) && !isReasoningOnlyTruncation && (hitLimit || hitTimeout) && policy.enabled && attempt < policy.maxAttempts) {
 				const prev = getCurrentMaxTokens(currentOptions);
 				bumpMaxTokens(currentOptions, policy);
 				const next = getCurrentMaxTokens(currentOptions);
@@ -1735,7 +1743,7 @@ export async function runStream({
 				continue;
 			}
 
-			if (!toolCall && (hitLimit || hitTimeout)) {
+			if (hitLimit || hitTimeout) {
 				notifyTruncationOnce({
 					kind: hitTimeout ? 'timeout' : 'length',
 					model: String((currentOptions as any)?.model ?? ''),
@@ -1745,6 +1753,7 @@ export async function runStream({
 					maxAttempts: policy.maxAttempts,
 					textLen: fullTextSoFar.length,
 					reasoningLen: fullReasoningSoFar.length,
+					toolCallCount: toolAccByIdx.size,
 				});
 			}
 

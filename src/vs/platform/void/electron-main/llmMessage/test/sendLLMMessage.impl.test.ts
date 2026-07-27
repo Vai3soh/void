@@ -434,6 +434,86 @@ suite('runStream (OpenAI-compatible)', () => {
 		assert.strictEqual(fin.toolCall!.isDone, true);
 	});
 
+	test('B4a: length after a complete tool_call retries with increased max_tokens', async () => {
+		const responses = [
+			makeAsyncStream([
+				makeChunk({
+					tool: { name: 'read_file', id: 'call_1', args: '{"uri":"/truncated","start_line":1,"end_line":2}' },
+					finish: 'length',
+				}),
+			]),
+			makeAsyncStream([
+				makeChunk({
+					tool: { name: 'read_file', id: 'call_2', args: '{"uri":"/complete","start_line":1,"end_line":2}' },
+					finish: 'tool_calls',
+				}),
+			]),
+		];
+		const openai = makeFakeOpenAIClient(responses[0]);
+		const requestedMaxTokens: unknown[] = [];
+		let createCallCount = 0;
+		openai.chat.completions.create = async (requestOptions: unknown) => {
+			requestedMaxTokens.push(
+				requestOptions && typeof requestOptions === 'object' && 'max_tokens' in requestOptions
+					? requestOptions.max_tokens
+					: undefined
+			);
+			const response = responses[createCallCount];
+			createCallCount += 1;
+			return response;
+		};
+
+		const caps = newCaptures();
+		const n = newNotificationCapture();
+		await runStream({
+			openai,
+			options: { model: 'o4-mini', messages: [], stream: true, max_tokens: 100 } as any,
+			onText: caps.onText,
+			onFinalMessage: caps.onFinalMessage,
+			onError: (e) => assert.fail('onError ' + e.message),
+			_setAborter: () => { },
+			nameOfReasoningFieldInDelta: undefined,
+			providerName: 'openAICompatible' as any,
+			toolDefsMap,
+			lengthRetryPolicy: { enabled: true, maxAttempts: 2, maxTokensCap: 200, step: 50 },
+			notificationService: n.notificationService as any,
+		});
+
+		assert.strictEqual(createCallCount, 2, 'truncated tool_call must retry');
+		assert.deepStrictEqual(requestedMaxTokens, [100, 150]);
+		assert.strictEqual(n.notifications.length, 0, 'successful retry must not notify');
+		assert.strictEqual(caps.getFinal()!.toolCall?.rawParams.uri, '/complete');
+	});
+
+	test('B4aa: exhausted length retry for tool_call emits a notification', async () => {
+		const stream = makeAsyncStream([
+			makeChunk({
+				tool: { name: 'read_file', id: 'call_1', args: '{"uri":"/truncated","start_line":1,"end_line":2}' },
+				finish: 'length',
+			}),
+		]);
+		const caps = newCaptures();
+		const n = newNotificationCapture();
+
+		await runStream({
+			openai: makeFakeOpenAIClient(stream),
+			options: { model: 'o4-mini', messages: [], stream: true, max_tokens: 100 } as any,
+			onText: caps.onText,
+			onFinalMessage: caps.onFinalMessage,
+			onError: (e) => assert.fail('onError ' + e.message),
+			_setAborter: () => { },
+			nameOfReasoningFieldInDelta: undefined,
+			providerName: 'openAICompatible' as any,
+			toolDefsMap,
+			lengthRetryPolicy: { enabled: true, maxAttempts: 1 },
+			notificationService: n.notificationService as any,
+		});
+
+		assert.strictEqual(n.notifications.length, 1, 'truncated tool_call must notify after retries');
+		assert.match(n.notifications[0]?.message, /tool_calls=1/);
+		assert.ok(caps.getFinal()!.toolCall, 'the received tool_call remains available');
+	});
+
 	test('B4b: tool_calls without index must still be parsed (no empty response)', async () => {
 		const partial1 = '{"uri":"/tmp/a.ts", "start_line": 1';
 		const partial2 = ', "end_line": 50}';
