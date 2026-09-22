@@ -142,6 +142,19 @@ suite('terminalOutputClassifier', () => {
 		assert.strictEqual(result.confidence, 'high');
 	});
 
+	test('Docker build output selects logs before lossy stage reduction', () => {
+		const result = classifyTerminalOutput('docker build .', [
+			'#1 [internal] load build definition from Dockerfile',
+			'#1 DONE 0.1s',
+			'#7 [builder 4/5] RUN npm run build',
+			'#7 ERROR: process did not complete successfully',
+			'ERROR: failed to solve: process did not complete successfully',
+		].join('\n'));
+		assert.strictEqual(result.profile, 'logs');
+		assert.strictEqual(result.confidence, 'high');
+		assert.ok(result.classificationEvidence.contentRanges.some(range => range.startLine === 3));
+	});
+
 	test('command marker alone is insufficient and returns generic', () => {
 		const commands = ['pytest', 'npm install', 'git status', 'rg TODO', 'kubectl logs pod-name'];
 		for (const command of commands) {

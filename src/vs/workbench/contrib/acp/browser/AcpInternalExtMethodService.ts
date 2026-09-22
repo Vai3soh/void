@@ -27,6 +27,7 @@ import {
 	type ChatMode,
 	type specialToolFormat
 } from '../../../../platform/void/common/voidSettingsTypes.js';
+import { type ChatModelFallbackSettings } from '../../../../platform/void/common/chatModelFallbackPolicy.js';
 
 import {
 	ToolName,
@@ -897,6 +898,12 @@ export class AcpInternalExtMethodService {
 				additionalTools = null;
 			}
 
+			// Fallback rotation policy (task 4.1): typed contract carried from the
+			// Chat fallback rotation settings so the Built-in ACP agent shares the
+			// same policy as the regular Chat execution engine. Backwards compatible:
+			// consumers that do not know this field ignore it.
+			const chatModelFallback: ChatModelFallbackSettings = st.globalSettings.chatModelFallback;
+
 			return {
 				providerName,
 				modelName,
@@ -905,6 +912,7 @@ export class AcpInternalExtMethodService {
 				overridesOfModel: st.overridesOfModel || null,
 				separateSystemMessage,
 				chatMode: st.globalSettings.chatMode ?? null,
+				chatModelFallback,
 				loopGuard: {
 					maxTurnsPerPrompt: st.globalSettings.loopGuardMaxTurnsPerPrompt,
 					maxSameAssistantPrefix: st.globalSettings.loopGuardMaxSameAssistantPrefix,

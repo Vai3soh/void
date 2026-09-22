@@ -937,12 +937,18 @@ export class AcpMainService implements IAcpMainServiceForChannel {
 		this.conn.prompt({ sessionId, prompt, _meta: promptMeta } as any)
 			.then((resp: any) => {
 				const usageFromMeta: LLMTokenUsage | undefined = resp?._meta?.llmTokenUsage;
+				const usageFromPromptResponse = resp?.usage ? {
+					input: Number(resp.usage.inputTokens ?? 0),
+					cacheCreation: Number(resp.usage.cachedWriteTokens ?? 0),
+					cacheRead: Number(resp.usage.cachedReadTokens ?? 0),
+					output: Number(resp.usage.outputTokens ?? 0),
+				} satisfies LLMTokenUsage : undefined;
 				const turnsFromMeta: LLMTokenUsage[] | undefined = Array.isArray(resp?._meta?.llmTokenUsageTurns)
 					? resp._meta.llmTokenUsageTurns
 					: undefined;
 
 				const usageFromSession = this.tokenUsageBySession.get(sessionId);
-				const usage = usageFromMeta ?? usageFromSession;
+				const usage = usageFromMeta ?? usageFromPromptResponse ?? usageFromSession;
 				this.tokenUsageBySession.delete(sessionId);
 
 				emitter?.fire({
@@ -1135,6 +1141,15 @@ export class AcpMainService implements IAcpMainServiceForChannel {
 
 		if (u.sessionUpdate === 'agent_message_chunk' && typeof u.content === 'object' && u.content && 'type' in u.content) {
 			if ((u.content as any).type === 'text') emitText((u.content as any).text);
+			return;
+		}
+
+		if (u.sessionUpdate === 'usage_update' && sessionId) {
+			const usage: LLMTokenUsage | undefined = u._meta?.llmTokenUsage;
+			if (usage) {
+				this.tokenUsageBySession.set(sessionId, usage);
+				emitter.fire({ type: 'usage', tokenUsageSnapshot: usage });
+			}
 			return;
 		}
 
@@ -1505,7 +1520,14 @@ export class AcpMainService implements IAcpMainServiceForChannel {
 				if (sid && toolCallId) {
 					this._stopTerminalPoll(sid, toolCallId);
 				}
-				const errorText = status === 'failed' ? 'Tool failed' : undefined;
+				let errorText: string | undefined;
+				if (status === 'failed') {
+					const fromContent = derivedTexts.length ? derivedTexts.join('\n').trim() : '';
+					const fromRaw = typeof (rObj as any)?._message === 'string' ? String((rObj as any)._message).trim() : '';
+					errorText = fromContent || fromRaw || 'Tool failed';
+				} else {
+					errorText = undefined;
+				}
 
 				// clear active tool call
 				{

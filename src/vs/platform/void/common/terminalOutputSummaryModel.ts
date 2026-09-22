@@ -160,9 +160,20 @@ function blocksOf(input: {
 		});
 	}
 	for (const aggregate of input.aggregates) {
+		const firstSample = aggregate.samples[0];
+		const lastSample = aggregate.samples[aggregate.samples.length - 1];
+		const lines = aggregate.kind === 'exact-line' && firstSample && aggregate.count >= 2
+			? [`${firstSample.text} [repeated ${aggregate.count} times]`]
+			: aggregate.count >= 3 && firstSample && lastSample
+				? [
+					firstSample.text,
+					`[... ${aggregate.count - 2} ${aggregate.kind === 'progress' ? 'progress' : 'aggregate'} lines omitted ...]`,
+					lastSample.text,
+				]
+				: aggregate.samples.map(sample => sample.text);
 		blocks.push({
 			kind: 'aggregate',
-			lines: aggregate.samples.map(sample => sample.text),
+			lines,
 			sourceRanges: aggregate.sourceRanges,
 			protected: false,
 		});

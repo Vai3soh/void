@@ -12,6 +12,7 @@ import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { IToolsService, isDangerousTerminalCommand } from '../common/toolsService.js';
 import { ILanguageModelToolsService } from '../../chat/common/languageModelToolsService.js';
 import { IMetricsService } from '../../../../platform/void/common/metricsService.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { LLMLoopDetector, LOOP_DETECTED_MESSAGE } from '../../../../platform/void/common/loopGuard.js';
 import { getErrorMessage, RawToolCallObj, RawToolParamsObj, LLMTokenUsage, type LLMError, type OnText } from '../../../../platform/void/common/sendLLMMessageTypes.js';
@@ -58,6 +59,24 @@ type ActiveToolTurn = {
 	pendingToolCalls: RawToolCallObj[];
 	loopDetected: boolean;
 };
+
+import {
+	buildCandidateModels,
+	calculateBoundedWait,
+	createActualModelMetadata,
+	createFallbackRuntimeState,
+	createFallbackTransitionStatus,
+	DEFAULT_CHAT_MODEL_FALLBACK_SETTINGS,
+	DEFAULT_CHAT_MODEL_MAX_ROTATION_ATTEMPTS,
+	createReturnToPrimaryStatus,
+	isErrorEligibleForFallback,
+	recordModelCooldown,
+	selectNextCandidate,
+	selectNextCandidateIgnoringCooldowns,
+	type ActualModelMetadata,
+	type ModelTransitionStatus,
+} from '../../../../platform/void/common/chatModelFallbackPolicy.js';
+import { captureChatModelFallbackMetric } from '../../../../platform/void/common/chatModelFallbackMetrics.js';
 
 export class ChatExecutionEngine {
 
@@ -259,7 +278,8 @@ export class ChatExecutionEngine {
 		@IMCPService private readonly _mcpService: IMCPService,
 		private readonly _historyCompressor: ChatHistoryCompressor,
 		private readonly _toolOutputManager: ChatToolOutputManager,
-		private readonly _resumeToolTurn?: (threadId: string) => Promise<void>
+		private readonly _resumeToolTurn?: (threadId: string) => Promise<void>,
+		@ILogService private readonly _logService?: ILogService,
 	) { }
 
 	public async runChatAgent(opts: {
@@ -280,6 +300,63 @@ export class ChatExecutionEngine {
 		const chatRetries = gs.chatRetries;
 		const retryDelay = gs.retryDelay;
 		const { overridesOfModel } = this._settingsService.state;
+
+		// Backfilled defaults (task 1.2): persisted settings without the fallback
+		// section (e.g. imported legacy state or test harnesses) fall back to the
+		// disabled-by-default settings instead of crashing.
+		const fallbackSettings = gs.chatModelFallback ?? DEFAULT_CHAT_MODEL_FALLBACK_SETTINGS;
+		this._logService?.debug?.('[ChatFallbackRotation] runChatAgent start', {
+			threadId,
+			chatMode,
+			modelSelection: modelSelection ? { providerName: modelSelection.providerName, modelName: modelSelection.modelName } : null,
+			fallbackEnabled: !!fallbackSettings?.enabled,
+			fallbackModelsCount: Array.isArray(fallbackSettings?.fallbackModels) ? fallbackSettings.fallbackModels.length : 0,
+		});
+		// Primary snapshot (task 3.1): fixed at the start of this user execution.
+		// Changing the primary model in the UI during execution never mutates this
+		// snapshot; a new user request re-enters runChatAgent and snapshots the new
+		// primary, so the next request starts from the newly-selected model.
+		const fallbackState = modelSelection && fallbackSettings?.enabled
+			? createFallbackRuntimeState(modelSelection, fallbackSettings.fallbackModels)
+			: undefined;
+		let activeModelSelection = modelSelection;
+		// Continuous rotation loop (spec update): after the failing model is put
+		// on cooldown, rotation always continues the chain - the next candidate is
+		// chosen even if it is still cooling down (e.g. the primary's 429
+		// Retry-After has not expired) - but only for up to `maxRotationAttempts`
+		// model switches per user execution.
+		const maxRotationAttempts = typeof fallbackSettings?.maxRotationAttempts === 'number' && fallbackSettings.maxRotationAttempts > 0
+			? fallbackSettings.maxRotationAttempts
+			: DEFAULT_CHAT_MODEL_MAX_ROTATION_ATTEMPTS;
+		let nRotationAttempts = 0;
+		// "Served by" label is shown once per model switch: track the model that
+		// served the last committed assistant message in this thread.
+		let lastServedModelKey: string | undefined;
+		{
+			const threadMessages = access.getThreadMessages(threadId);
+			for (let i = threadMessages.length - 1; i >= 0; i--) {
+				const message = threadMessages[i];
+				if (message.role === 'assistant' && message.actualModel) {
+					lastServedModelKey = `${message.actualModel.providerName}::${message.actualModel.modelName}`;
+					break;
+				}
+			}
+		}
+		// Tolerant availability check (task 1.4/3.1): entries whose provider/model
+		// cannot be positively detected as unavailable are treated as available so
+		// the user's saved fallback list is never destructively cleaned up.
+		const isModelConfigured = (providerName: string, modelName: string): boolean => {
+			try {
+				const state = this._settingsService.state as unknown as Record<string, unknown>;
+				const options = state.modelOptions ?? state.modelsOptions;
+				if (!Array.isArray(options)) return true; // fail open
+				return options.some((m: unknown) => {
+					if (!m || typeof m !== 'object') return false;
+					const mo = m as { providerName?: unknown; modelName?: unknown };
+					return mo.providerName === providerName && mo.modelName === modelName;
+				});
+			} catch { return true; }
+		};
 
 		let nMessagesSent = 0;
 		let shouldSendAnotherMessage = true;
@@ -311,6 +388,54 @@ export class ChatExecutionEngine {
 			shouldSendAnotherMessage = false;
 			isRunningWhenEnd = undefined;
 			nMessagesSent += 1;
+
+			// Fallback rotation (task 3.1): the model for this LLM-turn is selected
+			// ONLY here, between turns - never mid-stream. When the primary is not
+			// cooling it is always re-selected first (return-to-primary behavior).
+			if (fallbackState && modelSelection) {
+				const nowMs = Date.now();
+				const candidates = buildCandidateModels(fallbackState, isModelConfigured, nowMs);
+				this._logService?.debug?.('[ChatFallbackRotation] per-turn candidates', {
+					threadId,
+					nMessagesSent,
+					candidates: candidates.map(c => ({ providerName: c.providerName, modelName: c.modelName })),
+				});
+				const nextCandidate = candidates[0];
+				if (nextCandidate) {
+					activeModelSelection = nextCandidate;
+					// Metrics (task 6.1): primary attempt when the primary serves this turn.
+					if (fallbackSettings?.enabled && nextCandidate.providerName === fallbackState.primary.providerName && nextCandidate.modelName === fallbackState.primary.modelName) {
+						captureChatModelFallbackMetric(this._metricsService, 'Chat Model Fallback - Primary Attempt', {
+							transportPath: 'regular Chat',
+							chatMode,
+							errorPolicy: fallbackSettings.errorPolicy ?? 'temporary-errors',
+							providerName: fallbackState.primary.providerName,
+							modelName: fallbackState.primary.modelName,
+							candidateCount: fallbackState.fallbackModels.length,
+						});
+					}
+				}
+				else {
+					// All candidates cooling/unavailable: bounded wait, then re-select so
+					// we either surface a candidate after cooldown or keep the last one.
+					const boundedWaitMs = calculateBoundedWait(fallbackState, nowMs, 5_000);
+					if (boundedWaitMs !== null && !isStopped()) {
+						// Metrics (task 6.1): all candidates cooling, bounded wait applied.
+						captureChatModelFallbackMetric(this._metricsService, 'Chat Model Fallback - Cooldown Skip', {
+							transportPath: 'regular Chat',
+							chatMode,
+							errorPolicy: fallbackSettings?.errorPolicy ?? 'temporary-errors',
+							providerName: fallbackState.primary.providerName,
+							modelName: fallbackState.primary.modelName,
+							cooldownMs: boundedWaitMs,
+							candidateCount: fallbackState.fallbackModels.length,
+						});
+						await timeout(boundedWaitMs);
+						const retryCandidates = buildCandidateModels(fallbackState, isModelConfigured, Date.now());
+						activeModelSelection = retryCandidates[0] ?? activeModelSelection;
+					}
+				}
+			}
 
 			access.setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor });
 
@@ -345,13 +470,39 @@ export class ChatExecutionEngine {
 				access.setThreadState(threadId, { historyCompression: compressionInfoForSentPayload });
 			}
 
-			const { messages, separateSystemMessage } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
+			// Model transition statuses collected during this LLM-turn (task 3):
+			// switches to a fallback model and the return to the primary model.
+			// They are surfaced inline in the chat UI and never become part of the
+			// LLM conversation.
+			const modelTransitions: ModelTransitionStatus[] = [];
+
+			// Return to the primary model once it is available again (its cooldown
+			// expired) instead of staying on a fallback across turns. This respects
+			// cooldowns, so it may also move straight to a fallback if the primary
+			// is still cooling down at the start of the turn.
+			if (fallbackState && fallbackSettings?.enabled && activeModelSelection) {
+				const nextCandidate = selectNextCandidate(fallbackState, isModelConfigured, Date.now(), new Set());
+				if (nextCandidate && (nextCandidate.providerName !== activeModelSelection.providerName || nextCandidate.modelName !== activeModelSelection.modelName)) {
+					const wasOnFallback = activeModelSelection.providerName !== fallbackState.primary.providerName || activeModelSelection.modelName !== fallbackState.primary.modelName;
+					modelTransitions.push(
+						wasOnFallback
+							? createReturnToPrimaryStatus(activeModelSelection, nextCandidate)
+							: createFallbackTransitionStatus(activeModelSelection, nextCandidate, 'primary model cooling down'),
+					);
+					activeModelSelection = nextCandidate;
+				}
+			}
+
+			// Use the per-turn selected candidate (task 3.1) so provider-specific
+			// message/system formatting follows the active model, not the snapshot.
+			// `let` because the fallback rotation re-prepares these per candidate.
+			let { messages, separateSystemMessage } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages,
-				modelSelection,
+				modelSelection: activeModelSelection,
 				chatMode
 			});
 
-			await this._patchImagesIntoMessages({ messages, chatMessages, modelSelection });
+			await this._patchImagesIntoMessages({ messages, chatMessages, modelSelection: activeModelSelection });
 
 			if (isStopped()) {
 				return;
@@ -367,8 +518,8 @@ export class ChatExecutionEngine {
 				let lastUsageForTurn: LLMTokenUsage | undefined;
 
 				try {
-					if (modelSelection) {
-						const { providerName, modelName } = modelSelection;
+					if (activeModelSelection) {
+						const { providerName, modelName } = activeModelSelection;
 						const caps = getModelCapabilities(providerName as any, modelName, overridesOfModel);
 						const reservedFromCaps = caps.reservedOutputTokenSpace ?? 0;
 
@@ -399,7 +550,7 @@ export class ChatExecutionEngine {
 				} catch { /* noop */ }
 
 				type ResTypes =
-					| { type: 'llmDone'; toolCalls?: RawToolCallObj[]; toolCall?: RawToolCallObj; info: { fullText: string; fullReasoning: string; anthropicReasoning: any }; tokenUsage?: LLMTokenUsage }
+					| { type: 'llmDone'; toolCalls?: RawToolCallObj[]; toolCall?: RawToolCallObj; info: { fullText: string; fullReasoning: string; anthropicReasoning: any }; tokenUsage?: LLMTokenUsage; actualModel?: ActualModelMetadata; modelTransitions?: ModelTransitionStatus[] }
 					| { type: 'llmError'; error: LLMError }
 					| { type: 'llmAborted' };
 
@@ -450,7 +601,7 @@ export class ChatExecutionEngine {
 					messagesType: 'chatMessages',
 					chatMode,
 					messages: messages,
-					modelSelection,
+					modelSelection: activeModelSelection,
 					modelSelectionOptions,
 					overridesOfModel,
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
@@ -464,7 +615,20 @@ export class ChatExecutionEngine {
 						clearPendingStreamUpdate();
 						if (isStopped()) return;
 						if (tokenUsage) lastUsageForTurn = tokenUsage;
-						resMessageIsDonePromise({ type: 'llmDone', toolCalls, toolCall, info: { fullText, fullReasoning, anthropicReasoning }, tokenUsage });
+						resMessageIsDonePromise({
+							type: 'llmDone',
+							toolCalls,
+							toolCall,
+							info: { fullText, fullReasoning, anthropicReasoning },
+							tokenUsage,
+							// Actual model metadata + transition statuses for this turn (task 3):
+							// the model that really served the request (a fallback, if rotation
+							// happened) and any model switches recorded along the way.
+							actualModel: fallbackState && activeModelSelection
+								? createActualModelMetadata(activeModelSelection.providerName, activeModelSelection.modelName, fallbackState)
+								: undefined,
+							modelTransitions: modelTransitions.length > 0 ? modelTransitions : undefined,
+						});
 					},
 					onError: async (error) => {
 						clearPendingStreamUpdate();
@@ -489,7 +653,18 @@ export class ChatExecutionEngine {
 					this._llmMessageService.abort(llmCancelToken);
 					return;
 				}
-				access.setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '', reasoningSoFar: '', toolCallSoFar: null }, interrupt: Promise.resolve(() => this._llmMessageService.abort(llmCancelToken)) });
+				// Inline transition status (task 5.1): surfaced above the streaming
+				// assistant content while the fallback request is pending or streaming.
+				access.setStreamState(threadId, {
+					isRunning: 'LLM',
+					llmInfo: {
+						displayContentSoFar: '',
+						reasoningSoFar: '',
+						toolCallSoFar: null,
+						modelTransition: modelTransitions.length > 0 ? modelTransitions[0] : undefined,
+					},
+					interrupt: Promise.resolve(() => this._llmMessageService.abort(llmCancelToken))
+				});
 
 				const llmRes = await messageIsDonePromise;
 
@@ -506,6 +681,105 @@ export class ChatExecutionEngine {
 
 					const { error } = llmRes;
 					const canRetry = error.providerHttp?.retryable !== false && error.providerHttp?.status !== 400;
+
+					// Fallback rotation: if enabled and the error is eligible for the
+					// configured policy, put the failing model on cooldown and switch to
+					// the next available candidate for the retry attempt.
+					if (fallbackState && fallbackSettings?.enabled && activeModelSelection) {
+						const errorPolicy = fallbackSettings.errorPolicy ?? 'temporary-errors';
+						const isEligible = isErrorEligibleForFallback(errorPolicy, {
+							status: error.providerHttp?.status,
+							isNetworkError: error.providerHttp?.isNetworkError,
+							fullError: error.fullError ?? null,
+						});
+						this._logService?.debug?.('[ChatFallbackRotation] llmError received', {
+							threadId,
+							providerHttpStatus: error.providerHttp?.status,
+							retryAfterMs: error.providerHttp?.retryAfterMs,
+							providerHttpPresent: !!error.providerHttp,
+							fullErrorStatus: (error.fullError as { status?: unknown } | null)?.status,
+							errorPolicy,
+							isEligible,
+						});
+						if (isEligible) {
+							recordModelCooldown(
+								fallbackState,
+								activeModelSelection,
+								error.providerHttp?.retryAfterMs,
+								retryDelay,
+								Date.now(),
+							);
+							// Metrics (task 6.1): cooldown recorded for the failed model.
+							captureChatModelFallbackMetric(this._metricsService, 'Chat Model Fallback - Cooldown Skip', {
+								transportPath: 'regular Chat',
+								chatMode,
+								errorPolicy: errorPolicy,
+								providerName: activeModelSelection.providerName,
+								modelName: activeModelSelection.modelName,
+								status: error.providerHttp?.status,
+								fromRetryAfter: error.providerHttp?.retryAfterMs !== undefined,
+								cooldownMs: error.providerHttp?.retryAfterMs ?? retryDelay,
+								candidateCount: fallbackState.fallbackModels.length,
+							});
+							const triedKeys = new Set<string>([`${activeModelSelection.providerName}::${activeModelSelection.modelName}`]);
+							// Rotation budget (spec update): switch to the next candidate even if
+							// it is still cooling down, but stop after maxRotationAttempts switches.
+							const canRotate = nRotationAttempts < maxRotationAttempts;
+							const rotated = canRotate
+								? selectNextCandidateIgnoringCooldowns(
+									fallbackState,
+									isModelConfigured,
+									triedKeys,
+								)
+								: null;
+							this._logService?.debug?.('[ChatFallbackRotation] selectNextCandidate result', {
+								threadId,
+								rotated: rotated ? { providerName: rotated.providerName, modelName: rotated.modelName } : null,
+								rotationAttempts: nRotationAttempts,
+								maxRotationAttempts,
+								canRotate,
+							});
+							if (rotated) {
+								nRotationAttempts += 1;
+								// Metrics (task 6.1): transition to a fallback candidate.
+								captureChatModelFallbackMetric(this._metricsService, 'Chat Model Fallback - Transition', {
+									transportPath: 'regular Chat',
+									chatMode,
+									errorPolicy: errorPolicy,
+									providerName: activeModelSelection.providerName,
+									modelName: activeModelSelection.modelName,
+									targetProviderName: rotated.providerName,
+									targetModelName: rotated.modelName,
+									status: error.providerHttp?.status,
+									candidateCount: fallbackState.fallbackModels.length,
+								});
+								modelTransitions.push(createFallbackTransitionStatus(
+									activeModelSelection,
+									rotated,
+									error.providerHttp?.isNetworkError
+										? 'network error'
+										: error.providerHttp?.status !== undefined ? `HTTP ${error.providerHttp.status}` : 'temporary error',
+								));
+								activeModelSelection = rotated;
+								// Re-prepare provider-specific message formatting for the new candidate.
+								({ messages, separateSystemMessage } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
+									chatMessages,
+									modelSelection: activeModelSelection,
+									chatMode
+								}));
+								shouldRetryLLM = true;
+								access.setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor });
+								// The retry is issued immediately: cooldowns must not block the
+								// continuous rotation loop (the next candidate may still be cooling
+								// down, e.g. the primary's Retry-After has not expired).
+								if (isStopped()) {
+									return;
+								}
+								continue;
+							}
+						}
+					}
+
 					if (canRetry && nAttempts < chatRetries) {
 						shouldRetryLLM = true;
 						access.setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor });
@@ -528,6 +802,19 @@ export class ChatExecutionEngine {
 						}
 						if (info?.toolCallSoFar) access.addMessageToThread(threadId, { role: 'interrupted_streaming_tool', name: info.toolCallSoFar.name });
 
+						// Metrics (task 6.1): request failed without an available candidate.
+						if (fallbackState && fallbackSettings?.enabled) {
+							captureChatModelFallbackMetric(this._metricsService, 'Chat Model Fallback - Candidates Exhausted', {
+								transportPath: 'regular Chat',
+								chatMode,
+								errorPolicy: fallbackSettings.errorPolicy ?? 'temporary-errors',
+								providerName: activeModelSelection?.providerName,
+								modelName: activeModelSelection?.modelName,
+								status: error.providerHttp?.status,
+								candidateCount: fallbackState.fallbackModels.length,
+							});
+						}
+
 						access.setStreamState(threadId, { isRunning: undefined, error });
 						access.addUserCheckpoint(threadId);
 						return;
@@ -535,16 +822,42 @@ export class ChatExecutionEngine {
 				}
 
 				// Success
-				const { toolCalls, toolCall, info, tokenUsage } = llmRes;
+				const { toolCalls, toolCall, info, tokenUsage, actualModel } = llmRes;
 				const effectiveUsage = tokenUsage ?? lastUsageForTurn;
 				if (effectiveUsage) access.accumulateTokenUsage(threadId, effectiveUsage);
+				// Metrics (task 6.1): which model actually served the response.
+				if (fallbackState && fallbackSettings?.enabled && actualModel) {
+					captureChatModelFallbackMetric(this._metricsService, 'Chat Model Fallback - Success', {
+						transportPath: 'regular Chat',
+						chatMode,
+						errorPolicy: fallbackSettings.errorPolicy ?? 'temporary-errors',
+						providerName: actualModel.providerName,
+						modelName: actualModel.modelName,
+						isFallback: actualModel.isFallback,
+						candidateCount: fallbackState.fallbackModels.length,
+					});
+				}
 
+				// "Served by" label semantics (spec update): the actual-model marker is
+				// attached only when the serving model CHANGED relative to the previous
+				// committed assistant message - a switch to a fallback shows the label
+				// once ("Served by fallback: use ..."), a return to the primary shows
+				// "Served by primary: use ...", and continuing on the same model shows
+				// nothing.
+				const servingModelKey = actualModel ? `${actualModel.providerName}::${actualModel.modelName}` : undefined;
+				const modelSwitched = !!actualModel
+					&& servingModelKey !== lastServedModelKey
+					&& (lastServedModelKey !== undefined || actualModel.isFallback);
+				if (servingModelKey !== undefined) {
+					lastServedModelKey = servingModelKey;
+				}
 				access.addMessageToThread(threadId, {
 					role: 'assistant',
 					displayContent: info.fullText,
 					reasoning: info.fullReasoning,
 					anthropicReasoning: info.anthropicReasoning,
 					...(effectiveUsage ? { tokenUsage: effectiveUsage } : {}),
+					...(modelSwitched && actualModel ? { actualModel } : {}),
 				});
 
 				// Loop Detection (Assistant)

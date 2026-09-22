@@ -41,6 +41,7 @@ export type IAcpMessageChunk =
 			exitStatus?: { exitCode: number | null; signal: string | null };
 		};
 	}
+	| { type: 'usage'; tokenUsageSnapshot: LLMTokenUsage }
 	| { type: 'error'; error: string; tokenUsageTurns?: LLMTokenUsage[] }
 	| { type: 'done'; tokenUsageSnapshot?: LLMTokenUsage; tokenUsageTurns?: LLMTokenUsage[]; };
 

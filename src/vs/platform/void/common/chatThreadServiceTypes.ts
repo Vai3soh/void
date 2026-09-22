@@ -8,6 +8,7 @@ import { VoidFileSnapshot } from './editCodeServiceTypes.js';
 // Allow dynamic tool names (MCP/runtime tools)
 export type AnyToolName = ToolName | string;
 import { AnthropicReasoning, RawToolParamsObj, LLMTokenUsage } from './sendLLMMessageTypes.js';
+import type { ActualModelMetadata } from './chatModelFallbackPolicy.js';
 import { ToolCallParams, ToolName, ToolResultType } from './toolsServiceTypes.js';
 
 // Attachments that can be associated with a user chat message
@@ -80,6 +81,8 @@ export type ChatMessage =
 
 		anthropicReasoning: AnthropicReasoning[] | null; // anthropic reasoning
 		tokenUsage?: LLMTokenUsage;
+		/** Actual provider/model that served this response, plus fallback origin (task 5.3). */
+		actualModel?: ActualModelMetadata;
 	}
 	| ToolMessage<AnyToolName>
 	| DecorativeCanceledTool

@@ -37,7 +37,9 @@ gulp.task(compileClientTask);
 
 // Copy Terminalia fonts after dev compile
 const copyVoidFontsDev = () => {
-	return gulp.src('src/vs/code/electron-sandbox/workbench/assets/fonts/*.{woff2,ttf}')
+	// `encoding: false` is required so fonts are copied as raw binary;
+	// vinyl-fs 4 (gulp 5) otherwise transcodes via utf8 and corrupts them.
+	return gulp.src('src/vs/code/electron-sandbox/workbench/assets/fonts/*.{woff2,ttf}', { encoding: false })
 		.pipe(gulp.dest('out/vs/code/electron-sandbox/workbench/assets/fonts'));
 };
 

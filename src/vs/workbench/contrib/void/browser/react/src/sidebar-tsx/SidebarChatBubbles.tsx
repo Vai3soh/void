@@ -3,6 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 import { LLMTokenUsage } from '../../../../../../../platform/void/common/sendLLMMessageTypes.js';
+import type { ActualModelMetadata } from '../../../../../../../platform/void/common/chatModelFallbackPolicy.js';
 import React, { KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAccessor, useChatThreadsStreamState, useFullChatThreadsStreamState } from '../util/services.js';
 import { ChatMarkdownRender, ChatMessageLocation } from '../markdown/ChatMarkdownRender.js';
@@ -346,6 +347,14 @@ export const UserMessageComponent = ({
 	</div>;
 };
 
+export const ActualModelInline = ({ model }: { model: ActualModelMetadata }) => {
+	return (
+		<div className='mt-1 text-[11px] text-void-fg-3 opacity-80'>
+			Served by {model.isFallback ? 'fallback' : 'primary'}: use {model.providerName}/{model.modelName}
+		</div>
+	);
+};
+
 export const TokenUsageInline = ({ usage }: { usage: LLMTokenUsage }) => {
 	const [open, setOpen] = useState(false);
 	const fmt = (n: number) => (typeof n === 'number' ? (n.toLocaleString?.() ?? String(n)) : '0');
@@ -449,6 +458,9 @@ export const AssistantMessageComponent = ({
 			)}
 			{(chatMessage as any).tokenUsage ? (
 				<TokenUsageInline usage={(chatMessage as any).tokenUsage as LLMTokenUsage} />
+			) : null}
+			{(chatMessage as any).actualModel ? (
+				<ActualModelInline model={(chatMessage as any).actualModel as ActualModelMetadata} />
 			) : null}
 		</div>
 	);

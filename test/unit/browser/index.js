@@ -123,8 +123,9 @@ const voidQuickBrowserTests = [
 	'src/vs/workbench/contrib/void/test/browser/chatThreadService.nonAcpToAcpSwitch.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/chatThreadService.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/chatThreadService.modelConfigSwitch.test.ts',
-	'src/vs/workbench/contrib/void/test/browser/terminalToolService.runCommand.test.ts',
+	'src/vs/workbench/contrib/void/browser/test/terminalToolService.runCommand.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/toolsServiceSearchInFile.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/toolsServiceReadFile.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/dynamicProviderModelSearch.test.ts',
 	'src/vs/workbench/contrib/acp/test/browser/acpInternalExtMethodService.getLLMConfigSwitch.test.ts',
 	'src/vs/workbench/contrib/void/browser/test/readFileChunkLinesPropagation.test.ts',
@@ -137,7 +138,11 @@ const voidQuickBrowserTests = [
 	'src/vs/workbench/contrib/void/test/browser/chatThreadService.agentSkills.test.ts',
 	'src/vs/workbench/contrib/acp/test/browser/acpInternalExtMethodService.agentSkills.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/chatAcpHandler.agentSkills.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/chatAcpHandler.toolProgressCard.test.ts',
 	'src/vs/workbench/contrib/void/test/browser/ChatHistoryCompressor.agentSkills.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/chatModelFallbackSettings.test.ts',
+	'src/vs/workbench/contrib/void/test/browser/chatModelFallbackRendering.test.ts',
+	'src/vs/platform/void/common/test/chatModelFallbackMetrics.test.ts',
 ];
 
 function ensureIsArray(a) {

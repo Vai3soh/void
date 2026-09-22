@@ -11,6 +11,7 @@
  * and collected evidence. No VS Code service dependencies.
  */
 
+import { extractTerminalOutputSignals } from './terminalOutputSignalExtractor.js';
 import { terminalOutputLines } from './terminalOutputSummaryModel.js';
 import type {
 	ClassificationResult,
@@ -23,32 +24,6 @@ import type {
 	SummaryEvidence,
 	TerminalOutputProfile,
 } from './terminalOutputSummaryTypes.js';
-
-const NEGATIVE_PATTERNS: readonly RegExp[] = [
-	/\.(mp3|mp4|wav|ogg|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot)\b/i,
-	/\b(error|warning|fail|panic|fatal)(Count|_count|_total|_sum|_bucket)\b/i,
-	/\b(src|lib|dist|node_modules|vendor)\/[^\s]*\.(ts|tsx|js|jsx|rs|go|py|java|rb)\b/i,
-	/^\s*(const|let|var|function|class|import|export|from|type|interface)\s+/i,
-	/\bconsole\.(error|warn|log|info|debug|trace)\b/i,
-];
-
-function matchesNegativePattern(line: string): boolean {
-	const trimmed = line.trim();
-	if (!trimmed) { return false; }
-	return NEGATIVE_PATTERNS.some(pattern => pattern.test(trimmed));
-}
-
-function isKeywordDiagnostic(line: string): boolean {
-	const trimmed = line.trim();
-	if (!trimmed || matchesNegativePattern(trimmed)) { return false; }
-	return /\b(error|fail|failed|failure|panic|exception|fatal)\b/i.test(trimmed);
-}
-
-function isKeywordWarning(line: string): boolean {
-	const trimmed = line.trim();
-	if (!trimmed || matchesNegativePattern(trimmed)) { return false; }
-	return /\b(warning|warn)\b/i.test(trimmed);
-}
 
 interface ProfileMarkers {
 	commandMarkers: readonly RegExp[];
@@ -109,11 +84,13 @@ const PROFILE_MARKERS: Record<TerminalOutputProfile, ProfileMarkers> = {
 			/\b(?:up to date|packages? are looking for funding)\b/i,
 			/\b(?:peer dependencies|deprecation|WARN\s+deprecated)\b/i,
 			/\bSuccessfully\s+(?:installed|uninstalled)\b/i,
+			/^(?:npm ERR! Lifecycle script|ERR_PNPM_[A-Z_]+)\b/i,
 		],
 		uniqueMarkers: [
 			/\badded\s+\d+\s+packages?\b/i,
 			/\b(?:removed|changed)\s+\d+\s+packages?\b/i,
 			/\b\d+\s+vulnerabilities?\b/i,
+			/^(?:npm ERR! Lifecycle script|ERR_PNPM_[A-Z_]+)\b/i,
 		],
 	},
 	'search-listing': {
@@ -137,9 +114,20 @@ const PROFILE_MARKERS: Record<TerminalOutputProfile, ProfileMarkers> = {
 		uniqueMarkers: [/\b(?:On branch|Your branch is)\b/, /^diff\s+--git\b/, /\bcommit\s+[0-9a-f]{40}\b/i],
 	},
 	'logs': {
-		commandMarkers: [/^\s*(?:journalctl|kubectl\s+logs?|docker\s+logs?|tail\s+-f)(?:\s|$)/i],
-		contentMarkers: [/^\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}/, /\b(?:INFO|WARN|ERROR|DEBUG|TRACE|FATAL)\b/, /\b(?:stdout|stderr|level|component|logger)\b/i],
-		uniqueMarkers: [/^\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}/],
+		commandMarkers: [/^\s*(?:journalctl|kubectl\s+logs?|docker\s+(?:logs?|(?:image\s+)?build|buildx\s+build)|tail\s+-f)(?:\s|$)/i],
+		contentMarkers: [
+			/^\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}/,
+			/\b(?:INFO|WARN|ERROR|DEBUG|TRACE|FATAL)\b/,
+			/\b(?:stdout|stderr|level|component|logger)\b/i,
+			/^#\d+\s+\[[^\]]+\]/,
+			/^#\d+\s+(?:DONE|ERROR)\b/,
+			/^ERROR:\s+failed to solve\b/i,
+		],
+		uniqueMarkers: [
+			/^\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}/,
+			/^#\d+\s+\[[^\]]+\]/,
+			/^ERROR:\s+failed to solve\b/i,
+		],
 	},
 	'generic': { commandMarkers: [], contentMarkers: [], uniqueMarkers: [] },
 };
@@ -150,6 +138,7 @@ function collectEvidence(rawOutput: string): SummaryEvidence {
 	const diagnostics: DiagnosticBlock[] = [];
 	const protectedRanges: SourceRange[] = [];
 	const rawLines = terminalOutputLines(rawOutput);
+	const extractedSignals = extractTerminalOutputSignals(rawLines);
 	const nativeSummaryRe = /\b(\d+\s+(passed|failed|skipped|errors?|warnings?)|BUILD\s+(SUCCESSFUL|FAILED)|Tests?:.*\b(passed|failed|total)\b|test\s+result:\s*(ok|FAILED)|added\s+\d+\s+packages?|found\s+\d+\s+vulnerabilit)/i;
 	const statusRe = /\b(exit\s+(code|status)|exited\s+with(?:\s+code)?)\s*[:=]?\s*(-?\d+)\b/i;
 
@@ -175,27 +164,11 @@ function collectEvidence(rawOutput: string): SummaryEvidence {
 			protectedRanges.push(rawLine.sourceRange);
 		}
 
-		if (isKeywordDiagnostic(trimmed) || isKeywordWarning(trimmed)) {
-			const severity = isKeywordWarning(trimmed) && !isKeywordDiagnostic(trimmed) ? 'warning' : 'error';
-			diagnostics.push({
-				kind: 'diagnostic',
-				identity: trimmed,
-				file: undefined,
-				line: undefined,
-				column: undefined,
-				code: undefined,
-				message: trimmed,
-				verbatim: line,
-				severity,
-				contextLines: [line],
-				sourceRange: rawLine.sourceRange,
-				contextRange: rawLine.sourceRange,
-			});
-			protectedRanges.push(rawLine.sourceRange);
-		}
 	}
 
-	return { nativeSummaries, statuses, countFacts: [], diagnostics, aggregates: [], protectedRanges };
+	diagnostics.push(...extractedSignals.diagnostics);
+	protectedRanges.push(...extractedSignals.protectedRanges);
+	return { nativeSummaries, statuses, countFacts: [], diagnostics, aggregates: extractedSignals.aggregates, protectedRanges };
 }
 
 interface MarkerMatches {

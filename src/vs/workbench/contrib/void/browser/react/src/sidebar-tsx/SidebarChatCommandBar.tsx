@@ -11,7 +11,25 @@ import { Check, X } from 'lucide-react';
 import { LLMTokenUsage } from '../../../../../../../platform/void/common/sendLLMMessageTypes.js';
 import { getBasename, voidOpenFileFn } from './SidebarChatShared.js';
 import { StatusIndicator } from '../markdown/ApplyBlockHoverButtons.js';
+import type { ModelTransitionStatus } from '../../../../../../../platform/void/common/chatModelFallbackPolicy.js';
 
+
+export const ModelTransitionIndicator = ({ transition }: { transition: ModelTransitionStatus }) => {
+	const fromLabel = transition.fromModel ? `${transition.fromModel.providerName}/${transition.fromModel.modelName}` : 'primary';
+	const toLabel = `${transition.toModel.providerName}/${transition.toModel.modelName}`;
+	const verb = transition.phase === 'fallback' ? 'Falling back' : 'Returning to primary';
+
+	return (
+		<div className='mb-1'>
+			<div className='flex items-center justify-between rounded bg-void-bg-3 text-void-fg-3 text-xs border border-void-border-3 px-2 py-1'>
+				<span className='font-semibold'>{verb}:</span>
+				<span className='opacity-80'>
+					{fromLabel} → {toLabel} ({transition.reason})
+				</span>
+			</div>
+		</div>
+	);
+};
 
 export const HistoryCompressionIndicator = () => {
 	const chatThreadsState = useChatThreadsState();

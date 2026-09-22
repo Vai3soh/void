@@ -151,7 +151,7 @@ export interface DiagnosticBlock {
 	contextRange: SourceRange;
 }
 
-export type AggregateKind = 'exact-line' | 'adapter-signature';
+export type AggregateKind = 'exact-line' | 'progress' | 'adapter-signature';
 
 /** A representative source sample retained by an aggregate or summary. */
 export interface RepresentativeSample {
@@ -182,6 +182,31 @@ export type SummaryBlockKind = 'status' | 'native-summary' | 'failure' | 'diagno
 export interface SummaryBlock {
 	kind: SummaryBlockKind;
 	lines: readonly string[];
+	sourceRanges: readonly SourceRange[];
+	protected: boolean;
+}
+
+export type SummaryBlockPriority =
+	| 'footer-status'
+	| 'native-summary-counts'
+	| 'primary-diagnostics'
+	| 'warnings-aggregates'
+	| 'overview'
+	| 'samples';
+
+export type SummaryBlockTruncation = 'none' | 'stack-trace' | 'progress' | 'samples' | 'logs';
+
+export interface PrioritySummaryLine {
+	text: string;
+	sourceRanges: readonly SourceRange[];
+}
+
+export interface PrioritySummaryBlock {
+	id: string;
+	kind: SummaryBlockKind | 'count';
+	priority: SummaryBlockPriority;
+	truncation: SummaryBlockTruncation;
+	lines: readonly PrioritySummaryLine[];
 	sourceRanges: readonly SourceRange[];
 	protected: boolean;
 }

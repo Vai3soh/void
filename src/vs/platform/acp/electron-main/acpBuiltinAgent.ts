@@ -25,15 +25,37 @@ import type { IInstantiationService, ServicesAccessor } from '../../instantiatio
 import { IVoidSettingsService } from '../../void/common/voidSettingsService.js';
 import { sendChatRouter as sendChatRouterOriginal } from '../../void/electron-main/llmMessage/sendLLMMessage.impl.js';
 import { ProviderName, SettingsOfProvider, ModelSelectionOptions, OverridesOfModel, ChatMode, defaultGlobalSettings } from '../../void/common/voidSettingsTypes.js';
-import { LLMChatMessage, type DynamicRequestConfig, type RequestParamsConfig, type ProviderRouting, type AdditionalToolInfo, LLMPlan, LLMTokenUsage } from '../../void/common/sendLLMMessageTypes.js';
+import { LLMChatMessage, type DynamicRequestConfig, type RequestParamsConfig, type ProviderRouting, type AdditionalToolInfo, LLMPlan, LLMTokenUsage, type LLMError } from '../../void/common/sendLLMMessageTypes.js';
 import { getModelApiConfiguration, getModelCapabilities } from '../../void/common/modelInference.js';
 import { createParallelToolCallsConfig } from '../../void/common/parallelToolCalls.js';
 import { LLMLoopDetector, LOOP_DETECTED_MESSAGE } from '../../void/common/loopGuard.js';
+import {
+	captureChatModelFallbackMetric,
+	type ChatModelFallbackMetricEventName,
+	type ChatModelFallbackMetricsCapture,
+	type ChatModelFallbackMetricsParams,
+} from '../../void/common/chatModelFallbackMetrics.js';
 import { computeTruncatedToolOutput } from '../../void/common/toolOutputTruncation.js';
 import { stableToolOutputsRelPath } from '../../void/common/toolOutputFileNames.js';
 import { normalizeTerminalCommandOutput, normalizeTerminalCwdLabel } from '../../void/common/terminalToolOutput.js';
 import { getToolApprovalRequirement, type ToolApprovalType } from '../../void/common/toolApprovalPolicy.js';
 import { classifyToolCall } from '../../void/common/toolExecutionPolicy.js';
+import {
+	buildCandidateModels,
+	calculateBoundedWait,
+	createFallbackRuntimeState,
+	createFallbackTransitionStatus,
+	createReturnToPrimaryStatus,
+	DEFAULT_CHAT_MODEL_MAX_ROTATION_ATTEMPTS,
+	isErrorEligibleForFallback,
+	normalizeFallbackModels,
+	recordModelCooldown,
+	selectNextCandidateIgnoringCooldowns,
+	type ChatModelErrorPolicy,
+	type FallbackModelEntry,
+	type FallbackRuntimeState,
+	type ModelTransitionStatus,
+} from '../../void/common/chatModelFallbackPolicy.js';
 import { resolveAcpAgentAddress, type AcpAgentAddress } from '../common/acpAgentAddress.js';
 
 type Stream = ConstructorParameters<typeof AgentSideConnection>[1];
@@ -187,7 +209,38 @@ interface GetLLMConfigResponse {
 	disabledDynamicTools?: string[] | null;
 	autoApprove?: { [approvalType in ToolApprovalType]?: boolean };
 	mcpAutoApprove?: boolean;
+	// Fallback rotation policy (task 4.1). Typed contract carried from
+	// void/settings/getLLMConfig without changing external ACP contracts.
+	chatModelFallback?: AcpChatModelFallbackSettings | null;
 }
+
+/** Fallback rotation policy shared with the regular Chat execution path. */
+type AcpChatModelFallbackSettings = {
+	enabled: boolean;
+	errorPolicy: ChatModelErrorPolicy;
+	fallbackModels: FallbackModelEntry[];
+	maxRotationAttempts?: number;
+};
+
+/**
+ * Tolerant validation of the fallback settings carried by getLLMConfig:
+ * malformed entries are dropped and defaults are applied, so persisted
+ * user settings are never destructively cleaned up.
+ */
+const parseAcpFallbackSettings = (raw: unknown): AcpChatModelFallbackSettings | null => {
+	if (!raw || typeof raw !== 'object') return null;
+	const r = raw as { enabled?: unknown; errorPolicy?: unknown; fallbackModels?: unknown; maxRotationAttempts?: unknown };
+	const errorPolicy: ChatModelErrorPolicy =
+		(r.errorPolicy === 'rate-limits-only' || r.errorPolicy === 'temporary-errors' || r.errorPolicy === 'any-provider-error')
+			? r.errorPolicy
+			: 'temporary-errors';
+	return {
+		enabled: r.enabled === true,
+		errorPolicy,
+		fallbackModels: normalizeFallbackModels(r.fallbackModels),
+		maxRotationAttempts: (typeof r.maxRotationAttempts === 'number' && r.maxRotationAttempts > 0) ? r.maxRotationAttempts : undefined,
+	};
+};
 
 interface ExecuteWithTextResponse {
 	ok: boolean;
@@ -238,11 +291,25 @@ interface OnFinalMessagePayload {
 	toolCall?: ToolCallLike;
 	plan?: LLMPlan;
 	tokenUsage?: LLMTokenUsage;
+	// Model transition statuses collected during this LLM-turn (task 4.3):
+	// forwarded to the host as a typed ACP stream chunk and never committed
+	// to the LLM conversation.
+	modelTransitions?: ModelTransitionStatus[];
+	// Actual model that served the turn, plus fallback origin (task 4.1).
+	actualModel?: ActualModelMetadataLike;
 }
+
+/** Actual-model metadata carried on final messages (task 4.1). */
+type ActualModelMetadataLike = {
+	providerName: string;
+	modelName: string;
+	isFallback: boolean;
+	originalPrimary?: { providerName: string; modelName: string };
+};
 
 type OAIFunctionCall = { id: string; name: string; args: Record<string, unknown> };
 
-type AcpToolCallPhase = 'queued' | 'awaiting-permission' | 'running' | 'succeeded' | 'failed' | 'skipped';
+type AcpToolCallPhase = 'queued' | 'awaiting-permission' | 'running' | 'succeeded' | 'failed' | 'rejected' | 'skipped';
 
 type AcpToolCallState = {
 	readonly id: string;
@@ -268,6 +335,16 @@ type SessionState = {
 
 	cancelled?: boolean;
 	aborter?: (() => void) | null;
+	// Fallback rotation runtime (task 4.2): snapshot of the primary model
+	// for this user execution, shared cooldowns and candidate list.
+	fallbackRuntime?: FallbackRuntimeState;
+	// Model transition statuses collected during the current prompt (task 4.3).
+	fallbackTransitions?: ModelTransitionStatus[];
+	// True when the last failed turn rotated to a fallback candidate (task 4.2);
+	// consumed by the prompt() loop to retry the turn instead of failing the prompt.
+	fallbackLastTurnRotated?: boolean;
+	/** Rotation budget counter (spec update): model switches in this user prompt. */
+	fallbackRotationAttempts?: number;
 	pendingToolCallsById: Record<string, { id: string; name: string }>;
 	toolCallStatesById: Record<string, AcpToolCallState>;
 	activePermissionCallId?: string;
@@ -278,6 +355,8 @@ type SessionState = {
 	threadId?: string;
 	// System prompt from client (VOID.md from renderer) to inject into every turn
 	clientSystemPrompt?: string | null;
+	// Fallback rotation policy resolved from getLLMConfig (task 4.1/4.2).
+	fallbackSettings?: AcpChatModelFallbackSettings | null;
 	llmCfg: {
 		providerName: ProviderNameStr;
 		settingsOfProvider: SettingsOfProviderLike;
@@ -360,6 +439,39 @@ const toDeltaChunk = (
 
 class VoidPipelineAcpAgent implements Agent {
 	private sessions = new Map<string, SessionState>();
+
+	/**
+	 * Tolerant availability check (task 1.4): the builtin agent cannot
+	 * positively detect model unavailability from its config, so it fails
+	 * open and treats every configured candidate as available.
+	 */
+	private _isAcpModelConfigured(_providerName: string, _modelName: string): boolean {
+		return true;
+	}
+
+	/**
+	 * Emit a model transition status as a typed ACP `model_status` session
+	 * update (task 4.3). Record it in the per-prompt transition list so it can
+	 * be attached to final messages. Service statuses are never part of the
+	 * LLM conversation (`state.messages`).
+	 */
+	private async _emitModelStatus(sid: string, state: SessionState, transition: ModelTransitionStatus): Promise<void> {
+		if (!state.fallbackTransitions) state.fallbackTransitions = [];
+		state.fallbackTransitions.push(transition);
+		try {
+			await this._enqueue(sid, async () => {
+				await this.conn.sessionUpdate({
+					sessionId: sid,
+					update: {
+						sessionUpdate: 'model_status',
+						transition,
+					} as any
+				});
+			});
+		} catch (e) {
+			this.log?.warn?.('[ACP Agent] failed to emit model_status update', e);
+		}
+	}
 	private _updateChainBySession = new Map<string, Promise<void>>();
 	private _textStreamStateBySession = new Map<string, StreamDeltaState>();
 	private _reasoningStreamStateBySession = new Map<string, StreamDeltaState>();
@@ -371,6 +483,26 @@ class VoidPipelineAcpAgent implements Agent {
 		private readonly notificationService?: INotificationService,
 		private readonly instantiationService?: IInstantiationService
 	) { }
+
+	/**
+	 * Metrics/debug sink for fallback rotation (task 6.1). Built-in ACP has no
+	 * direct access to IMetricsService (main process IPC), so taxonomy events are
+	 * emitted as debug logs with the same redaction as the regular Chat path.
+	 */
+	private readonly _fallbackMetricsSink: ChatModelFallbackMetricsCapture = {
+		capture: (event: string, params: Record<string, unknown>) => {
+			try {
+				this.log?.debug?.(`[ACP Agent] ${event}`, JSON.stringify(params));
+			} catch { /* metrics must never break execution */ }
+		},
+	};
+
+	private _captureFallbackMetric(
+		eventName: ChatModelFallbackMetricEventName,
+		params: ChatModelFallbackMetricsParams
+	): void {
+		captureChatModelFallbackMetric(this._fallbackMetricsSink, eventName, params);
+	}
 
 	private _getReadFileChunkLines(): number {
 		try {
@@ -439,6 +571,10 @@ class VoidPipelineAcpAgent implements Agent {
 				? String((_params as any).systemPrompt)
 				: null;
 
+		// Fallback rotation (task 4.1): resolve the typed fallback policy from
+		// the getLLMConfig response. Absent/undefined keeps previous behavior.
+		const fallbackSettingsFromConfig = parseAcpFallbackSettings((cfg as { chatModelFallback?: unknown }).chatModelFallback);
+
 		this.sessions.set(sessionId, {
 			cancelled: false,
 			pendingToolCallsById: {},
@@ -446,6 +582,7 @@ class VoidPipelineAcpAgent implements Agent {
 			messages,
 			threadId: threadIdFromMeta,
 			clientSystemPrompt,
+			fallbackSettings: fallbackSettingsFromConfig,
 			llmCfg: {
 				providerName,
 				settingsOfProvider: cfg?.settingsOfProvider,
@@ -528,6 +665,14 @@ class VoidPipelineAcpAgent implements Agent {
 			};
 		};
 
+		const toAcpUsage = (usage: LLMTokenUsage) => ({
+			totalTokens: usage.input + usage.cacheCreation + usage.cacheRead + usage.output,
+			inputTokens: usage.input + usage.cacheCreation + usage.cacheRead,
+			outputTokens: usage.output,
+			cachedReadTokens: usage.cacheRead,
+			cachedWriteTokens: usage.cacheCreation,
+		});
+
 		const rollbackDanglingToolCall = (toolCallId: string, assistantText?: string) => {
 			if (!toolCallId) return;
 			const last = state.messages[state.messages.length - 1] as any;
@@ -551,6 +696,25 @@ class VoidPipelineAcpAgent implements Agent {
 
 		let usageForThisPrompt: LLMTokenUsage | undefined = undefined;
 		const usageTurnsForThisPrompt: LLMTokenUsage[] = [];
+
+		// Fallback rotation (tasks 4.2/4.3): snapshot the primary once per user
+		// prompt, expose shared runtime state and reset per-prompt transitions.
+		const fallbackSettings = state.fallbackSettings;
+		if (fallbackSettings?.enabled && state.llmCfg.providerName && state.llmCfg.modelName) {
+			state.fallbackRuntime = createFallbackRuntimeState(
+				{ providerName: state.llmCfg.providerName, modelName: state.llmCfg.modelName },
+				fallbackSettings.fallbackModels,
+			);
+		}
+		else {
+			state.fallbackRuntime = undefined;
+		}
+		state.fallbackTransitions = [];
+		// Spec update: rotation budget counter is reset per user prompt.
+		state.fallbackRotationAttempts = 0;
+		// Fallback rotation (tasks 4.2/4.3): emitModelStatus and
+		// isAcpModelConfigured are shared helpers below/above so both `prompt()`
+		// and `runOneTurnWithSendLLM()` can use them.
 
 		// refresh cfg
 		try {
@@ -615,6 +779,9 @@ class VoidPipelineAcpAgent implements Agent {
 					newModel: state.llmCfg.modelName,
 				}));
 			}
+			// Fallback rotation (task 4.1): refresh the typed fallback policy on every
+			// getLLMConfig round so settings changes apply to the next user prompt.
+			state.fallbackSettings = parseAcpFallbackSettings((cfg as { chatModelFallback?: unknown }).chatModelFallback);
 		} catch (e) {
 			this.log?.warn?.('[ACP Agent] failed to refresh llmCfg from settings, keeping previous config', e);
 		}
@@ -744,6 +911,10 @@ class VoidPipelineAcpAgent implements Agent {
 			let toolCalls: OAIFunctionCall[] = [];
 			let toolCall: OAIFunctionCall | null = null;
 			let assistantText = '';
+			// Actual model metadata of the last completed turn of this prompt
+			// (task 4.1), attached to PromptResponse._meta for the host/renderer
+			// without touching LLM conversation content.
+			let actualModelForPrompt: ActualModelMetadataLike | undefined = undefined;
 
 			try {
 				this.log?.debug?.('[ACP Agent][prompt] calling runOneTurnWithSendLLM', {
@@ -752,10 +923,100 @@ class VoidPipelineAcpAgent implements Agent {
 					messagesCount: state.messages.length,
 				});
 
+				// Fallback rotation (task 4.2): select the candidate model for this
+				// LLM-turn only here, between turns - never mid-stream. When the
+				// primary is not cooling it is always re-selected first.
+				// Spec update (continuous rotation loop): a rotation retry of the same
+				// logical turn skips this between-turns selection - the failed turn's
+				// onError already chose the next candidate ignoring cooldowns, and the
+				// retry must be issued immediately (no bounded wait).
+				if (state.fallbackLastTurnRotated === true) {
+					state.fallbackLastTurnRotated = false;
+				} else if (state.fallbackRuntime && fallbackSettings?.enabled) {
+					const nowMs = Date.now();
+					const candidates = buildCandidateModels(state.fallbackRuntime, this._isAcpModelConfigured, nowMs);
+					const current = { providerName: state.llmCfg.providerName, modelName: state.llmCfg.modelName };
+					const nextCandidate = candidates[0];
+					if (nextCandidate && (nextCandidate.providerName !== current.providerName || nextCandidate.modelName !== current.modelName)) {
+						const wasOnFallback =
+							current.providerName !== state.fallbackRuntime.primary.providerName ||
+							current.modelName !== state.fallbackRuntime.primary.modelName;
+						// Metrics (task 6.1): candidate transition between turns.
+						this._captureFallbackMetric('Chat Model Fallback - Transition', {
+							transportPath: 'Built-in ACP',
+							chatMode: String(state.llmCfg.chatMode ?? 'agent'),
+							errorPolicy: fallbackSettings.errorPolicy ?? 'temporary-errors',
+							providerName: current.providerName,
+							modelName: current.modelName,
+							targetProviderName: nextCandidate.providerName,
+							targetModelName: nextCandidate.modelName,
+							candidateCount: state.fallbackRuntime.fallbackModels.length,
+						});
+						await this._emitModelStatus(sid, state,
+							wasOnFallback
+								? createReturnToPrimaryStatus(current, nextCandidate)
+								: createFallbackTransitionStatus(current, nextCandidate, 'primary model cooling down'),
+						);
+						// Rebuild dynamic request context for the new candidate before
+						// the turn (task 4.2: endpoint/headers/caps are per model).
+						state.llmCfg = {
+							...state.llmCfg,
+							providerName: nextCandidate.providerName,
+							modelName: nextCandidate.modelName,
+							dynamicRequestConfig: undefined,
+						};
+					}
+					else if (!nextCandidate) {
+						// All candidates cooling/unavailable: bounded wait, then re-select
+						// so we either surface a candidate after cooldown or keep the last one.
+						const boundedWaitMs = calculateBoundedWait(state.fallbackRuntime, nowMs, 5_000);
+						if (boundedWaitMs !== null) {
+							// Metrics (task 6.1): all candidates cooling, bounded wait applied.
+							this._captureFallbackMetric('Chat Model Fallback - Cooldown Skip', {
+								transportPath: 'Built-in ACP',
+								chatMode: String(state.llmCfg.chatMode ?? 'agent'),
+								errorPolicy: fallbackSettings?.errorPolicy ?? 'temporary-errors',
+								providerName: state.fallbackRuntime.primary.providerName,
+								modelName: state.fallbackRuntime.primary.modelName,
+								cooldownMs: boundedWaitMs,
+								candidateCount: state.fallbackRuntime.fallbackModels.length,
+							});
+							await new Promise(r => setTimeout(r, boundedWaitMs));
+							const retryCandidates = buildCandidateModels(state.fallbackRuntime, this._isAcpModelConfigured, Date.now());
+							const retryCandidate = retryCandidates[0];
+							if (retryCandidate) {
+								state.llmCfg = {
+									...state.llmCfg,
+									providerName: retryCandidate.providerName,
+									modelName: retryCandidate.modelName,
+									dynamicRequestConfig: undefined,
+								};
+							}
+						}
+					}
+				}
+
+				// Metrics (task 6.1): primary attempt when the primary serves this turn.
+				if (state.fallbackRuntime && state.llmCfg.providerName === state.fallbackRuntime.primary.providerName && state.llmCfg.modelName === state.fallbackRuntime.primary.modelName) {
+					this._captureFallbackMetric('Chat Model Fallback - Primary Attempt', {
+						transportPath: 'Built-in ACP',
+						chatMode: String(state.llmCfg.chatMode ?? 'agent'),
+						errorPolicy: fallbackSettings?.errorPolicy ?? 'temporary-errors',
+						providerName: state.fallbackRuntime.primary.providerName,
+						modelName: state.fallbackRuntime.primary.modelName,
+						candidateCount: state.fallbackRuntime.fallbackModels.length,
+					});
+				}
+
 				const turn = await this.runOneTurnWithSendLLM(state, sid);
 				toolCalls = turn.toolCalls?.length ? turn.toolCalls : (turn.toolCall ? [turn.toolCall] : []);
 				toolCall = toolCalls[0] ?? null;
 				assistantText = turn.assistantText;
+				// Track the actual model that produced the final assistant content of
+				// this prompt (task 4.1) - populated only when rotation is enabled.
+				if (turn.actualModel) {
+					actualModelForPrompt = turn.actualModel;
+				}
 
 				this.log?.debug?.('[ACP Agent][prompt] runOneTurnWithSendLLM completed', {
 					sessionId: sid,
@@ -791,6 +1052,21 @@ class VoidPipelineAcpAgent implements Agent {
 					turn: turnCount,
 					error: e instanceof Error ? e.message : String(e),
 				});
+				// Fallback rotation (task 4.2): when the failed turn rotated to a
+				// fallback candidate, retry the turn instead of failing the whole
+				// user prompt. The failed attempt's output is not committed (task 4.4),
+				// so the retry starts from a clean state.
+				if (state.fallbackLastTurnRotated === true) {
+					// Keep the flag set: the next loop iteration consumes it to skip
+					// the between-turns cooldown-aware selection so the retry is
+					// issued immediately (spec update: cooldowns must not block the
+					// continuous rotation loop).
+					// Do not count the failed turn against the safeguard so tool-loop
+					// continuity is preserved (task 4.4).
+					safeguard++;
+					turnCount--;
+					continue;
+				}
 				if (e instanceof Error) {
 					throw e;
 				}
@@ -804,12 +1080,16 @@ class VoidPipelineAcpAgent implements Agent {
 					turn: turnCount,
 					stopReason: 'end_turn',
 				});
-				const resp: any = { stopReason: 'end_turn' as const };
-				if (usageForThisPrompt || usageTurnsForThisPrompt.length) {
+				const resp: any = {
+					stopReason: 'end_turn' as const,
+					...(usageForThisPrompt ? { usage: toAcpUsage(usageForThisPrompt) } : {}),
+				};
+				if (usageForThisPrompt || usageTurnsForThisPrompt.length || actualModelForPrompt) {
 					resp._meta = {
 						...(resp._meta || {}),
 						...(usageForThisPrompt ? { llmTokenUsage: usageForThisPrompt } : {}),
 						...(usageTurnsForThisPrompt.length ? { llmTokenUsageTurns: usageTurnsForThisPrompt } : {}),
+						...(actualModelForPrompt ? { actualModel: actualModelForPrompt } : {}),
 					};
 				}
 				return resp as PromptResponse;
@@ -826,12 +1106,7 @@ class VoidPipelineAcpAgent implements Agent {
 				state.toolCallStatesById[call.id] = { id: call.id, name: call.name, phase: 'queued' };
 			}
 
-			// Track whether any tool call in this turn was approved by the user.
-			// If ALL tool calls were rejected/skipped, we end the turn without
-			// another LLM call - otherwise the model would re-try the rejected
-			// tool, creating an annoying "flicker" (thread appears to finish,
-			// then resumes with the same or a new tool call).
-			let anyApproved = false;
+			let cancelledByUser = false;
 
 			const pendingReadOnlyToolExecutions: Promise<void>[] = [];
 			const isAcpReadOnlyToolCall = (toolCall: OAIFunctionCall): boolean => {
@@ -876,7 +1151,6 @@ class VoidPipelineAcpAgent implements Agent {
 						content: 'ok'
 					});
 					state.toolCallStatesById[toolCall.id].phase = 'succeeded';
-					anyApproved = true;
 					return;
 				}
 
@@ -918,7 +1192,7 @@ class VoidPipelineAcpAgent implements Agent {
 					}
 				} as any);
 
-				let isAllow = true;
+				let permissionDecision: 'allow' | 'skip' | 'cancel' = 'allow';
 
 				if (requiresPermission) {
 					state.toolCallStatesById[toolCall.id].phase = 'awaiting-permission';
@@ -939,7 +1213,8 @@ class VoidPipelineAcpAgent implements Agent {
 						},
 						options: [
 							{ optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
-							{ optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }
+							{ optionId: 'skip_once', name: 'Skip', kind: 'reject_once' },
+							{ optionId: 'cancel_once', name: 'Cancel', kind: 'reject_once' }
 						]
 					} as any);
 					state.activePermissionCallId = undefined;
@@ -956,20 +1231,26 @@ class VoidPipelineAcpAgent implements Agent {
 					const outcome = (perm as { outcome?: { outcome?: string; optionId?: string } } | undefined)?.outcome;
 					const selected = outcome?.outcome === 'selected';
 					const optionId = selected ? String(outcome?.optionId ?? '') : '';
-					isAllow = optionId === 'allow_once' || optionId === 'allow_always';
+					permissionDecision = optionId === 'allow_once' || optionId === 'allow_always'
+						? 'allow'
+						: optionId === 'skip_once'
+							? 'skip'
+							: optionId === 'cancel_once'
+								? 'cancel'
+								: 'skip';
 
 					this.log?.debug?.('[ACP Agent][prompt] permission result', {
 						sessionId: sid,
 						turn: turnCount,
 						optionId,
-						isAllow,
+						permissionDecision,
 						outcome,
 					});
 				}
 
-				if (!isAllow) {
-					// Treat non-allow as "skipped" (this is how ACP Skip is implemented via rejectLatestToolRequest)
+				if (permissionDecision !== 'allow') {
 					const toolName = String(toolCall.name || 'tool');
+					const skipped = permissionDecision === 'skip';
 					await this.conn.sessionUpdate({
 						sessionId: sid,
 						update: {
@@ -978,24 +1259,22 @@ class VoidPipelineAcpAgent implements Agent {
 							status: 'completed',
 							title: toolName,
 							content: [{ type: 'content', content: { type: 'text', text: '' } }],
-							rawOutput: { _skipped: true }
+							rawOutput: skipped ? { _skipped: true } : { _rejected: true }
 						}
 					} as any);
 
 					state.messages.push({
 						role: 'tool',
 						tool_call_id: String(toolCall.id),
-						content: skipModelText(toolName)
+						content: skipped ? skipModelText(toolName) : 'Tool execution was cancelled by the user.'
 					});
 					delete state.pendingToolCallsById[String(toolCall.id)];
-					state.toolCallStatesById[toolCall.id].phase = 'skipped';
+					state.toolCallStatesById[toolCall.id].phase = skipped ? 'skipped' : 'rejected';
+					if (!skipped) cancelledByUser = true;
 					return;
 				}
 
 				state.toolCallStatesById[toolCall.id].phase = 'running';
-
-				// Mark that at least one tool call will execute - see anyApproved check after the loop.
-				anyApproved = true;
 
 				// in_progress
 				await this.conn.sessionUpdate({
@@ -1088,15 +1367,20 @@ class VoidPipelineAcpAgent implements Agent {
 							: (typeof originalResult === 'string' ? originalResult : JSON.stringify(rawOut));
 					}
 				} catch (e: any) {
-					textOut = `Tool error: ${String(e?.message ?? e)}`;
+					const errMessage =
+						(typeof (e?.data?.details) === 'string' && e.data.details.trim()) ? e.data.details
+							: (typeof (e?.data) === 'string' && e.data.trim()) ? e.data
+								: (typeof (e?.message) === 'string' && e.message.trim() && e.message !== 'Internal error') ? e.message
+									: String(e?.message ?? e);
+					textOut = `Tool error: ${errMessage}`;
 					status = 'failed';
-					rawOut = { _error: true, _message: e?.message ?? String(e), _stack: e?.stack ? e.stack.substring(0, 500) : undefined };
+					rawOut = { _error: true, _message: errMessage, _stack: e?.stack ? e.stack.substring(0, 500) : undefined };
 					this.log?.debug?.('[ACP Agent][prompt] tool execution error', {
 						sessionId: sid,
 						turn: turnCount,
 						toolCallId: toolCall.id,
 						toolName: toolCall.name,
-						error: e?.message ?? String(e),
+						error: errMessage,
 					});
 				}
 
@@ -1245,6 +1529,7 @@ class VoidPipelineAcpAgent implements Agent {
 			};
 
 			for (let _i = 0; _i < toolCalls.length; _i++) {
+				if (cancelledByUser) break;
 				const toolCall = toolCalls[_i];
 				this.log?.debug?.('[ACP Agent][prompt] processing toolCall', {
 					sessionId: sid,
@@ -1272,6 +1557,7 @@ class VoidPipelineAcpAgent implements Agent {
 					index: _i,
 					state_cancelled: state.cancelled,
 				});
+				if (cancelledByUser) break;
 			}
 			await drainPendingReadOnlyToolExecutions();
 			if (state.cancelled) {
@@ -1281,8 +1567,17 @@ class VoidPipelineAcpAgent implements Agent {
 
 			const unsettledToolCalls = toolCalls.filter(call => {
 				const phase = state.toolCallStatesById[call.id]?.phase;
-				return phase !== 'succeeded' && phase !== 'failed' && phase !== 'skipped';
+				return phase !== 'succeeded' && phase !== 'failed' && phase !== 'rejected' && phase !== 'skipped';
 			});
+			if (cancelledByUser) {
+				this.log?.debug?.('[ACP Agent][prompt] CANCELLED BY USER - ending turn', {
+					sessionId: sid,
+					turn: turnCount,
+					toolCallsCount: toolCalls.length,
+				});
+				this._closeCancelledToolCalls(state);
+				return { stopReason: 'cancelled' };
+			}
 			if (unsettledToolCalls.length > 0) {
 				throw new Error(`ACP tool batch did not settle every call id: ${unsettledToolCalls.map(call => call.id).join(', ')}`);
 			}
@@ -1295,41 +1590,6 @@ class VoidPipelineAcpAgent implements Agent {
 				if (resultCounts.get(call.id) !== 1) {
 					throw new Error(`ACP tool batch expected exactly one result for call id: ${call.id}`);
 				}
-			}
-
-			// If ALL tool calls in this turn were rejected/skipped (none approved),
-			// end the turn without another LLM call. This prevents the model from
-			// re-trying the rejected tool, which caused the thread to "flicker"
-			// (appear to finish, then resume with the same or a new tool call).
-			if (!anyApproved) {
-				this.log?.debug?.('[ACP Agent][prompt] ALL TOOL CALLS REJECTED - ending turn', {
-					sessionId: sid,
-					turn: turnCount,
-					toolCallsCount: toolCalls.length,
-				});
-
-				const syntheticLoopCheck = loopDetector.registerAssistantTurn('');
-				if (syntheticLoopCheck.isLoop) {
-					this.log?.debug?.('[ACP Agent][prompt] LOOP DETECTED after all-rejected turn', {
-						sessionId: sid,
-						turn: turnCount,
-						reason: syntheticLoopCheck.reason,
-					});
-					if (toolCall?.id) {
-						rollbackDanglingToolCall(String(toolCall.id), assistantText);
-					}
-					this.emitError(LOOP_DETECTED_MESSAGE);
-				}
-
-				const resp: any = { stopReason: 'end_turn' as const };
-				if (usageForThisPrompt || usageTurnsForThisPrompt.length) {
-					resp._meta = {
-						...(resp._meta || {}),
-						...(usageForThisPrompt ? { llmTokenUsage: usageForThisPrompt } : {}),
-						...(usageTurnsForThisPrompt.length ? { llmTokenUsageTurns: usageTurnsForThisPrompt } : {}),
-					};
-				}
-				return resp as PromptResponse;
 			}
 		}
 
@@ -1345,7 +1605,7 @@ class VoidPipelineAcpAgent implements Agent {
 
 	private _closeCancelledToolCalls(state: SessionState): void {
 		for (const callState of Object.values(state.toolCallStatesById)) {
-			if (callState.phase === 'succeeded' || callState.phase === 'failed' || callState.phase === 'skipped') continue;
+			if (callState.phase === 'succeeded' || callState.phase === 'failed' || callState.phase === 'rejected' || callState.phase === 'skipped') continue;
 			callState.phase = 'failed';
 			if (!state.messages.some(message => message.role === 'tool' && message.tool_call_id === callState.id)) {
 				state.messages.push({
@@ -1719,7 +1979,7 @@ class VoidPipelineAcpAgent implements Agent {
 		}
 	}
 
-	private async runOneTurnWithSendLLM(state: SessionState, sid: string): Promise<{ toolCalls: OAIFunctionCall[]; toolCall: OAIFunctionCall | null; assistantText: string }> {
+	private async runOneTurnWithSendLLM(state: SessionState, sid: string): Promise<{ toolCalls: OAIFunctionCall[]; toolCall: OAIFunctionCall | null; assistantText: string; actualModel?: ActualModelMetadataLike; modelTransitions?: ModelTransitionStatus[] }> {
 		const {
 			providerName,
 			settingsOfProvider,
@@ -1795,10 +2055,13 @@ class VoidPipelineAcpAgent implements Agent {
 		this._textStreamStateBySession.set(sid, emptyStreamDeltaState());
 		this._reasoningStreamStateBySession.set(sid, emptyStreamDeltaState());
 
-		return new Promise<{ toolCalls: OAIFunctionCall[]; toolCall: OAIFunctionCall | null; assistantText: string }>((resolve, reject) => {
+		return new Promise<{ toolCalls: OAIFunctionCall[]; toolCall: OAIFunctionCall | null; assistantText: string; actualModel?: ActualModelMetadataLike; modelTransitions?: ModelTransitionStatus[] }>((resolve, reject) => {
 			state.aborter = null;
 			let finalTools: OAIFunctionCall[] = [];
 			let lastAssistantText = '';
+			// Actual model + transitions of the last completed turn (tasks 4.1/4.3).
+			let lastActualModel: ActualModelMetadataLike | undefined = undefined;
+			let lastModelTransitions: ModelTransitionStatus[] | undefined = undefined;
 
 			const originalOnText = (chunk: OnTextChunk) => {
 				const fullText = typeof chunk?.fullText === 'string' ? chunk.fullText : '';
@@ -1828,6 +2091,25 @@ class VoidPipelineAcpAgent implements Agent {
 				const tools = (Array.isArray(res?.toolCalls) && res.toolCalls.length ? res.toolCalls : (res?.toolCall ? [res.toolCall] : []));
 				const plan: LLMPlan | undefined = res.plan;
 				const tokenUsage = res.tokenUsage;
+				// Actual-model metadata and per-turn transitions (tasks 4.1/4.3):
+				// the caller may attach them for result/thread state. Only fill them
+				// when rotation is enabled so the primary path stays unchanged.
+				const runtimeForResult = state.fallbackRuntime;
+				const actualModel: ActualModelMetadataLike | undefined =
+					(runtimeForResult && state.llmCfg.providerName && state.llmCfg.modelName)
+						? {
+							providerName: state.llmCfg.providerName,
+							modelName: state.llmCfg.modelName,
+							isFallback:
+								state.llmCfg.providerName !== runtimeForResult.primary.providerName ||
+								state.llmCfg.modelName !== runtimeForResult.primary.modelName,
+							originalPrimary: runtimeForResult.primary,
+						}
+						: undefined;
+				const modelTransitions: ModelTransitionStatus[] | undefined =
+					(state.fallbackTransitions && state.fallbackTransitions.length > 0)
+						? state.fallbackTransitions
+						: undefined;
 
 				this.log?.debug?.('[ACP Agent][runOneTurn] onFinalMessage', {
 					sessionId: sid,
@@ -1884,8 +2166,25 @@ class VoidPipelineAcpAgent implements Agent {
 				}
 				state.aborter = null;
 				lastAssistantText = fullText;
+				// Expose actual-model metadata and transitions through the promise
+				// payload so `prompt()` can attach them to PromptResponse._meta
+				// (tasks 4.1/4.3) without touching LLM conversation content.
+				lastActualModel = actualModel;
+				lastModelTransitions = modelTransitions;
+				// Metrics (task 6.1): which model actually served the turn.
+				if (state.fallbackRuntime && actualModel) {
+					this._captureFallbackMetric('Chat Model Fallback - Success', {
+						transportPath: 'Built-in ACP',
+						chatMode: String(state.llmCfg.chatMode ?? 'agent'),
+						errorPolicy: state.fallbackSettings?.errorPolicy ?? 'temporary-errors',
+						providerName: actualModel.providerName,
+						modelName: actualModel.modelName,
+						isFallback: actualModel.isFallback,
+						candidateCount: state.fallbackRuntime.fallbackModels.length,
+					});
+				}
 				await this._drainSessionUpdates(sid);
-				resolve({ toolCalls: finalTools, toolCall: finalTools[0] ?? null, assistantText: lastAssistantText });
+				resolve({ toolCalls: finalTools, toolCall: finalTools[0] ?? null, assistantText: lastAssistantText, actualModel: lastActualModel, modelTransitions: lastModelTransitions });
 			};
 
 			const originalOnError = (err: unknown) => {
@@ -1899,6 +2198,108 @@ class VoidPipelineAcpAgent implements Agent {
 					error: message,
 					hasStack: !!(err as any)?.stack,
 				});
+
+				// Fallback rotation (task 4.2): on an eligible provider error, put the
+				// failing model on cooldown (Retry-After when present) and reject the
+				// turn so the loop re-selects a candidate between turns. The partial
+				// output of the failed attempt is NOT committed: `originalOnText` only
+				// emits deltas, and `state.messages` is only appended in
+				// `originalOnFinalMessage`, so the failed attempt leaves no history.
+				// User abort never rotates.
+				const llmError = (err && typeof err === 'object' && 'providerHttp' in (err as Record<string, unknown>))
+					? (err as unknown as LLMError)
+					: undefined;
+				const isUserAbort = state.cancelled === true;
+				const runtime = state.fallbackRuntime;
+				const settings = state.fallbackSettings;
+				if (runtime && settings?.enabled && !isUserAbort) {
+					const errorPolicy = settings.errorPolicy;
+					const isEligible = isErrorEligibleForFallback(errorPolicy, {
+						status: llmError?.providerHttp?.status,
+						isNetworkError: llmError?.providerHttp?.isNetworkError,
+						fullError: err instanceof Error ? err : null,
+					});
+					if (isEligible && state.llmCfg.providerName && state.llmCfg.modelName) {
+						const failedModel = { providerName: state.llmCfg.providerName, modelName: state.llmCfg.modelName };
+						// Metrics (task 6.1): cooldown recorded for the failed model.
+						this._captureFallbackMetric('Chat Model Fallback - Cooldown Skip', {
+							transportPath: 'Built-in ACP',
+							chatMode: String(state.llmCfg.chatMode ?? 'agent'),
+							errorPolicy: errorPolicy,
+							providerName: failedModel.providerName,
+							modelName: failedModel.modelName,
+							status: llmError?.providerHttp?.status,
+							fromRetryAfter: llmError?.providerHttp?.retryAfterMs !== undefined,
+							cooldownMs: llmError?.providerHttp?.retryAfterMs ?? defaultGlobalSettings.retryDelay,
+							candidateCount: runtime.fallbackModels.length,
+						});
+						recordModelCooldown(
+							runtime,
+							failedModel,
+							llmError?.providerHttp?.retryAfterMs,
+							defaultGlobalSettings.retryDelay,
+							Date.now(),
+						);
+						const triedKeys = new Set<string>([`${failedModel.providerName}::${failedModel.modelName}`]);
+						// Spec update (continuous rotation loop): when the currently-serving model
+						// fails, switch to the next candidate even if it is still cooling down,
+						// but stop after maxRotationAttempts switches within this user prompt.
+						const maxRotationAttempts = (typeof settings.maxRotationAttempts === 'number' && settings.maxRotationAttempts > 0)
+							? settings.maxRotationAttempts
+							: DEFAULT_CHAT_MODEL_MAX_ROTATION_ATTEMPTS;
+						const canRotate = (state.fallbackRotationAttempts ?? 0) < maxRotationAttempts;
+						const rotated = canRotate
+							? selectNextCandidateIgnoringCooldowns(runtime, this._isAcpModelConfigured, triedKeys)
+							: null;
+						if (rotated) {
+							state.fallbackRotationAttempts = (state.fallbackRotationAttempts ?? 0) + 1;
+						}
+						if (rotated) {
+							// Metrics (task 6.1): transition to a fallback candidate.
+							this._captureFallbackMetric('Chat Model Fallback - Transition', {
+								transportPath: 'Built-in ACP',
+								chatMode: String(state.llmCfg.chatMode ?? 'agent'),
+								errorPolicy: errorPolicy,
+								providerName: failedModel.providerName,
+								modelName: failedModel.modelName,
+								targetProviderName: rotated.providerName,
+								targetModelName: rotated.modelName,
+								status: llmError?.providerHttp?.status,
+								candidateCount: runtime.fallbackModels.length,
+							});
+							// Mark the rotation so `prompt()` retries the turn with the new
+							// candidate instead of failing the whole user prompt (task 4.2).
+							state.fallbackLastTurnRotated = true;
+							// Apply the new candidate immediately so the retry uses it.
+							state.llmCfg = {
+								...state.llmCfg,
+								providerName: rotated.providerName,
+								modelName: rotated.modelName,
+								dynamicRequestConfig: undefined,
+							};
+							// Emit the transition status as a typed ACP chunk (task 4.3).
+							void this._emitModelStatus(sid, state, createFallbackTransitionStatus(
+								failedModel,
+								rotated,
+								llmError?.providerHttp?.status !== undefined ? `HTTP ${llmError.providerHttp.status}` : 'temporary error',
+							));
+							// Cooldown skip is bounded by the runtime's own wait semantics.
+						} else {
+							// Metrics (task 6.1): no available candidate, request fails.
+							this._captureFallbackMetric('Chat Model Fallback - Candidates Exhausted', {
+								transportPath: 'Built-in ACP',
+								chatMode: String(state.llmCfg.chatMode ?? 'agent'),
+								errorPolicy: errorPolicy,
+								providerName: failedModel.providerName,
+								modelName: failedModel.modelName,
+								status: llmError?.providerHttp?.status,
+								candidateCount: runtime.fallbackModels.length,
+							});
+							state.fallbackLastTurnRotated = false;
+						}
+					}
+				}
+
 				// Use emitError so we preserve details/stack for the host/UI.
 				try {
 					this.emitError(message, err);
@@ -2211,11 +2612,19 @@ class VoidPipelineAcpAgent implements Agent {
 		});
 	}
 
-	private async emitTokenUsage(_sessionId: string, _usage: LLMTokenUsage) {
-		// ACP schema on the client side does not accept sessionUpdate: 'llm_usage_snapshot'
-		// (Invalid params). Usage is still aggregated and returned via PromptResponse._meta,
-		// and then passed as IAcpMessageChunk.tokenUsageSnapshot on done.
-		return;
+	private async emitTokenUsage(sessionId: string, usage: LLMTokenUsage) {
+		const totalTokens = usage.input + usage.cacheCreation + usage.cacheRead + usage.output;
+		await this._enqueue(sessionId, async () => {
+			await this.conn.sessionUpdate({
+				sessionId,
+				update: {
+					sessionUpdate: 'usage_update',
+					used: usage.input + usage.cacheCreation + usage.cacheRead,
+					size: totalTokens,
+					_meta: { llmTokenUsage: usage }
+				}
+			} as any);
+		});
 	}
 }
 

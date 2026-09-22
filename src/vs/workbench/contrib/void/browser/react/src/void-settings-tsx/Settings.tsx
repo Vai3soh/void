@@ -13,6 +13,7 @@ import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidSimpleInputBox, VoidSwit
 import { useAccessor, useIsDark, useMCPServiceState, useSettingsState } from '../util/services.js';
 import { X, ChevronRight } from 'lucide-react';
 import { ModelDropdown } from './ModelDropdown.js';
+import { FallbackModelsEditor } from './FallbackModelsEditor.js';
 import { ChatMarkdownRender } from '../markdown/ChatMarkdownRender.js';
 import { WarningBox } from './WarningBox.js';
 import { os } from '../../../../../../../platform/void/common/helpers/systemInfo.js';
@@ -2496,6 +2497,12 @@ export const Settings = () => {
 																			/>
 																		</div>
 																	</div>
+																																	<div className='flex items-start gap-x-2'>
+																	<span className='w-56 shrink-0'>Chat Model Fallbacks</span>
+																	<div className='flex-1'>
+																		<FallbackModelsEditor />
+																	</div>
+																</div>
 																	<div className='flex items-center gap-x-2'>
 																		<span className='w-56'>Retry Delay (ms)</span>
 																		<div className='w-20'>
@@ -2526,76 +2533,76 @@ export const Settings = () => {
 																			/>
 																		</div>
 																	</div>
-																																																																	<div className='flex items-center gap-x-2 mt-1'>
-																						<VoidSwitch
-																							size='xs'
-																							value={settingsState.globalSettings.terminalOutputSummarization ?? defaultGlobalSettings.terminalOutputSummarization}
-																							onChange={(newVal) => voidSettingsService.setGlobalSetting('terminalOutputSummarization', newVal)}
-																						/>
-																						<span className='text-void-fg-3 text-xs pointer-events-none'>
-																							Summarize terminal output
-																						</span>
-																					</div>
-																					<div className='flex items-center gap-x-2'>
-																						<span className='w-56'>Terminal Output Head Lines</span>
-																						<div className='w-20'>
-																							<VoidSimpleInputBox
-																								compact
-																								placeholder={String(defaultGlobalSettings.terminalOutputHeadLines)}
-																								value={String(settingsState.globalSettings.terminalOutputHeadLines ?? defaultGlobalSettings.terminalOutputHeadLines)}
-																								onChangeValue={(raw) => {
-																									const n = Number(raw)
-																									const safe = Number.isInteger(n) && n >= 0 ? n : 0
-																									voidSettingsService.setGlobalSetting('terminalOutputHeadLines', safe)
-																								}}
-																							/>
-																						</div>
-																					</div>
-																					<div className='flex items-center gap-x-2'>
-																						<span className='w-56'>Terminal Output Tail Lines</span>
-																						<div className='w-20'>
-																							<VoidSimpleInputBox
-																								compact
-																								placeholder={String(defaultGlobalSettings.terminalOutputTailLines)}
-																								value={String(settingsState.globalSettings.terminalOutputTailLines ?? defaultGlobalSettings.terminalOutputTailLines)}
-																								onChangeValue={(raw) => {
-																									const n = Number(raw)
-																									const safe = Number.isInteger(n) && n >= 0 ? n : 0
-																									voidSettingsService.setGlobalSetting('terminalOutputTailLines', safe)
-																								}}
-																							/>
-																						</div>
-																					</div>
-																					<div className='flex items-center gap-x-2'>
-																						<span className='w-56'>Read File Chunk Lines</span>
-																												<div className='w-20'>
-																													<VoidSimpleInputBox
-																														compact
-																														placeholder={String(defaultGlobalSettings.readFileChunkLines)}
-																														value={String(settingsState.globalSettings.readFileChunkLines ?? defaultGlobalSettings.readFileChunkLines)}
-																														onChangeValue={(raw) => {
-																															const n = parseInt(raw, 10)
-																															const safe = Number.isFinite(n) && n > 0 ? n : 200
-																															voidSettingsService.setGlobalSetting('readFileChunkLines', safe)
-																														}}
-																													/>
-																												</div>
-																											</div>
-																											<div className='flex items-center gap-x-2'>
-																												<span className='w-56'>Terminal Command Timeout (minutes)</span>
-																												<div className='w-20'>
-																													<VoidSimpleInputBox
-																														compact
-																														placeholder={String(defaultGlobalSettings.terminalCommandTimeoutMinutes)}
-																														value={String(settingsState.globalSettings.terminalCommandTimeoutMinutes ?? defaultGlobalSettings.terminalCommandTimeoutMinutes)}
-																														onChangeValue={(raw) => {
-																															const n = parseInt(raw, 10)
-																															const safe = Number.isFinite(n) && n > 0 ? n : defaultGlobalSettings.terminalCommandTimeoutMinutes
-																															voidSettingsService.setGlobalSetting('terminalCommandTimeoutMinutes', safe)
-																														}}
-																													/>
-																												</div>
-																											</div>
+																	<div className='flex items-center gap-x-2 mt-1'>
+																		<VoidSwitch
+																			size='xs'
+																			value={settingsState.globalSettings.terminalOutputSummarization ?? defaultGlobalSettings.terminalOutputSummarization}
+																			onChange={(newVal) => voidSettingsService.setGlobalSetting('terminalOutputSummarization', newVal)}
+																		/>
+																		<span className='text-void-fg-3 text-xs pointer-events-none' title='Deterministically summarizes verbose or long terminal output without an LLM. Full raw output is saved when lossy reduction is applied.'>
+																			Deterministic terminal output summary
+																		</span>
+																	</div>
+																	<div className='flex items-center gap-x-2'>
+																		<span className='w-56'>Terminal Output Head Lines</span>
+																		<div className='w-20'>
+																			<VoidSimpleInputBox
+																				compact
+																				placeholder={String(defaultGlobalSettings.terminalOutputHeadLines)}
+																				value={String(settingsState.globalSettings.terminalOutputHeadLines ?? defaultGlobalSettings.terminalOutputHeadLines)}
+																				onChangeValue={(raw) => {
+																					const n = Number(raw)
+																					const safe = Number.isInteger(n) && n >= 0 ? n : 0
+																					voidSettingsService.setGlobalSetting('terminalOutputHeadLines', safe)
+																				}}
+																			/>
+																		</div>
+																	</div>
+																	<div className='flex items-center gap-x-2'>
+																		<span className='w-56'>Terminal Output Tail Lines</span>
+																		<div className='w-20'>
+																			<VoidSimpleInputBox
+																				compact
+																				placeholder={String(defaultGlobalSettings.terminalOutputTailLines)}
+																				value={String(settingsState.globalSettings.terminalOutputTailLines ?? defaultGlobalSettings.terminalOutputTailLines)}
+																				onChangeValue={(raw) => {
+																					const n = Number(raw)
+																					const safe = Number.isInteger(n) && n >= 0 ? n : 0
+																					voidSettingsService.setGlobalSetting('terminalOutputTailLines', safe)
+																				}}
+																			/>
+																		</div>
+																	</div>
+																	<div className='flex items-center gap-x-2'>
+																		<span className='w-56'>Read File Chunk Lines</span>
+																		<div className='w-20'>
+																			<VoidSimpleInputBox
+																				compact
+																				placeholder={String(defaultGlobalSettings.readFileChunkLines)}
+																				value={String(settingsState.globalSettings.readFileChunkLines ?? defaultGlobalSettings.readFileChunkLines)}
+																				onChangeValue={(raw) => {
+																					const n = parseInt(raw, 10)
+																					const safe = Number.isFinite(n) && n > 0 ? n : 200
+																					voidSettingsService.setGlobalSetting('readFileChunkLines', safe)
+																				}}
+																			/>
+																		</div>
+																	</div>
+																	<div className='flex items-center gap-x-2'>
+																		<span className='w-56'>Terminal Command Timeout (minutes)</span>
+																		<div className='w-20'>
+																			<VoidSimpleInputBox
+																				compact
+																				placeholder={String(defaultGlobalSettings.terminalCommandTimeoutMinutes)}
+																				value={String(settingsState.globalSettings.terminalCommandTimeoutMinutes ?? defaultGlobalSettings.terminalCommandTimeoutMinutes)}
+																				onChangeValue={(raw) => {
+																					const n = parseInt(raw, 10)
+																					const safe = Number.isFinite(n) && n > 0 ? n : defaultGlobalSettings.terminalCommandTimeoutMinutes
+																					voidSettingsService.setGlobalSetting('terminalCommandTimeoutMinutes', safe)
+																				}}
+																			/>
+																		</div>
+																	</div>
 																	<div className='flex items-center gap-x-2 mt-1'>
 																		<VoidSwitch
 																			size='xs'

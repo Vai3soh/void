@@ -903,7 +903,7 @@ export const extractReasoningAndXMLToolsWrapper = (
 			resetStreamingParseState();
 		}
 		const rawFullText = params.fullText || '';
-		const providerReasoning = params.fullReasoning ?? undefined;
+		const providerReasoning = params.fullReasoning ? params.fullReasoning : undefined;
 		const incomingPlan = params.plan;
 
 		let textForXml = rawFullText;
@@ -1052,7 +1052,12 @@ export const extractReasoningAndXMLToolsWrapper = (
 			extraFromReasoning = after;
 		}
 
-		const baseTextForUiRaw = (params.fullText || '') + (extraFromReasoning || '');
+		let baseTextForUiRaw = (params.fullText || '') + (extraFromReasoning || '');
+		if (!providerReasoning && activeThinkTags) {
+			const parsedMainText = extractReasoningViaTags(params.fullText || '', activeThinkTags);
+			baseTextForUiRaw = parsedMainText.textOut;
+			finalReasoning = parsedMainText.reasoningOut;
+		}
 		let baseTextForUi = stripThinkTagsFromText(baseTextForUiRaw);
 		const plan = params.plan;
 

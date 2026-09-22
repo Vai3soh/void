@@ -38,6 +38,12 @@ export type ProviderHttpErrorMetadata = {
 	retryable: boolean;
 	retryAfterMs?: number;
 	requestDiagnostics?: OpenAICompatibleRequestDiagnostics;
+	/**
+	 * True when the failure was a network/socket error (e.g. UND_ERR_SOCKET,
+	 * ECONNRESET) rather than an HTTP-level response error. Transported through
+	 * IPC (unlike Error.cause) so renderer-side fallback policies can classify it.
+	 */
+	isNetworkError?: boolean;
 };
 
 export type LLMError = {
@@ -78,6 +84,7 @@ export type OpenAICompatibleRequestDiagnostics = {
 	preflightOk: boolean;
 	preflightIssueCodes: OpenAICompatiblePreflightIssueCode[];
 	compactedTurnGroupCount: number;
+	removedInvalidToolCallCount: number;
 };
 
 export type DynamicRequestConfig = {

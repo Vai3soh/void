@@ -7,6 +7,10 @@ import { ModelOverrides } from './modelInference.js';
 import type { ToolApprovalType } from './toolApprovalPolicy.js';
 import { VoidSettingsState, CustomProviderSettings } from './voidSettingsService.js'
 import { IDynamicProviderRegistryService, ProviderMeta } from './providerReg.js';
+import {
+	type ChatModelFallbackSettings,
+	DEFAULT_CHAT_MODEL_FALLBACK_SETTINGS,
+} from './chatModelFallbackPolicy.js';
 
 
 let __dynamicProviderRegistry: IDynamicProviderRegistryService | undefined;
@@ -212,6 +216,8 @@ export type GlobalSettings = {
 	enableAgentSkills: boolean;
 	disabledAgentSkillNames: string[];
 	enableAcpExternalAgentSkillsFallback: boolean;
+	/** Chat model fallback rotation settings. Disabled by default. */
+	chatModelFallback: ChatModelFallbackSettings;
 }
 
 export const defaultGlobalSettings: GlobalSettings = {
@@ -254,6 +260,7 @@ export const defaultGlobalSettings: GlobalSettings = {
 	enableAgentSkills: true,
 	disabledAgentSkillNames: [],
 	enableAcpExternalAgentSkillsFallback: true,
+	chatModelFallback: DEFAULT_CHAT_MODEL_FALLBACK_SETTINGS,
 }
 
 export type GlobalSettingName = keyof GlobalSettings

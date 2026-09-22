@@ -16,6 +16,7 @@ import { isFeatureNameDisabled } from '../../../../../../../platform/void/common
 import { ProviderName } from '../../../../../../../platform/void/common/voidSettingsTypes.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities } from '../../../../../../../platform/void/common/modelInference.js';
+import type { ModelTransitionStatus } from '../../../../../../../platform/void/common/chatModelFallbackPolicy.js';
 import { Check, Image, X } from 'lucide-react';
 import { ChatAttachment, StagingSelectionItem } from '../../../../../../../platform/void/common/chatThreadServiceTypes.js';
 import ErrorBoundary from './ErrorBoundary.js';
@@ -23,7 +24,7 @@ import { getBasename } from './SidebarChatShared.js';
 import { IconLoading, VoidChatArea } from './SidebarChatUI.js';
 import { EditToolSoFar } from './SidebarChatTools.js';
 import { ChatBubble } from './SidebarChatBubbles.js';
-import { CommandBarInChat, TokenUsageSpoiler, HistoryCompressionIndicator } from './SidebarChatCommandBar.js';
+import { CommandBarInChat, TokenUsageSpoiler, HistoryCompressionIndicator, ModelTransitionIndicator } from './SidebarChatCommandBar.js';
 
 
 const scrollToBottom = (divRef: { current: HTMLElement | null }) => {
@@ -201,7 +202,7 @@ export const SidebarChat = () => {
 	const currThreadStreamState = useChatThreadsStreamState(chatThreadsState.currentThreadId)
 	const isRunning = currThreadStreamState?.isRunning
 	const latestError = currThreadStreamState?.error
-	const { displayContentSoFar, toolCallSoFar, reasoningSoFar } = currThreadStreamState?.llmInfo ?? {}
+	const { displayContentSoFar, toolCallSoFar, reasoningSoFar, modelTransition } = currThreadStreamState?.llmInfo ?? {}
 
 	// this is just if it's currently being generated, NOT if it's currently running
 	const toolIsGenerating = toolCallSoFar && !toolCallSoFar.isDone // show loading for slow tools (right now just edit)
@@ -364,11 +365,15 @@ export const SidebarChat = () => {
 			w-full h-full
 			overflow-x-hidden
 			overflow-y-auto
-			${previousMessagesHTML.length === 0 && !displayContentSoFar ? 'hidden' : ''}
+			${previousMessagesHTML.length === 0 && !displayContentSoFar && !modelTransition ? 'hidden' : ''}
 		`}
 	>
 		{/* previous messages */}
 		{previousMessagesHTML}
+		{/* model transition indicator (task 5.1/5.2): inline status rendered in the
+			assistant area - right above the streaming fallback content, below the
+			user's last message - instead of above the whole conversation */}
+		{modelTransition ? <ModelTransitionIndicator transition={modelTransition} /> : null}
 		{currStreamingMessageHTML}
 		{/* Generating tool */}
 		{generatingTool}

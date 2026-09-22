@@ -98,53 +98,79 @@ export const _registerServices = (accessor: ServicesAccessor) => {
 	const { settingsStateService, chatThreadsStateService, themeService, editCodeService, voidCommandBarService, modelService } = stateServices
 
 	chatThreadsState = chatThreadsStateService.state
-	disposables.push(
-		chatThreadsStateService.onDidChangeCurrentThread(() => {
-			chatThreadsState = chatThreadsStateService.state
-			chatThreadsStateListeners.forEach(l => l(chatThreadsState))
-		})
-	)
-
 	currentThreadId = chatThreadsStateService.state.currentThreadId
-	disposables.push(
-		chatThreadsStateService.onDidChangeCurrentThreadId((id: string) => {
-			currentThreadId = id
-			currentThreadIdListeners.forEach(l => l(id))
-		})
-	)
-
 	allThreads = chatThreadsStateService.state.allThreads
-	disposables.push(
-		chatThreadsStateService.onDidChangeAllThreads(() => {
-			allThreads = chatThreadsStateService.state.allThreads
-			allThreadsListeners.forEach(l => l(allThreads))
-		})
-	)
+	chatThreadsStreamState = { ...chatThreadsStateService.streamState }
 
-	chatThreadsStreamState = chatThreadsStateService.streamState
+	let pendingChatThreadsStateUpdate = false
+	let pendingCurrentThreadIdUpdate = false
+	let pendingAllThreadsUpdate = false
 	const pendingStreamUpdates = new Set<string>()
-	let rafScheduled = false
-	const flushStreamUpdates = () => {
-		rafScheduled = false
-		if (pendingStreamUpdates.size === 0) return
-		chatThreadsStreamState = chatThreadsStateService.streamState
-		const updates = Array.from(pendingStreamUpdates)
+	let chatStateAnimationFrame: number | undefined
+	const flushChatStateUpdates = () => {
+		chatStateAnimationFrame = undefined
+		if (!pendingChatThreadsStateUpdate && !pendingCurrentThreadIdUpdate && !pendingAllThreadsUpdate && pendingStreamUpdates.size === 0) return
+
+		const notifyChatThreadsState = pendingChatThreadsStateUpdate
+		const notifyCurrentThreadId = pendingCurrentThreadIdUpdate
+		const notifyAllThreads = pendingAllThreadsUpdate
+		const streamUpdates = Array.from(pendingStreamUpdates)
+		pendingChatThreadsStateUpdate = false
+		pendingCurrentThreadIdUpdate = false
+		pendingAllThreadsUpdate = false
 		pendingStreamUpdates.clear()
+
+		chatThreadsState = chatThreadsStateService.state
+		currentThreadId = chatThreadsStateService.state.currentThreadId
+		allThreads = chatThreadsStateService.state.allThreads
+		chatThreadsStreamState = { ...chatThreadsStateService.streamState }
+
+		if (notifyChatThreadsState) chatThreadsStateListeners.forEach(l => l(chatThreadsState))
+		if (notifyCurrentThreadId) currentThreadIdListeners.forEach(l => l(currentThreadId))
+		if (notifyAllThreads) allThreadsListeners.forEach(l => l(allThreads))
 		chatThreadsStreamStateListeners.forEach(l => {
-			for (const threadId of updates) {
+			for (const threadId of streamUpdates) {
 				l(threadId)
 			}
 		})
 	}
+	const scheduleChatStateUpdate = () => {
+		if (chatStateAnimationFrame !== undefined) return
+		chatStateAnimationFrame = requestAnimationFrame(flushChatStateUpdates)
+	}
+
+	disposables.push(
+		chatThreadsStateService.onDidChangeCurrentThread(() => {
+			pendingChatThreadsStateUpdate = true
+			scheduleChatStateUpdate()
+		})
+	)
+
+	disposables.push(
+		chatThreadsStateService.onDidChangeCurrentThreadId(() => {
+			pendingCurrentThreadIdUpdate = true
+			scheduleChatStateUpdate()
+		})
+	)
+
+	disposables.push(
+		chatThreadsStateService.onDidChangeAllThreads(() => {
+			pendingAllThreadsUpdate = true
+			scheduleChatStateUpdate()
+		})
+	)
+
 	disposables.push(
 		chatThreadsStateService.onDidChangeStreamState(({ threadId }) => {
 			pendingStreamUpdates.add(threadId)
-			if (!rafScheduled) {
-				rafScheduled = true
-				requestAnimationFrame(flushStreamUpdates)
-			}
+			scheduleChatStateUpdate()
 		})
 	)
+	disposables.push({
+		dispose: () => {
+			if (chatStateAnimationFrame !== undefined) cancelAnimationFrame(chatStateAnimationFrame)
+		}
+	})
 
 	settingsState = settingsStateService.state
 	disposables.push(

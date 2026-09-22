@@ -194,6 +194,13 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 			try {
 				resolveReason = undefined;
 
+				// Wait for the PTY process to actually be created before expecting the
+				// CommandDetection capability to mount. Without this, `createTerminal()`
+				// (which returns immediately for hidden terminals) can leave us racing the
+				// asynchronous process spawn, causing spurious "capability did not mount"
+				// failures under load / parallel execution.
+				await terminal.processReady;
+
 				const cmdCap = await this._waitForCommandDetectionCapability(terminal);
 				if (!cmdCap) {
 					throw new Error(

@@ -351,6 +351,27 @@ suite('extractReasoningAndXMLToolsWrapper', () => {
 		assert.strictEqual(last.fullText, 'tail');
 	});
 
+	test('auto-detects think tags in main content when provider reasoning is empty', () => {
+		const { newOnText, newOnFinalMessage } = extractReasoningAndXMLToolsWrapper(
+			onText,
+			onFinalMessage,
+			null,
+			null,
+			{ toolsListOverride: [] as any }
+		);
+
+		const content = '<think>internal reasoning</think>visible answer';
+		newOnText({ fullText: content, fullReasoning: '' });
+		newOnFinalMessage({ fullText: content, fullReasoning: '', anthropicReasoning: null });
+
+		const last = capturedText[capturedText.length - 1];
+		assert.strictEqual(last.fullReasoning, 'internal reasoning');
+		assert.strictEqual(last.fullText, 'visible answer');
+		assert.ok(capturedFinal, 'final message should exist');
+		assert.strictEqual(capturedFinal!.fullReasoning, 'internal reasoning');
+		assert.strictEqual(capturedFinal!.fullText, 'visible answer');
+	});
+
 	test('hides trailing partial <tool_call marker from streaming UI text', () => {
 		const { newOnText } = extractReasoningAndXMLToolsWrapper(
 			onText,

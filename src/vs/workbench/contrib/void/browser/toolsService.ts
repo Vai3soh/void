@@ -5,7 +5,7 @@
 
 import { CancellationToken } from '../../../../base/common/cancellation.js'
 import { URI } from '../../../../base/common/uri.js'
-import { IFileService, FileOperationResult } from '../../../../platform/files/common/files.js'
+import { IFileService } from '../../../../platform/files/common/files.js'
 import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js'
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js'
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js'
@@ -408,11 +408,19 @@ export class ToolsService implements IToolsService {
 				}
 
 				const totalNumLines = model.getLineCount()
-				let startLineNumber: number
-				let endLineNumber: number
 
 				const startLineParam = startLine ?? null
 				const endLineParam = endLine ?? null
+
+				if (startLineParam !== null && startLineParam > totalNumLines) {
+					throw new Error(
+						`Invalid line range: startLine ${startLineParam} exceeds the file's total line count of ${totalNumLines}. ` +
+						`Please specify a startLine between 1 and ${totalNumLines}.`
+					)
+				}
+
+				let startLineNumber: number
+				let endLineNumber: number
 
 				if (startLineParam === null && endLineParam === null && linesCount === null) {
 

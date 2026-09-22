@@ -431,6 +431,10 @@ export const npmPnpmYarnPackageAdapter: TerminalOutputProfileAdapter = {
 		/^(?:Progress:|\[\d+\/\d+\]\s+(?:Resolving|Fetching|Linking|Building)\s+packages)/i,
 	]),
 	extract: (input, match) => resultOf(input, match, extractPackageManager(input)),
+	safeReductionSignature: line => {
+		const signature = progressSignature(line.text);
+		return signature ? { kind: 'progress', signature } : undefined;
+	},
 };
 
 export const genericPackageManagerAdapter: TerminalOutputProfileAdapter = {

@@ -824,6 +824,33 @@ suite('runStream (OpenAI-compatible)', () => {
 		assert.match(implTestExports.providerHttpErrorMessage(metadata), /Response body was absent/);
 	});
 
+	test('socket termination (UND_ERR_SOCKET) with HTTP 200 is classified as a network error', () => {
+		// Regression: undici throws `TypeError: terminated` with
+		// `cause.code: UND_ERR_SOCKET` mid-stream while the last HTTP response
+		// was 200 — it must be classified as a retryable network error so model
+		// fallback rotation can act on it (the cause chain does not cross IPC).
+		const metadata = implTestExports.providerHttpErrorMetadata({
+			status: 200,
+			cause: { name: 'SocketError', message: 'other side closed', code: 'UND_ERR_SOCKET' },
+		});
+
+		assert.ok(metadata);
+		assert.strictEqual(metadata.status, 200);
+		assert.strictEqual(metadata.isNetworkError, true);
+		assert.strictEqual(metadata.retryable, true);
+		assert.match(implTestExports.providerHttpErrorMessage(metadata), /Provider network error/);
+	});
+
+	test('network error without its own HTTP status still produces retryable metadata', () => {
+		const metadata = implTestExports.providerHttpErrorMetadata({
+			cause: { name: 'Error', code: 'ECONNREFUSED' },
+		});
+
+		assert.ok(metadata);
+		assert.strictEqual(metadata.isNetworkError, true);
+		assert.strictEqual(metadata.retryable, true);
+	});
+
 	test('runStream retries 429 without body within limits but never retries unchanged 400', async () => {
 		class FakeAPIError extends Error {
 			constructor(readonly status: number, readonly headers: Record<string, string>) {
@@ -932,6 +959,67 @@ suite('runStream (OpenAI-compatible)', () => {
 			stream: true,
 		});
 		assert.ok(invalidArguments.diagnostics.preflightIssueCodes.includes('invalid_tool_arguments_json'));
+		assert.strictEqual(invalidArguments.diagnostics.preflightOk, true);
+		assert.strictEqual(invalidArguments.diagnostics.removedInvalidToolCallCount, 1);
+		assert.deepStrictEqual(invalidArguments.options.messages, [userMessage]);
+	});
+
+	test('OpenAI-compatible preflight removes invalid tool history without blocking the next text request', () => {
+		const tools = (availableTools('agent') ?? []).map(tool => toOpenAICompatibleTool(tool));
+		const messages: ChatCompletionMessageParam[] = [
+			{ role: 'user', content: 'previous request' },
+			{
+				role: 'assistant',
+				content: '',
+				tool_calls: [{
+					type: 'function',
+					id: 'call-invalid',
+					function: { name: 'read_file', arguments: '{}' },
+				}],
+			},
+			{ role: 'tool', tool_call_id: 'call-invalid', content: '' },
+			{ role: 'user', content: 'continue with this text request' },
+		];
+
+		const prepared = implTestExports.prepareOpenAICompatibleRequest({ model: 'test', messages, tools, stream: true }, {});
+
+		assert.strictEqual(prepared.diagnostics.preflightOk, true);
+		assert.ok(prepared.diagnostics.preflightIssueCodes.includes('incompatible_tool_definition'));
+		assert.strictEqual(prepared.diagnostics.removedInvalidToolCallCount, 1);
+		assert.deepStrictEqual(prepared.options.messages, [
+			{ role: 'user', content: 'previous request' },
+			{ role: 'user', content: 'continue with this text request' },
+		]);
+	});
+
+	test('OpenAI-compatible preflight removes unknown and orphaned tool events instead of blocking', () => {
+		const tools = (availableTools('agent') ?? []).map(tool => toOpenAICompatibleTool(tool));
+		const messages: ChatCompletionMessageParam[] = [
+			{ role: 'user', content: 'continue' },
+			{
+				role: 'assistant',
+				content: '',
+				tool_calls: [{
+					type: 'function',
+					id: 'call-unknown',
+					function: { name: 'unknown_tool', arguments: '{}' },
+				}],
+			},
+			{ role: 'tool', tool_call_id: 'call-unknown', content: 'failed' },
+			{ role: 'tool', tool_call_id: 'call-orphan', content: 'orphan' },
+			{ role: 'user', content: 'new request' },
+		];
+
+		const prepared = implTestExports.prepareOpenAICompatibleRequest({ model: 'test', messages, tools, stream: true }, {});
+
+		assert.strictEqual(prepared.diagnostics.preflightOk, true);
+		assert.ok(prepared.diagnostics.preflightIssueCodes.includes('missing_tool_definition'));
+		assert.ok(prepared.diagnostics.preflightIssueCodes.includes('orphan_tool_result'));
+		assert.strictEqual(prepared.diagnostics.removedInvalidToolCallCount, 1);
+		assert.deepStrictEqual(prepared.options.messages, [
+			{ role: 'user', content: 'continue' },
+			{ role: 'user', content: 'new request' },
+		]);
 	});
 
 	test('production-shaped boundary compacts only complete assistant-tool groups and preserves all definitions', () => {
@@ -1543,6 +1631,58 @@ suite('sendLLMMessageToProviderImplementation integrations', () => {
 		assert.strictEqual(fin.fullReasoning, 'r1r2');
 	});
 
+	test('stream auto-detects reasoning_content for an unconfigured OpenAI-compatible provider', async () => {
+		const chunks = [
+			makeChunk({ content: '' }),
+			makeChunk({ content: '' }),
+			makeChunk({ reasoningFieldName: 'reasoning_content', reasoningDelta: 'The user asks me to solve 17*23.' }),
+			makeChunk({ reasoningFieldName: 'reasoning_content', reasoningDelta: ' Compute 17*23.' }),
+			makeChunk({ content: '\nХод рассуждений:\n17 × 23 = ' }),
+			makeChunk({ reasoningFieldName: 'reasoning_content', reasoningDelta: ' 17*20 + 17*3 = 340 + 51 = 391.' }),
+			makeChunk({ content: '17 × (20 + 3) = 340 + 51 = 391\n\nОтвет: 391', finish: 'stop' }),
+		];
+		const stream = makeAsyncStream(chunks);
+
+		const caps = newCaptures();
+		await runStream({
+			openai: makeFakeOpenAIClient(stream),
+			options: { model: 'glm-5.2', messages: [], stream: true } as any,
+			onText: caps.onText,
+			onFinalMessage: caps.onFinalMessage,
+			onError: (e) => assert.fail('onError ' + e.message),
+			_setAborter: () => { },
+			nameOfReasoningFieldInDelta: undefined,
+			providerName: 'local-glm' as any,
+		});
+
+		const fin = caps.getFinal()!;
+		assert.strictEqual(fin.fullText, '\nХод рассуждений:\n17 × 23 = 17 × (20 + 3) = 340 + 51 = 391\n\nОтвет: 391');
+		assert.strictEqual(fin.fullReasoning, 'The user asks me to solve 17*23. Compute 17*23. 17*20 + 17*3 = 340 + 51 = 391.');
+	});
+
+	test('stream auto-detects reasoning for an unconfigured OpenAI-compatible provider', async () => {
+		const stream = makeAsyncStream([
+			makeChunk({ reasoningFieldName: 'reasoning', reasoningDelta: 'reasoning' }),
+			makeChunk({ content: 'answer', finish: 'stop' }),
+		]);
+
+		const caps = newCaptures();
+		await runStream({
+			openai: makeFakeOpenAIClient(stream),
+			options: { model: 'x', messages: [], stream: true } as any,
+			onText: caps.onText,
+			onFinalMessage: caps.onFinalMessage,
+			onError: (e) => assert.fail('onError ' + e.message),
+			_setAborter: () => { },
+			nameOfReasoningFieldInDelta: undefined,
+			providerName: 'local-glm' as any,
+		});
+
+		const fin = caps.getFinal()!;
+		assert.strictEqual(fin.fullText, 'answer');
+		assert.strictEqual(fin.fullReasoning, 'reasoning');
+	});
+
 	test('Anthropic: includes redacted_thinking along with thinking and tool_use in final', async () => {
 		class FakeAnthropic {
 			static APIError = class extends Error { status = 401 };
@@ -1754,6 +1894,60 @@ suite('sendLLMMessageToProviderImplementation integrations', () => {
 		assert.strictEqual(capturedOptions.reasoning_effort, 'low');
 	});
 
+	test('OpenAI-compatible effort reasoning parses inline think tags from content', async () => {
+		let capturedOptions: any = null;
+		class FakeOpenAI {
+			chat = {
+				completions: {
+					create: async (opts: any) => {
+						capturedOptions = opts;
+						return { choices: [{ message: { content: '<think>internal reasoning</think>visible answer' } }] };
+					}
+				}
+			};
+		}
+		implTestExports.setOpenAIModule?.({ default: FakeOpenAI, APIError: class extends Error { } } as any);
+
+		const caps = newCaptures();
+		let resolveDone!: () => void;
+		const done = new Promise<void>(r => { resolveDone = r; });
+		await sendChatRouter({
+			messages: [{ role: 'user', content: 'hi' } as any],
+			separateSystemMessage: undefined,
+			onText: caps.onText,
+			onFinalMessage: (p) => { caps.onFinalMessage(p); resolveDone(); },
+			onError: (e) => assert.fail('onError: ' + e.message),
+			settingsOfProvider: { custom: { endpoint: 'https://example.com/v1', apiKey: 'sk-test' } } as any,
+			modelSelectionOptions: {} as any,
+			overridesOfModel: {} as any,
+			modelName: 'custom/reasoning-model',
+			_setAborter: () => { },
+			providerName: 'custom' as any,
+			chatMode: null as any,
+			dynamicRequestConfig: {
+				endpoint: 'https://example.com/v1',
+				apiStyle: 'openai-compatible',
+				supportsSystemMessage: 'system-role',
+				specialToolFormat: 'openai-style',
+				reasoningCapabilities: {
+					supportsReasoning: true,
+					canTurnOffReasoning: true,
+					canIOReasoning: true,
+					reasoningSlider: {
+						type: 'effort_slider',
+						values: ['low', 'medium', 'high'],
+						default: 'low',
+					},
+				},
+				headers: { Authorization: 'Bearer sk-test' },
+			} as any,
+		});
+		await done;
+
+		assert.strictEqual(capturedOptions.reasoning_effort, 'low');
+		assert.strictEqual(caps.getFinal()!.fullReasoning, 'internal reasoning');
+		assert.strictEqual(caps.getFinal()!.fullText, 'visible answer');
+	});
 	test('OpenRouter payload keeps provider-specific effort reasoning shape', async () => {
 		let capturedOptions: any = null;
 		class FakeOpenAI {

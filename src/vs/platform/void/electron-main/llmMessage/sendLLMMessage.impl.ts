@@ -238,6 +238,18 @@ const _shouldRedactKey = (key: string): boolean => {
 	return /(api[-_]?key|authorization|token$|secret|password|session)/i.test(key);
 };
 
+const _deepRedact = (v: unknown): unknown => {
+	if (Array.isArray(v)) return v.map(_deepRedact);
+	if (!_isPlainObject(v)) return v;
+
+	const out: Record<string, unknown> = {};
+	for (const [k, val] of Object.entries(v)) {
+		if (_shouldRedactKey(k)) out[k] = '***';
+		else out[k] = _deepRedact(val);
+	}
+	return out;
+};
+
 const _redactUrl = (url: string): string => {
 	try {
 		const parsed = new URL(url);
@@ -274,10 +286,26 @@ const _requestDiagnosticsFromSerializedBody = (body: string): OpenAICompatibleRe
 			preflightOk: true,
 			preflightIssueCodes: [],
 			compactedTurnGroupCount: 0,
+			removedInvalidToolCallCount: 0,
 		};
 	} catch {
 		return undefined;
 	}
+};
+
+const _logRequestBody = (logService: ILogService | undefined, body: unknown): void => {
+	const bodyStr = typeof body === 'string' ? body : '';
+	if (!bodyStr) {
+		_logDebug(logService, `HTTP Body`, '[non-string body omitted]');
+		return;
+	}
+	try {
+		const parsed = JSON.parse(bodyStr);
+		_logDebug(logService, `HTTP Body (json, redacted)`, _deepRedact(parsed));
+	} catch {
+		_logDebug(logService, `HTTP Body (non-json)`, '[omitted]');
+	}
+	_logDebug(logService, 'HTTP Request Diagnostics', _requestDiagnosticsFromSerializedBody(bodyStr));
 };
 
 /**
@@ -309,12 +337,7 @@ export function installDebugFetchLogging(logService: ILogService): void {
 					_logDebug(logService, `HTTP Headers`, hdrs);
 
 					if (init?.body) {
-						const bodyStr = typeof init.body === 'string' ? init.body : '';
-						if (bodyStr) {
-							_logDebug(logService, 'HTTP Request Diagnostics', _requestDiagnosticsFromSerializedBody(bodyStr));
-						} else {
-							_logDebug(logService, `HTTP Body`, '[non-string body omitted]');
-						}
+						_logRequestBody(logService, init.body);
 					}
 				} catch {
 					// ignore
@@ -1147,6 +1170,17 @@ export async function runStream({
 		return '';
 	};
 
+	const getDeltaReasoningValue = (delta: any): { field: string; value: string } | undefined => {
+		const fieldNames = nameOfReasoningFieldInDelta
+			? [nameOfReasoningFieldInDelta]
+			: ['reasoning_content', 'reasoning'];
+		for (const fieldName of fieldNames) {
+			const value = delta?.[fieldName];
+			if (typeof value === 'string' && value) return { field: fieldName, value };
+		}
+		return undefined;
+	};
+
 	const getDeltaContentValue = (delta: any): unknown => {
 		if (delta?.content !== undefined) return delta.content;
 		if (delta?.contentParts !== undefined) return delta.contentParts;
@@ -1331,6 +1365,15 @@ export async function runStream({
 
 				const rawUsage = nonStreamResp?.usage;
 				const tokenUsage = validateLLMTokenUsage(mapOpenAIUsageToLLMTokenUsage(rawUsage), logService);
+				if (rawUsage !== undefined) {
+					__dbg('provider usage received (non-stream)', {
+						providerName,
+						model: (currentOptions as any)?.model,
+						attempt,
+						rawUsage,
+						mappedUsage: tokenUsage ?? null,
+					});
+				}
 
 				let collectedReasoning = '';
 				const details = msg?.reasoning_details ?? msg?.reasoningDetails;
@@ -1345,9 +1388,9 @@ export async function runStream({
 					if (!collectedReasoning && sawEncrypted) {
 						collectedReasoning = 'Reasoning content is encrypted by the provider and cannot be displayed';
 					}
-				} else if (nameOfReasoningFieldInDelta) {
-					const maybe = msg?.[nameOfReasoningFieldInDelta];
-					if (typeof maybe === 'string' && maybe) collectedReasoning = maybe;
+				} else {
+					const reasoningField = getDeltaReasoningValue(msg);
+					if (reasoningField) collectedReasoning = reasoningField.value;
 				}
 
 				if (__isHeavyDebugEnabled) {
@@ -1472,6 +1515,16 @@ export async function runStream({
 				{
 					const rawUsage = (chunk as any)?.usage;
 					const usage = validateLLMTokenUsage(mapOpenAIUsageToLLMTokenUsage(rawUsage), logService);
+					if (rawUsage !== undefined) {
+						__dbg('provider usage received (stream)', {
+							providerName,
+							model: (currentOptions as any)?.model,
+							attempt,
+							chunkCount,
+							rawUsage,
+							mappedUsage: usage ?? null,
+						});
+					}
 					if (usage) lastTokenUsage = usage;
 				}
 
@@ -1553,22 +1606,22 @@ export async function runStream({
 				}
 
 				// REASONING (field fallback)
-				if (!appendedReasoningThisChunk && nameOfReasoningFieldInDelta) {
-					const maybeField = (delta as any)?.[nameOfReasoningFieldInDelta];
-					if (typeof maybeField === 'string' && maybeField) {
+				if (!appendedReasoningThisChunk) {
+					const reasoningField = getDeltaReasoningValue(delta);
+					if (reasoningField) {
 						sawAnyReasoningDelta = true;
 						if (!reasoningSource) reasoningSource = 'deltaField';
-						fullReasoningSoFar += maybeField;
+						fullReasoningSoFar += reasoningField.value;
 						everHadAnyData = true;
 						lastReasoningAppendChunk = chunkCount;
 
-						if (!sawXmlToolTagInReasoning && __isHeavyDebugEnabled && (__TOOL_TAG_RE.test(maybeField) || __TOOL_TAG_RE.test(fullReasoningSoFar.slice(-2000)))) {
+						if (!sawXmlToolTagInReasoning && __isHeavyDebugEnabled && (__TOOL_TAG_RE.test(reasoningField.value) || __TOOL_TAG_RE.test(fullReasoningSoFar.slice(-2000)))) {
 							sawXmlToolTagInReasoning = true;
 							__dbg('XML tool tag detected (REASONING_FIELD stream)', {
 								attempt,
 								chunkCount,
-								field: nameOfReasoningFieldInDelta,
-								fieldPreview: __previewAroundFirstMatch(maybeField),
+								field: reasoningField.field,
+								fieldPreview: __previewAroundFirstMatch(reasoningField.value),
 							});
 						}
 					}
@@ -1962,7 +2015,7 @@ const _isFunctionToolDefinition = (tool: OpenAIChatCompletionTool): boolean => {
 const _toolDefinitionsByName = (tools: readonly OpenAIChatCompletionTool[]): Map<string, OpenAIChatCompletionTool> => {
 	const definitions = new Map<string, OpenAIChatCompletionTool>();
 	for (const tool of tools) {
-		if (tool.type !== 'function') continue;
+		if (!_isFunctionToolDefinition(tool)) continue;
 		definitions.set(tool.function.name, tool);
 	}
 	return definitions;
@@ -2029,8 +2082,16 @@ const _preflightOpenAICompatibleRequest = (
 	const issues: OpenAICompatiblePreflightIssue[] = [];
 	const tools = options.tools ?? [];
 	const definitions = _toolDefinitionsByName(tools);
-	const callInfoById = new Map<string, { name: string; messageIndex: number; resultCount: number }>();
-	let openCallIds = new Set<string>();
+	const invalidToolCallIds = new Set<string>();
+	const invalidToolCallIndexes = new Map<number, Set<number>>();
+	const toolResultIndexesToRemove = new Set<number>();
+	const callInfoById = new Map<string, { name: string; messageIndex: number; callIndex: number }>();
+	const markInvalidToolCall = (messageIndex: number, callIndex: number, callId: string | undefined): void => {
+		const callIndexes = invalidToolCallIndexes.get(messageIndex) ?? new Set<number>();
+		callIndexes.add(callIndex);
+		invalidToolCallIndexes.set(messageIndex, callIndexes);
+		if (callId) invalidToolCallIds.add(callId);
+	};
 
 	for (const [toolIndex, tool] of tools.entries()) {
 		if (!_isFunctionToolDefinition(tool)) {
@@ -2040,56 +2101,135 @@ const _preflightOpenAICompatibleRequest = (
 
 	for (let messageIndex = 0; messageIndex < options.messages.length; messageIndex += 1) {
 		const message = options.messages[messageIndex];
-		if (message.role === 'assistant' && message.tool_calls?.length) {
-			if (openCallIds.size > 0) issues.push({ code: 'invalid_message_role_order', messageIndex });
-			openCallIds = new Set<string>();
-			for (const call of message.tool_calls) {
-				if (!call.id || callInfoById.has(call.id)) {
-					issues.push({ code: 'duplicate_tool_call_id', messageIndex, toolCallId: call.id, toolName: call.function.name });
-					continue;
-				}
-				let parsedArguments: unknown;
-				try {
-					parsedArguments = JSON.parse(call.function.arguments);
-				} catch {
-					issues.push({ code: 'invalid_tool_arguments_json', messageIndex, toolCallId: call.id, toolName: call.function.name });
-				}
-				const definition = definitions.get(call.function.name);
-				if (!definition) {
-					issues.push({ code: 'missing_tool_definition', messageIndex, toolCallId: call.id, toolName: call.function.name });
-				} else if (parsedArguments !== undefined && !_isCompatibleToolDefinition(definition, parsedArguments)) {
-					issues.push({ code: 'incompatible_tool_definition', messageIndex, toolCallId: call.id, toolName: call.function.name });
-				}
-				callInfoById.set(call.id, { name: call.function.name, messageIndex, resultCount: 0 });
-				openCallIds.add(call.id);
-			}
-			continue;
-		}
-		if (message.role === 'tool') {
-			const callInfo = callInfoById.get(message.tool_call_id);
-			if (!callInfo || !openCallIds.has(message.tool_call_id)) {
-				issues.push({ code: 'orphan_tool_result', messageIndex, toolCallId: message.tool_call_id });
+		if (message.role !== 'assistant' || !message.tool_calls?.length) continue;
+		for (const [callIndex, call] of message.tool_calls.entries()) {
+			if (!call.id) {
+				issues.push({ code: 'duplicate_tool_call_id', messageIndex, toolName: call.function.name });
+				markInvalidToolCall(messageIndex, callIndex, undefined);
 				continue;
 			}
-			callInfo.resultCount += 1;
-			if (callInfo.resultCount > 1) {
-				issues.push({ code: 'duplicate_tool_result', messageIndex, toolCallId: message.tool_call_id, toolName: callInfo.name });
+			if (callInfoById.has(call.id)) {
+				issues.push({ code: 'duplicate_tool_call_id', messageIndex, toolCallId: call.id, toolName: call.function.name });
+				markInvalidToolCall(messageIndex, callIndex, call.id);
+				const firstCall = callInfoById.get(call.id);
+				if (firstCall) markInvalidToolCall(firstCall.messageIndex, firstCall.callIndex, call.id);
+				continue;
 			}
-			openCallIds.delete(message.tool_call_id);
-			continue;
-		}
-		if (openCallIds.size > 0) {
-			issues.push({ code: 'invalid_message_role_order', messageIndex });
-			for (const callId of openCallIds) {
-				const callInfo = callInfoById.get(callId);
-				issues.push({ code: 'missing_tool_result', messageIndex: callInfo?.messageIndex, toolCallId: callId, toolName: callInfo?.name });
+			callInfoById.set(call.id, { name: call.function.name, messageIndex, callIndex });
+
+			let parsedArguments: unknown;
+			try {
+				parsedArguments = JSON.parse(call.function.arguments);
+			} catch {
+				issues.push({ code: 'invalid_tool_arguments_json', messageIndex, toolCallId: call.id, toolName: call.function.name });
+				markInvalidToolCall(messageIndex, callIndex, call.id);
+				continue;
 			}
-			openCallIds = new Set<string>();
+			const definition = definitions.get(call.function.name);
+			if (!definition) {
+				issues.push({ code: 'missing_tool_definition', messageIndex, toolCallId: call.id, toolName: call.function.name });
+				markInvalidToolCall(messageIndex, callIndex, call.id);
+			} else if (!_isCompatibleToolDefinition(definition, parsedArguments)) {
+				issues.push({ code: 'incompatible_tool_definition', messageIndex, toolCallId: call.id, toolName: call.function.name });
+				markInvalidToolCall(messageIndex, callIndex, call.id);
+			}
 		}
 	}
-	for (const callId of openCallIds) {
-		const callInfo = callInfoById.get(callId);
-		issues.push({ code: 'missing_tool_result', messageIndex: callInfo?.messageIndex, toolCallId: callId, toolName: callInfo?.name });
+
+	const toolResultIndexesByCallId = new Map<string, number[]>();
+	for (const [messageIndex, message] of options.messages.entries()) {
+		if (message.role !== 'tool') continue;
+		const resultIndexes = toolResultIndexesByCallId.get(message.tool_call_id) ?? [];
+		resultIndexes.push(messageIndex);
+		toolResultIndexesByCallId.set(message.tool_call_id, resultIndexes);
+	}
+
+	for (let messageIndex = 0; messageIndex < options.messages.length; messageIndex += 1) {
+		const message = options.messages[messageIndex];
+		if (message.role !== 'assistant' || !message.tool_calls?.length) continue;
+		const resultMessageIndexes: number[] = [];
+		for (let resultIndex = messageIndex + 1; resultIndex < options.messages.length; resultIndex += 1) {
+			if (options.messages[resultIndex].role !== 'tool') break;
+			resultMessageIndexes.push(resultIndex);
+		}
+		const expectedCallIds = message.tool_calls.map(call => call.id);
+		const actualCallIds = resultMessageIndexes.map(resultIndex => {
+			const resultMessage = options.messages[resultIndex];
+			return resultMessage.role === 'tool' ? resultMessage.tool_call_id : '';
+		});
+		const hasCompleteOrderedResults = expectedCallIds.length === resultMessageIndexes.length
+			&& expectedCallIds.every((callId, callIndex) => callId === actualCallIds[callIndex]);
+		if (hasCompleteOrderedResults) continue;
+
+		issues.push({ code: 'invalid_message_role_order', messageIndex });
+		for (const [callIndex, call] of message.tool_calls.entries()) {
+			const resultIndexes = call.id ? toolResultIndexesByCallId.get(call.id) ?? [] : [];
+			if (resultIndexes.length === 0) {
+				issues.push({ code: 'missing_tool_result', messageIndex, toolCallId: call.id, toolName: call.function.name });
+			}
+			markInvalidToolCall(messageIndex, callIndex, call.id);
+		}
+		for (const resultIndex of resultMessageIndexes) {
+			toolResultIndexesToRemove.add(resultIndex);
+			const resultMessage = options.messages[resultIndex];
+			if (resultMessage.role !== 'tool') continue;
+			const resultIndexes = toolResultIndexesByCallId.get(resultMessage.tool_call_id) ?? [];
+			if (!callInfoById.has(resultMessage.tool_call_id)) {
+				issues.push({ code: 'orphan_tool_result', messageIndex: resultIndex, toolCallId: resultMessage.tool_call_id });
+			} else if (resultIndexes.length > 1) {
+				issues.push({ code: 'duplicate_tool_result', messageIndex: resultIndex, toolCallId: resultMessage.tool_call_id });
+			}
+		}
+	}
+
+	for (const [messageIndex, message] of options.messages.entries()) {
+		if (message.role !== 'tool') continue;
+		if (!callInfoById.has(message.tool_call_id)) {
+			issues.push({ code: 'orphan_tool_result', messageIndex, toolCallId: message.tool_call_id });
+			toolResultIndexesToRemove.add(messageIndex);
+		} else if (invalidToolCallIds.has(message.tool_call_id)) {
+			toolResultIndexesToRemove.add(messageIndex);
+		}
+	}
+
+	const cleanedMessages = options.messages.flatMap((message, messageIndex): ChatCompletionMessageParam[] => {
+		if (message.role === 'assistant' && message.tool_calls?.length) {
+			const invalidCallIndexes = invalidToolCallIndexes.get(messageIndex);
+			if (!invalidCallIndexes?.size) return [message];
+			const toolCalls = message.tool_calls.filter((_call, callIndex) => !invalidCallIndexes.has(callIndex));
+			if (toolCalls.length > 0) return [{ ...message, tool_calls: toolCalls }];
+			if (message.content) {
+				const { tool_calls: _toolCalls, ...assistantWithoutToolCalls } = message;
+				return [assistantWithoutToolCalls];
+			}
+			return [];
+		}
+		if (message.role === 'tool' && toolResultIndexesToRemove.has(messageIndex)) return [];
+		return [message];
+	});
+	const cleanedTools = tools.filter(tool => _isFunctionToolDefinition(tool));
+	const didClean = cleanedMessages.length !== options.messages.length
+		|| cleanedMessages.some((message, messageIndex) => message !== options.messages[messageIndex])
+		|| cleanedTools.length !== tools.length;
+	if (didClean) {
+		const cleanedOptions: OpenAICompatibleRequestEnvelope = {
+			...options,
+			messages: cleanedMessages,
+			...(cleanedTools.length !== tools.length ? { tools: cleanedTools } : {}),
+		};
+		const prepared = _preflightOpenAICompatibleRequest(cleanedOptions, preflightOptions, compactedTurnGroupCount);
+		return {
+			...prepared,
+			diagnostics: {
+				...prepared.diagnostics,
+				preflightIssueCodes: Array.from(new Set([
+					...issues.map(issue => issue.code),
+					...prepared.diagnostics.preflightIssueCodes,
+				])),
+				removedInvalidToolCallCount: prepared.diagnostics.removedInvalidToolCallCount
+					+ Array.from(invalidToolCallIndexes.values()).reduce((count, indexes) => count + indexes.size, 0),
+			},
+		};
 	}
 
 	const serialized = JSON.stringify(options, null, 2);
@@ -2118,6 +2258,7 @@ const _preflightOpenAICompatibleRequest = (
 			preflightOk: issues.length === 0,
 			preflightIssueCodes: Array.from(new Set(issues.map(issue => issue.code))),
 			compactedTurnGroupCount,
+			removedInvalidToolCallCount: 0,
 		},
 	};
 };
@@ -2157,13 +2298,50 @@ const _prepareOpenAICompatibleRequest = (
 	return _compactOpenAICompatibleRequest(options, preflightOptions, targetBytes);
 };
 
+const _providerNetworkErrorCodes: ReadonlySet<string> = new Set([
+	'UND_ERR_SOCKET',
+	'UND_ERR_CONNECT_TIMEOUT',
+	'UND_ERR_HEADERS',
+	'UND_ERR_INFO',
+	'ECONNRESET',
+	'ECONNREFUSED',
+	'ECONNABORTED',
+	'EPIPE',
+	'ETIMEDOUT',
+	'EAI_AGAIN',
+	'ENOTFOUND',
+	'EHOSTUNREACH',
+	'ENETUNREACH',
+	'ENETRESET',
+]);
+
+/**
+ * Detect network/socket failures (e.g. undici `TypeError: terminated` whose
+ * `cause.code` is `UND_ERR_SOCKET`). These are classified as retryable and
+ * eligible for model fallback rotation even when the last HTTP response was
+ * 200 - the raw `cause` chain does not survive the IPC hop to the renderer,
+ * so the classification must be attached to the providerHttp metadata.
+ */
+const _isProviderNetworkError = (error: Record<string, unknown>): boolean => {
+	const codes: unknown[] = [error.code];
+	if (_isPlainObject(error.cause)) {
+		codes.push(error.cause.code);
+	}
+	return codes.some(code => typeof code === 'string' && _providerNetworkErrorCodes.has(code));
+};
+
 const _providerHttpErrorMetadata = (
 	error: unknown,
 	requestDiagnostics?: OpenAICompatibleRequestDiagnostics
 ): ProviderHttpErrorMetadata | undefined => {
 	if (!_isPlainObject(error)) return undefined;
+	const isNetworkError = _isProviderNetworkError(error);
 	const statusValue = error.status ?? latestProviderHttpResponseMetadata?.status;
-	if (typeof statusValue !== 'number') return undefined;
+	// Network errors (socket terminated mid-stream, connection refused, ...)
+	// are classified even without an HTTP status: metadata with status 0 is
+	// produced so retry/fallback policies can act on it.
+	if (typeof statusValue !== 'number' && !isNetworkError) return undefined;
+	const status = typeof statusValue === 'number' ? statusValue : 0;
 	const normalizedHeaders = normalizeHeaders(error.headers ?? latestProviderHttpResponseMetadata?.headers);
 	const safeHeaders = _safeProviderHeaders(normalizedHeaders);
 	const requestId = providerRequestIdHeaderNames
@@ -2182,22 +2360,25 @@ const _providerHttpErrorMetadata = (
 	const bodyPresent = error.error !== undefined;
 	return {
 		kind: 'provider-http',
-		status: statusValue,
+		status,
 		bodyPresent,
 		safeHeaders,
 		requestId,
-		retryable: statusValue === 408 || statusValue === 409 || statusValue === 429 || statusValue >= 500,
+		retryable: isNetworkError || status === 408 || status === 409 || status === 429 || status >= 500,
 		retryAfterMs,
 		requestDiagnostics,
+		isNetworkError: isNetworkError || undefined,
 	};
 };
 
 const _providerHttpErrorMessage = (metadata: ProviderHttpErrorMetadata): string => {
-	const classification = metadata.status === 429
-		? 'Provider rate limit'
-		: metadata.status === 400
-			? 'Provider rejected the request'
-			: 'Provider HTTP error';
+	const classification = metadata.isNetworkError
+		? 'Provider network error'
+		: metadata.status === 429
+			? 'Provider rate limit'
+			: metadata.status === 400
+				? 'Provider rejected the request'
+				: 'Provider HTTP error';
 	const requestId = metadata.requestId ? ` Request ID: ${metadata.requestId}.` : '';
 	const body = metadata.bodyPresent ? '' : ' Response body was absent.';
 	return `${classification} (HTTP ${metadata.status}).${body}${requestId}`;
@@ -2340,8 +2521,9 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 	}
 
 	const { needsManualParse: needsManualReasoningParse, nameOfFieldInDelta: nameOfReasoningFieldInDelta } = providerReasoningIOSettings?.output ?? {};
-	const manuallyParseReasoning = !!(needsManualReasoningParse && canIOReasoning && openSourceThinkTags);
 	const hasReasoningFieldInDelta = !!nameOfReasoningFieldInDelta;
+	const shouldParseInlineReasoning = !!(reasoningInfo && canIOReasoning && !hasReasoningFieldInDelta);
+	const manuallyParseReasoning = shouldParseInlineReasoning || !!(needsManualReasoningParse && canIOReasoning && openSourceThinkTags);
 
 	const needsReasoningProcessing = hasReasoningFieldInDelta || manuallyParseReasoning;
 	const needsXMLToolsProcessing = !fmtForTools || fmtForTools === 'disabled';
@@ -2484,13 +2666,10 @@ const _sendOpenAICompatibleChat = async (params: SendChatParams_Internal) => {
 	};
 	const preparedRequest = _prepareOpenAICompatibleRequest(options, preflightOptions);
 	params.logService?.debug?.('[LLM][debug] OpenAI-compatible request diagnostics', preparedRequest.diagnostics);
-	if (!preparedRequest.diagnostics.preflightOk) {
-		const issueCodes = preparedRequest.diagnostics.preflightIssueCodes.join(', ');
-		onError({
-			message: `Void blocked an invalid OpenAI-compatible request before send: ${issueCodes}.`,
-			fullError: new Error(`OpenAI-compatible request preflight failed: ${issueCodes}`),
-		});
-		return;
+	if (preparedRequest.diagnostics.removedInvalidToolCallCount > 0) {
+		params.logService?.debug?.(
+			`[LLM][debug] Removed ${preparedRequest.diagnostics.removedInvalidToolCallCount} invalid tool call(s) from OpenAI-compatible request history`
+		);
 	}
 	const sendOptions = preparedRequest.options;
 

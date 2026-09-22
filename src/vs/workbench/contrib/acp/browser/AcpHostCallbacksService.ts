@@ -762,9 +762,25 @@ export class AcpHostCallbacksService {
 
 				const decision = await this._enqueuePermissionRequest(threadId, toolCallId, normName, rawArgs, chat);
 
-				return decision === 'approved'
-					? { outcome: { outcome: 'selected', optionId: 'allow_once' } }
-					: { outcome: { outcome: 'selected', optionId: 'reject_once' } };
+				type PermissionOptionForSelection = { optionId: string; kind: string };
+				const permissionOptions: PermissionOptionForSelection[] = (Array.isArray(p?.options) ? p.options : [])
+					.map((option: { optionId?: unknown; kind?: unknown }): PermissionOptionForSelection => ({
+						optionId: typeof option?.optionId === 'string' ? option.optionId : '',
+						kind: typeof option?.kind === 'string' ? option.kind : '',
+					}))
+					.filter((option: PermissionOptionForSelection) => option.optionId.length > 0);
+				const findOptionId = (preferredId: string, kind: string): string | undefined =>
+					permissionOptions.find((option: PermissionOptionForSelection) => option.optionId === preferredId)?.optionId
+					?? permissionOptions.find((option: PermissionOptionForSelection) => option.kind === kind)?.optionId;
+				const selectedOptionId = decision === 'approved'
+					? (findOptionId('allow_once', 'allow_once') ?? findOptionId('allow_always', 'allow_always') ?? 'allow_once')
+					: decision === 'skipped'
+						? (findOptionId('skip_once', 'reject_once') ?? (permissionOptions.length ? undefined : 'reject_once'))
+						: (findOptionId('cancel_once', 'reject_once') ?? (permissionOptions.length ? undefined : 'reject_once'));
+
+				return selectedOptionId
+					? { outcome: { outcome: 'selected', optionId: selectedOptionId } }
+					: { outcome: { outcome: 'cancelled' } };
 
 			} catch (err) {
 				this.logService.error(`[AcpHostCallbacksService] requestPermission ERROR:`, err);

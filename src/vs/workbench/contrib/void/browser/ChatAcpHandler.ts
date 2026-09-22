@@ -25,7 +25,7 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { IAgentSkillsService } from '../common/skills/agentSkillsService.js';
 import { formatAgentSkillsCatalogForExternalAcp } from '../common/skills/agentSkillsPrompt.js';
 import { AgentSkillActiveMetadata } from '../common/skills/agentSkillsTypes.js';
-import { getToolApprovalRequirement } from '../../../../platform/void/common/toolApprovalPolicy.js';
+
 
 const _snakeToCamel = (s: string) => s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 const _normalizeFsPath = (p: string) => String(p ?? '').replace(/\\/g, '/').replace(/\/+$/g, '');
@@ -649,8 +649,15 @@ export class ChatAcpHandler extends Disposable {
 			this._acpStreamByThread.delete(threadId);
 		};
 
+		let receivedLiveUsage = false;
 		const onChunk = async (chunk: IAcpMessageChunk) => {
 			if (done) return;
+
+			if (chunk.type === 'usage') {
+				receivedLiveUsage = true;
+				access.accumulateTokenUsage(threadId, chunk.tokenUsageSnapshot);
+				return;
+			}
 
 			if (chunk.type === 'text') {
 				flushedThisTurn = false;
@@ -778,9 +785,7 @@ export class ChatAcpHandler extends Disposable {
 				if (!id) return;
 
 				const existing = this._getExistingToolMsgById(threadId, id, access);
-				const callInfoForProgress = this._acpToolCallInfoByKey.get(this._acpToolKey(threadId, id));
-				const announcedName = normalizeAcpToolName(String(callInfoForProgress?.name ?? tp.name ?? 'tool'));
-				if (!existing && getToolApprovalRequirement(announcedName).kind !== 'none') return;
+
 				const prevLen =
 					(typeof existing?.displayContent === 'string' ? existing.displayContent.length : 0)
 					|| (typeof existing?.content === 'string' ? existing.content.length : 0);
@@ -1148,8 +1153,8 @@ export class ChatAcpHandler extends Disposable {
 				}
 
 
-				const usage = (chunk as any).tokenUsageSnapshot;
-				if (usage) {
+				const usage = chunk.type === 'done' ? chunk.tokenUsageSnapshot : undefined;
+				if (usage && !receivedLiveUsage) {
 					access.accumulateTokenUsage(threadId, usage);
 				}
 

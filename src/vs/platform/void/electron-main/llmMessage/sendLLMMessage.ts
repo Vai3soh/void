@@ -87,7 +87,7 @@ export const sendLLMMessage = async (
 		onFinalMessage_(p);
 	};
 
-	const onError: OnError = ({ message, fullError }) => {
+	const onError: OnError = ({ message, fullError, providerHttp }) => {
 		if (didAbort) return;
 
 		let errorMessage = message;
@@ -96,7 +96,7 @@ export const sendLLMMessage = async (
 		}
 
 		captureLLMEvent(`${loggingName} - Error`, { error: errorMessage });
-		onError_({ message: errorMessage, fullError });
+		onError_({ message: errorMessage, fullError, providerHttp });
 	};
 
 	const onAbort = () => {

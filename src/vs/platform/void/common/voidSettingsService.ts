@@ -13,6 +13,7 @@ import { IStorageService, StorageScope, StorageTarget } from '../../../platform/
 import { IMetricsService } from './metricsService.js';
 import { getModelCapabilities, VoidStaticModelInfo, ModelOverrides } from './modelInference.js';
 import { VOID_SETTINGS_STORAGE_KEY } from './storageKeys.js';
+import { normalizeFallbackModels, DEFAULT_CHAT_MODEL_FALLBACK_SETTINGS } from './chatModelFallbackPolicy.js';
 import {
 	FeatureName, ProviderName,
 	ModelSelectionOfFeature,
@@ -370,6 +371,23 @@ export class VoidSettingsService extends Disposable implements IVoidSettingsServ
 			}
 			if (!Array.isArray(gs.disabledToolNames)) {
 				gs.disabledToolNames = [];
+			}
+			// Backfill chatModelFallback settings for migration
+			if (!gs.chatModelFallback || typeof gs.chatModelFallback !== 'object') {
+				gs.chatModelFallback = DEFAULT_CHAT_MODEL_FALLBACK_SETTINGS;
+			} else {
+				// Validate and normalize the fallback models array
+				const cmf = gs.chatModelFallback as any;
+				if (typeof cmf.enabled !== 'boolean') cmf.enabled = DEFAULT_CHAT_MODEL_FALLBACK_SETTINGS.enabled;
+				if (cmf.errorPolicy !== 'rate-limits-only' && cmf.errorPolicy !== 'temporary-errors' && cmf.errorPolicy !== 'any-provider-error') {
+					cmf.errorPolicy = DEFAULT_CHAT_MODEL_FALLBACK_SETTINGS.errorPolicy;
+				}
+				if (!Array.isArray(cmf.fallbackModels)) {
+					cmf.fallbackModels = [];
+				} else {
+					cmf.fallbackModels = normalizeFallbackModels(cmf.fallbackModels);
+				}
+				gs.chatModelFallback = cmf;
 			}
 		}
 		catch (e) {

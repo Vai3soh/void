@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 
-import React, { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useAccessor, useChatThreadsStreamState, } from '../util/services.js';
 
 import { AlertTriangle, Ban, ChevronRight, CircleEllipsis } from 'lucide-react';
@@ -23,13 +23,13 @@ import { ChatMessage, ToolMessage, } from '../../../../../../../platform/void/co
 import { URI } from '../../../../../../../base/common/uri.js';
 import { getBasename, getRelative, getFolderName, voidOpenFileFn } from './SidebarChatShared.js';
 import { IconLoading, ToolChildrenWrapper, CodeChildren, ListableToolItem } from './SidebarChatUI.js';
-import { LintErrorItem, ToolCallParams, ShallowDirectoryItem, ToolParamName } from '../../../../../../../platform/void/common/toolsServiceTypes.js';
+import { LintErrorItem, ShallowDirectoryItem, ToolParamName } from '../../../../../../../platform/void/common/toolsServiceTypes.js';
 import { ChatMarkdownRender, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
 import { RawToolCallObj } from '../../../../../../../platform/void/common/sendLLMMessageTypes.js';
 import { BlockCode } from '../util/inputs.js';
 import { MAX_FILE_CHARS_PAGE } from '../../../../../../../platform/void/common/prompt/constants.js';
 import { formatTerminalCommandLine, normalizeTerminalCommandOutput, normalizeTerminalCwdLabel } from '../../../../../../../platform/void/common/terminalToolOutput.js';
-import { getTerminalOutputSavedTokensLabel } from '../../../terminalOutputSavedTokens.js';
+import { getTerminalOutputSavedTokensLabel, getTerminalOutputSummaryIndicatorLabel } from '../../../terminalOutputSavedTokens.js';
 
 const USER_CANCELED_TOOL_LABEL = 'User canceled tool';
 
@@ -1094,6 +1094,7 @@ export const CommandTool = ({ toolMessage, threadId }: { threadId: string; toolM
 	if (toolMessage.type === 'success') {
 		const { result } = toolMessage;
 		const savedTokensLabel = getTerminalOutputSavedTokensLabel(toolMessage.content);
+		const summaryIndicatorLabel = getTerminalOutputSummaryIndicatorLabel(toolMessage.content);
 
 		let msg: string =
 			toolMessage.displayContent
@@ -1113,7 +1114,9 @@ export const CommandTool = ({ toolMessage, threadId }: { threadId: string; toolM
 			<>
 				{commandBlock}
 				{savedTokensLabel !== null && (
-					<div className="px-2 pt-1 pb-0 text-xs text-void-fg-4">{savedTokensLabel}</div>
+					<div className="px-2 pt-1 pb-0 text-xs text-void-fg-4">
+						{savedTokensLabel}{summaryIndicatorLabel !== null ? ` · ${summaryIndicatorLabel}` : ''}
+					</div>
 				)}
 			</>
 		);
@@ -1158,7 +1161,7 @@ export const CommandTool = ({ toolMessage, threadId }: { threadId: string; toolM
 				</div>
 			</>
 		);
-		return <ToolHeaderWrapper {...componentParams} defaultIsOpen={true} />;
+		return <ToolHeaderWrapper {...componentParams} defaultIsOpen={false} />;
 	}
 
 	componentParams.bottomChildren = commandBlock;

@@ -98,6 +98,87 @@ suite('acpBuiltinAgent tool turn orchestration', () => {
 		assert.strictEqual(sendCount, 2);
 	});
 
+	test('skip records a skipped result and continues the current ACP prompt', async () => {
+		let sendCount = 0;
+		let executionCount = 0;
+
+		__test.setSendChatRouter(async opts => {
+			sendCount++;
+			if (sendCount === 1) {
+				await opts.onFinalMessage({
+					fullText: '',
+					fullReasoning: '',
+					anthropicReasoning: null,
+					toolCall: { id: 'skip-call', name: 'edit_file', isDone: true, rawParams: { uri: '/a.ts' }, doneParams: ['uri'] },
+				});
+				return;
+			}
+
+			const result = opts.messages.find(message => message.role === 'tool' && message.tool_call_id === 'skip-call');
+			assert.ok(result && result.role === 'tool');
+			assert.ok(result.content.includes('Tool execution was skipped by the user.'));
+			await opts.onFinalMessage({ fullText: 'continued', fullReasoning: '', anthropicReasoning: null });
+		});
+
+		const connection = {
+			extMethod: async (method: string) => {
+				if (method === 'void/settings/getLLMConfig') return config;
+				if (method === 'void/tools/execute_with_text') {
+					executionCount++;
+					return { ok: true, result: {}, text: 'unexpected execution' };
+				}
+				throw new Error(`Unexpected extMethod: ${method}`);
+			},
+			requestPermission: async () => ({ outcome: { outcome: 'selected', optionId: 'skip_once' } }),
+			sessionUpdate: async () => { },
+		};
+		const agent = new __test.VoidPipelineAcpAgent(connection as unknown as AgentConnection, new NullLogService());
+		const { sessionId } = await agent.newSession({ _meta: {} } as unknown as NewSessionRequest);
+		const response = await agent.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] } as unknown as PromptRequest);
+
+		assert.strictEqual(response.stopReason, 'end_turn');
+		assert.strictEqual(executionCount, 0);
+		assert.strictEqual(sendCount, 2);
+	});
+
+	test('cancel ends the current ACP prompt and keeps the session usable', async () => {
+		let sendCount = 0;
+
+		__test.setSendChatRouter(async opts => {
+			sendCount++;
+			if (sendCount === 1) {
+				await opts.onFinalMessage({
+					fullText: '',
+					fullReasoning: '',
+					anthropicReasoning: null,
+					toolCall: { id: 'cancel-call', name: 'edit_file', isDone: true, rawParams: { uri: '/a.ts' }, doneParams: ['uri'] },
+				});
+				return;
+			}
+
+			await opts.onFinalMessage({ fullText: 'next prompt completed', fullReasoning: '', anthropicReasoning: null });
+		});
+
+		const connection = {
+			extMethod: async (method: string) => {
+				if (method === 'void/settings/getLLMConfig') return config;
+				throw new Error(`Unexpected extMethod: ${method}`);
+			},
+			requestPermission: async () => ({ outcome: { outcome: 'selected', optionId: 'cancel_once' } }),
+			sessionUpdate: async () => { },
+		};
+		const agent = new __test.VoidPipelineAcpAgent(connection as unknown as AgentConnection, new NullLogService());
+		const { sessionId } = await agent.newSession({ _meta: {} } as unknown as NewSessionRequest);
+
+		const cancelledResponse = await agent.prompt({ sessionId, prompt: [{ type: 'text', text: 'cancel this' }] } as unknown as PromptRequest);
+		assert.strictEqual(cancelledResponse.stopReason, 'cancelled');
+		assert.strictEqual(sendCount, 1);
+
+		const nextResponse = await agent.prompt({ sessionId, prompt: [{ type: 'text', text: 'continue' }] } as unknown as PromptRequest);
+		assert.strictEqual(nextResponse.stopReason, 'end_turn');
+		assert.strictEqual(sendCount, 2);
+	});
+
 	test('manual permission FIFO advances after terminal execution and continuation sees every result', async () => {
 		let sendCount = 0;
 		const trace: string[] = [];

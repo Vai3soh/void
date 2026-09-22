@@ -47,6 +47,7 @@ import { ChatExecutionEngine } from './ChatExecutionEngine.js';
 import { getModelCapabilities } from '../../../../platform/void/common/modelInference.js';
 import { IAgentSkillsService } from '../common/skills/agentSkillsService.js';
 import { AgentSkillActiveMetadata } from '../common/skills/agentSkillsTypes.js';
+import type { ModelTransitionStatus } from '../../../../platform/void/common/chatModelFallbackPolicy.js';
 
 const THREAD_INDEX_STORAGE_KEY = 'void.chat.threads.index';
 const THREAD_STORAGE_KEY_PREFIX = 'void.chat.thread.';
@@ -120,6 +121,8 @@ export type ThreadStreamState = {
 			reasoningSoFar: string;
 			toolCallSoFar: RawToolCallObj | null;
 			planSoFar?: any;
+			/** Inline model transition status (task 5.1/5.2): shown above streaming content, never part of LLM context. */
+			modelTransition?: ModelTransitionStatus;
 		};
 		toolInfo?: undefined;
 		interrupt: Promise<() => void>;
@@ -421,7 +424,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			this._historyCompressor, this._toolOutputManager,
 			async threadId => {
 				await this._executionEngine.runChatAgent({ threadId, ...this._currentModelSelectionProps() }, this._threadAccess);
-			}
+			},
+			this._logService,
 		);
 	}
 

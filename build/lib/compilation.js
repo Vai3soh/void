@@ -132,7 +132,9 @@ function createCompile(src, { build, emitError, transpileOnly, preserveEnglish }
 function transpileTask(src, out, esbuild) {
     const task = () => {
         const transpile = createCompile(src, { build: false, emitError: true, transpileOnly: { esbuild }, preserveEnglish: false });
-        const srcPipe = gulp_1.default.src(`${src}/**`, { base: `${src}` });
+        // `encoding: false` is required so binary assets (e.g. codicon.ttf) are copied as-is;
+        // vinyl-fs 4 (gulp 5) otherwise transcodes via utf8 and corrupts them.
+        const srcPipe = gulp_1.default.src(`${src}/**`, { base: `${src}`, encoding: false });
         return srcPipe
             .pipe(transpile())
             .pipe(gulp_1.default.dest(out));

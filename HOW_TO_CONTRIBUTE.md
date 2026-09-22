@@ -76,7 +76,7 @@ If you get any errors, scroll down for common fixes.
 #### Common Fixes
 
 - Make sure you followed the prerequisite steps above.
-- Make sure you have Node version `20.18.2` (the version in `.nvmrc`).
+- Make sure you have Node version `22.23.2` (the version in `.nvmrc`).
     - You can do this without changing your global Node version using [nvm](https://github.com/nvm-sh/nvm): run `nvm install`, followed by `nvm use` to install the version in `.nvmrc` locally.
 - Make sure the path to your Void folder does not have any spaces in it.
 - If you get `"TypeError: Failed to fetch dynamically imported module"`, make sure all imports end with `.js`.

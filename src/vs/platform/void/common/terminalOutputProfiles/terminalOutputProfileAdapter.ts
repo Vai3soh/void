@@ -10,6 +10,7 @@ import type {
 	TerminalOutputProfile,
 	TerminalOutputSummary,
 } from '../terminalOutputSummaryTypes.js';
+import type { TerminalOutputSafeReductionSignatureProvider } from '../terminalOutputReducer.js';
 
 export interface TerminalOutputAdapterInput {
 	command: string;
@@ -31,6 +32,7 @@ export interface TerminalOutputProfileAdapter {
 	profile: TerminalOutputProfile;
 	match(input: TerminalOutputAdapterInput): TerminalOutputAdapterMatch | undefined;
 	extract(input: TerminalOutputAdapterInput, match: TerminalOutputAdapterMatch): TerminalOutputSummary;
+	safeReductionSignature?: TerminalOutputSafeReductionSignatureProvider;
 }
 
 export interface TerminalOutputAdapterSelection {

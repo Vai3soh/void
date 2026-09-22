@@ -10,6 +10,10 @@ import {
 	genericBuildAdapter,
 } from './buildAdapters.js';
 import {
+	genericLogsAdapter,
+	logOutputAdapters,
+} from './logAdapters.js';
+import {
 	genericPackageManagerAdapter,
 	packageManagerOutputAdapters,
 } from './packageManagerAdapters.js';
@@ -28,6 +32,7 @@ import {
 export interface TerminalOutputAdapterOptions {
 	command: string;
 	rawOutput: string;
+	sourceLineOffset?: number;
 	processStatus?: 'success' | 'failure' | 'unknown';
 	processStatusText?: string;
 	processStatusRange?: SourceRange;
@@ -36,10 +41,20 @@ export interface TerminalOutputAdapterOptions {
 export type TestOutputAdapterOptions = TerminalOutputAdapterOptions;
 
 function inputOf(options: TerminalOutputAdapterOptions): TerminalOutputAdapterInput {
+	const sourceLineOffset = Number.isFinite(options.sourceLineOffset)
+		? Math.max(0, Math.floor(options.sourceLineOffset ?? 0))
+		: 0;
 	return {
 		command: options.command,
 		rawOutput: options.rawOutput,
-		lines: terminalOutputLines(options.rawOutput),
+		lines: terminalOutputLines(options.rawOutput).map(line => ({
+			...line,
+			lineNumber: line.lineNumber + sourceLineOffset,
+			sourceRange: {
+				startLine: line.sourceRange.startLine + sourceLineOffset,
+				endLine: line.sourceRange.endLine + sourceLineOffset,
+			},
+		})),
 		processStatus: options.processStatus ?? 'unknown',
 		processStatusText: options.processStatusText,
 		processStatusRange: options.processStatusRange,
@@ -61,6 +76,12 @@ export function summarizeBuildOutput(options: TerminalOutputAdapterOptions): Ter
 export function summarizePackageManagerOutput(options: TerminalOutputAdapterOptions): TerminalOutputSummary {
 	const input = inputOf(options);
 	const selection = selectTerminalOutputAdapter(input, packageManagerOutputAdapters, genericPackageManagerAdapter);
+	return selection.adapter.extract(input, selection.match);
+}
+
+export function summarizeLogsOutput(options: TerminalOutputAdapterOptions): TerminalOutputSummary {
+	const input = inputOf(options);
+	const selection = selectTerminalOutputAdapter(input, logOutputAdapters, genericLogsAdapter);
 	return selection.adapter.extract(input, selection.match);
 }
 
@@ -89,6 +110,14 @@ export {
 	genericBuildAdapter,
 	typescriptEslintBuildAdapter,
 } from './buildAdapters.js';
+export {
+	applicationLogsAdapter,
+	dockerBuildAdapter,
+	genericLogsAdapter,
+	logOutputAdapters,
+	parseTerminalLogEvent,
+} from './logAdapters.js';
+export type { LogEventLevel, ParsedLogEvent } from './logAdapters.js';
 export {
 	genericPackageManagerAdapter,
 	npmPnpmYarnPackageAdapter,

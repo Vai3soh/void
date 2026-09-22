@@ -6,9 +6,15 @@
 import { isJsonObject } from '../../../../platform/void/common/jsonTypes.js';
 import { CHARS_PER_TOKEN_ESTIMATE } from '../../../../platform/void/common/prompt/constants.js';
 
+export interface TerminalOutputSummaryIndicator {
+	profile: string;
+	reason: 'verbose' | 'hard-limit';
+}
+
 interface TerminalOutputTruncationMeta {
 	summarizer: true;
 	originalLength: number;
+	summaryIndicator: TerminalOutputSummaryIndicator | null;
 }
 
 const getTerminalOutputTruncationMeta = (content: string): TerminalOutputTruncationMeta | null => {
@@ -23,7 +29,12 @@ const getTerminalOutputTruncationMeta = (content: string): TerminalOutputTruncat
 		if (!isJsonObject(parsed)) return null;
 		if (parsed.summarizer !== true) return null;
 		if (typeof parsed.originalLength !== 'number' || !Number.isFinite(parsed.originalLength)) return null;
-		return { summarizer: true, originalLength: parsed.originalLength };
+		const summaryIndicator = parsed.summaryVersion === 2
+			&& typeof parsed.profile === 'string'
+			&& (parsed.summaryReason === 'verbose' || parsed.summaryReason === 'hard-limit')
+			? { profile: parsed.profile, reason: parsed.summaryReason as 'verbose' | 'hard-limit' }
+			: null;
+		return { summarizer: true, originalLength: parsed.originalLength, summaryIndicator };
 	} catch {
 		return null;
 	}
@@ -40,4 +51,13 @@ export const getTerminalOutputSavedTokens = (content: string): number | null => 
 export const getTerminalOutputSavedTokensLabel = (content: string): string | null => {
 	const savedTokens = getTerminalOutputSavedTokens(content);
 	return savedTokens === null ? null : `~${savedTokens} tokens saved`;
+};
+
+export const getTerminalOutputSummaryIndicator = (content: string): TerminalOutputSummaryIndicator | null => {
+	return getTerminalOutputTruncationMeta(content)?.summaryIndicator ?? null;
+};
+
+export const getTerminalOutputSummaryIndicatorLabel = (content: string): string | null => {
+	const indicator = getTerminalOutputSummaryIndicator(content);
+	return indicator ? `${indicator.profile} · ${indicator.reason}` : null;
 };

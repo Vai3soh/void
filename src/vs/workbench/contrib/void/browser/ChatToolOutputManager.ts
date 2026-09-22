@@ -12,6 +12,10 @@ import { defaultGlobalSettings } from '../../../../platform/void/common/voidSett
 import { computeTruncatedToolOutput } from '../../../../platform/void/common/toolOutputTruncation.js';
 import { summarizeTerminalOutput } from '../../../../platform/void/common/terminalOutputSummarizer.js';
 import { type SummarizerOptions, type SummarizerResult } from '../../../../platform/void/common/terminalOutputSummarizerTypes.js';
+import { buildTerminalOutputSummaryPipeline, type TerminalOutputSummaryPipelineResult } from '../../../../platform/void/common/terminalOutputSummaryPipeline.js';
+import { shouldSummarizeTerminalOutput } from '../../../../platform/void/common/terminalOutputSummaryPolicy.js';
+import { renderTerminalOutputSummary, type TerminalOutputSummaryRenderResult } from '../../../../platform/void/common/terminalOutputSummaryRenderer.js';
+import { type SummaryReason, type TerminalOutputSummaryCandidate } from '../../../../platform/void/common/terminalOutputSummaryTypes.js';
 import { type JsonObject, type JsonValue, type ToolOutputInput, getStringField, isJsonObject } from '../../../../platform/void/common/jsonTypes.js';
 
 import {
@@ -87,13 +91,9 @@ export class ChatToolOutputManager {
 			return false;
 		}
 
-		// Prefer native copy if available
 		try {
-			const fileService = this._fileService as { copy?: (from: URI, to: URI, overwrite: boolean) => Promise<any> };
-			if (typeof fileService.copy === 'function') {
-				await fileService.copy(fromUri, toUri, true);
-				return true;
-			}
+			await this._fileService.copy(fromUri, toUri, true);
+			return true;
 		} catch { /* ignore */ }
 
 		// Fallback: read+write
@@ -254,7 +254,20 @@ export class ChatToolOutputManager {
 
 		const hasTruncationFooter = (text: string): boolean => {
 			if (!text) return false;
-			return text.includes('[VOID] TOOL OUTPUT TRUNCATED') && !!extractTruncationMeta(text);
+			const match = extractTruncationMetaMatch(text);
+			if (!match || text.lastIndexOf('[VOID] TOOL OUTPUT TRUNCATED', match.endIndex) < 0) return false;
+			const originalLength = match.meta.originalLength;
+			const maxChars = match.meta.maxChars;
+			const hasTrustedShape = typeof originalLength === 'number'
+				&& Number.isFinite(originalLength)
+				&& typeof maxChars === 'number'
+				&& Number.isFinite(maxChars)
+				&& (match.meta.tool === 'read_file'
+					|| typeof match.meta.logFilePath === 'string'
+					|| (match.meta.summaryVersion === 2 && match.meta.rawLogAvailable === false));
+			if (!hasTrustedShape) return false;
+			const trailingText = text.slice(match.endIndex).trim();
+			return !trailingText || /^\(?(?:exit\s+(?:code|signal|status)|Command was interrupted)\b[^\n]*\)?$/i.test(trailingText);
 		};
 
 		let uiText: string;
@@ -315,6 +328,44 @@ export class ChatToolOutputManager {
 		const terminalTimeoutMessage = terminalTimeoutMessageMatch?.[1];
 		const fullTextWithoutTerminalTimeoutMessage = terminalTimeoutMessage ? fullText.slice(0, terminalTimeoutMessageMatch.index).trimEnd() : fullText;
 
+		const terminalCommandHeader = resObj ? getStringField(resObj, 'commandHeader') : undefined;
+		const firstTerminalLine = fullText.split(/\r\n|\r|\n/, 1)[0];
+		const effectiveCommandHeader = terminalCommandHeader ?? (firstTerminalLine.startsWith('$ ') ? firstTerminalLine : undefined);
+		const terminalCommand = effectiveCommandHeader?.replace(/^\$\s*/, '') ?? '';
+		const bodyStartLine = effectiveCommandHeader && fullText.startsWith(`${effectiveCommandHeader}\n`) ? 1 : 0;
+		const statusTextFromFullOutput = (() => {
+			const lastLine = fullText.split(/\r\n|\r|\n/).at(-1);
+			return lastLine && (/^\(?exit\s+(?:code|signal|status)\b/i.test(lastLine) || /^Terminal command\b/.test(lastLine) || /^\(Command was interrupted\b/.test(lastLine))
+				? lastLine
+				: undefined;
+		})();
+		const terminalBodyOutput = fullText.split(/\r\n|\r|\n/).slice(bodyStartLine, statusTextFromFullOutput ? -1 : undefined).join('\n');
+		const rawLineCount = fullText ? fullText.split(/\r\n|\r|\n/).length : 0;
+		const bodyLineCount = terminalBodyOutput ? terminalBodyOutput.split(/\r\n|\r|\n/).length : 0;
+		const bodyEndLine = bodyStartLine + bodyLineCount;
+		const processStatus = (() => {
+			if (terminalTimeoutMessage || /interrupted/i.test(statusTextFromFullOutput ?? '')) { return 'failure' as const; }
+			if (resObj) {
+				const exitStatus = resObj.exitStatus;
+				if (isJsonObject(exitStatus)) {
+					const exitCode = exitStatus.exitCode;
+					if (typeof exitCode === 'number' && Number.isFinite(exitCode)) { return exitCode === 0 ? 'success' as const : 'failure' as const; }
+				}
+				const resolveReason = resObj.resolveReason;
+				if (isJsonObject(resolveReason)) {
+					if (resolveReason.type === 'timeout' || resolveReason.type === 'interrupted') { return 'failure' as const; }
+					if (resolveReason.type === 'done' && typeof resolveReason.exitCode === 'number') { return resolveReason.exitCode === 0 ? 'success' as const : 'failure' as const; }
+				}
+				const exitCode = resObj.exitCode;
+				if (typeof exitCode === 'number' && Number.isFinite(exitCode)) { return exitCode === 0 ? 'success' as const : 'failure' as const; }
+			}
+			return 'unknown' as const;
+		})();
+		const processStatusText = terminalTimeoutMessage ?? statusTextFromFullOutput;
+		const processStatusRange = processStatusText
+			? { startLine: rawLineCount, endLine: rawLineCount }
+			: processStatus === 'unknown' ? undefined : { startLine: Math.max(1, bodyEndLine), endLine: Math.max(1, bodyEndLine) };
+
 		const makeLeanResult = (stripFileContents: boolean): ToolOutputInput => {
 			if (!resObj) return result;
 			if (!stripFileContents) return result;
@@ -342,7 +393,7 @@ export class ChatToolOutputManager {
 
 			if (isReadFile) {
 				const uiContent = uiText;
-				const displayContent = isRunCommand ? uiContent : this._cleanContentForDisplay(uiContent);
+				const displayContent = this._cleanContentForDisplay(uiContent);
 				return {
 					result: makeLeanResult(true),
 					content: uiContent,
@@ -352,8 +403,9 @@ export class ChatToolOutputManager {
 
 
 			const meta = extractTruncationMeta(uiText);
+			const preserveImmutableSummaryFooter = meta?.summarizer === true;
 
-			if (meta) {
+			if (meta && !preserveImmutableSummaryFooter) {
 				try {
 					const metaLogFilePath = typeof meta.logFilePath === 'string' ? meta.logFilePath : undefined;
 
@@ -377,12 +429,29 @@ export class ChatToolOutputManager {
 						}
 					}
 
-					if (canRewrite && desired && meta.logFilePath !== desired) {
-						meta.logFilePath = desired;
+					if (canRewrite && desired) {
+						let metaChanged = false;
+						if (meta.logFilePath !== desired) {
+							meta.logFilePath = desired;
+							metaChanged = true;
+						}
+						if (meta.summaryVersion === 2 && meta.rawLogAvailable !== true) {
+							meta.rawLogAvailable = true;
+							metaChanged = true;
+						}
+						if (metaChanged) {
+							uiText = uiText.replace(
+								/TRUNCATION_META:\s*\{[^\r\n]*\}/,
+								`TRUNCATION_META: ${JSON.stringify(meta)}`
+							);
+						}
+					} else if (meta.summaryVersion === 2 && meta.rawLogAvailable === true) {
+						meta.rawLogAvailable = false;
+						delete meta.logFilePath;
 						uiText = uiText.replace(
 							/TRUNCATION_META:\s*\{[^\r\n]*\}/,
 							`TRUNCATION_META: ${JSON.stringify(meta)}`
-						);
+						).replace(/^Full unsummarized output is available via read_file on logFilePath\.\n/m, '');
 					}
 				} catch (e) {
 					console.error('failed to parse meta', e);
@@ -402,7 +471,8 @@ export class ChatToolOutputManager {
 			}
 
 			const displayContent = isRunCommand ? uiContent : this._cleanContentForDisplay(uiContent);
-			const defaultStrip = ((resObj && typeof getStringField(resObj, 'fileContents') === 'string') ? getStringField(resObj, 'fileContents')!.length : 0) > maxToolOutputLength;
+			const defaultStrip = preserveImmutableSummaryFooter
+				|| ((resObj && typeof getStringField(resObj, 'fileContents') === 'string') ? getStringField(resObj, 'fileContents')!.length : 0) > maxToolOutputLength;
 
 			return {
 				result: makeLeanResult(defaultStrip),
@@ -414,7 +484,7 @@ export class ChatToolOutputManager {
 		// =========================
 		// B: no footer - truncate ourselves
 		// =========================
-		if (!fullText || fullText.length <= maxToolOutputLength) {
+		if (!fullText) {
 			const displayContent = isRunCommand ? uiText : this._cleanContentForDisplay(uiText);
 			return { result: makeLeanResult(false), content: uiText, displayContent };
 		}
@@ -424,43 +494,166 @@ export class ChatToolOutputManager {
 		if (useSummarizer && isRunCommand) {
 			const headLines = globalSettings.terminalOutputHeadLines ?? defaultGlobalSettings.terminalOutputHeadLines;
 			const tailLines = globalSettings.terminalOutputTailLines ?? defaultGlobalSettings.terminalOutputTailLines;
-			const makeOptions = (maxOutputLength: number): SummarizerOptions => ({
-				headLines,
-				tailLines,
-				maxOutputLength,
-			});
-			const makeMeta = (summary: SummarizerResult): JsonObject => ({
-				logFilePath: stablePath,
-				originalLength: summary.originalLength,
-				originalLineCount: summary.originalLineCount,
-				linesOmitted: summary.linesOmitted,
-				preservedSemanticLines: summary.preservedSemanticLines,
-				wasCharTruncated: summary.wasCharTruncated,
-				maxChars: maxToolOutputLength,
-				summarizer: true,
-			});
-			const makeFooter = (summary: SummarizerResult): string => [
-				`[VOID] TOOL OUTPUT TRUNCATED, SEE TRUNCATION_META BELOW.`,
-				`Output was summarized (deduplicated, head/tail with semantic preservation).`,
-				`Full unsummarized output is available via read_file on logFilePath.`,
-				`TRUNCATION_META: ${JSON.stringify(makeMeta(summary))}`,
-			].join('\n');
+			let pipeline: TerminalOutputSummaryPipelineResult | undefined;
+			try {
+				pipeline = buildTerminalOutputSummaryPipeline({
+					rawOutput: fullText,
+					bodyOutput: terminalBodyOutput,
+					bodyStartLine,
+					command: terminalCommand,
+					commandHeader: effectiveCommandHeader,
+					commandRange: bodyStartLine === 1 ? { startLine: 1, endLine: 1 } : undefined,
+					processStatus,
+					processStatusText: processStatusText ?? (processStatus === 'success' ? '(exit code 0)' : processStatus === 'failure' ? '(exit status failure)' : undefined),
+					processStatusRange,
+					headLines,
+					tailLines,
+				});
+			} catch {
+				pipeline = undefined;
+			}
 
-			const unbudgetedSummary = summarizeTerminalOutput(fullText, makeOptions(0));
-			const reservedFooter = makeFooter({ ...unbudgetedSummary, wasCharTruncated: false });
-			const bodyBudget = Math.max(0, maxToolOutputLength - reservedFooter.length - 2);
-			const summary = bodyBudget > 0
-				? summarizeTerminalOutput(fullText, makeOptions(bodyBudget))
-				: { ...unbudgetedSummary, text: '', wasCharTruncated: unbudgetedSummary.text.length > 0 };
-			const footer = makeFooter(summary);
+			if (pipeline) {
+				const makeMeta = (
+					reason: SummaryReason,
+					rendered: Pick<TerminalOutputSummaryRenderResult, 'body' | 'omittedRawLines' | 'omittedBlocks' | 'omittedDiagnostics'>,
+					rawLogAvailable: boolean,
+					compatibilitySummary?: SummarizerResult,
+				): JsonObject => ({
+					...(rawLogAvailable ? { logFilePath: stablePath } : {}),
+					originalLength: fullText.length,
+					originalLineCount: pipeline.rawLineCount,
+					linesOmitted: compatibilitySummary?.linesOmitted ?? rendered.omittedRawLines,
+					preservedSemanticLines: compatibilitySummary?.preservedSemanticLines ?? pipeline.protectedSignals,
+					wasCharTruncated: compatibilitySummary?.wasCharTruncated ?? rendered.omittedBlocks > 0,
+					maxChars: maxToolOutputLength,
+					summarizer: true,
+					summaryVersion: 2,
+					profile: pipeline.summary.profile,
+					adapter: pipeline.summary.adapter,
+					confidence: pipeline.summary.confidence,
+					summaryReason: reason,
+					resultLength: rendered.body.length,
+					omittedRawLines: rendered.omittedRawLines,
+					omittedBlocks: rendered.omittedBlocks,
+					omittedDiagnostics: rendered.omittedDiagnostics,
+					protectedSignals: pipeline.protectedSignals,
+					rawLogAvailable,
+				});
+				const makeFooter = (
+					reason: SummaryReason,
+					rendered: Pick<TerminalOutputSummaryRenderResult, 'body' | 'omittedRawLines' | 'omittedBlocks' | 'omittedDiagnostics'>,
+					rawLogAvailable: boolean,
+					compatibilitySummary?: SummarizerResult,
+				): string => [
+					`[VOID] TOOL OUTPUT TRUNCATED, SEE TRUNCATION_META BELOW.`,
+					`Output was deterministically summarized by the terminal output profile pipeline.`,
+					...(rawLogAvailable ? [`Full unsummarized output is available via read_file on logFilePath.`] : []),
+					`TRUNCATION_META: ${JSON.stringify(makeMeta(reason, rendered, rawLogAvailable, compatibilitySummary))}`,
+				].join('\n');
+				const renderWithFooter = (reason: SummaryReason, rawLogAvailable: boolean, compatibilitySummary?: SummarizerResult): TerminalOutputSummaryRenderResult => {
+					const maximumMetrics: Pick<TerminalOutputSummaryRenderResult, 'body' | 'omittedRawLines' | 'omittedBlocks' | 'omittedDiagnostics'> = {
+						body: fullText,
+						omittedRawLines: pipeline.rawLineCount,
+						omittedBlocks: pipeline.summary.blocks.length + pipeline.summary.counts.length + 1,
+						omittedDiagnostics: pipeline.summary.diagnostics.length,
+					};
+					let footer = makeFooter(reason, maximumMetrics, rawLogAvailable, compatibilitySummary);
+					let rendered = renderTerminalOutputSummary(pipeline.summary, {
+						maxOutputLength: maxToolOutputLength,
+						footer,
+						rawLineCount: pipeline.rawLineCount,
+					});
+					for (let iteration = 0; iteration < 8; iteration++) {
+						const nextFooter = makeFooter(reason, rendered, rawLogAvailable, compatibilitySummary);
+						if (nextFooter === footer) { break; }
+						footer = nextFooter;
+						rendered = renderTerminalOutputSummary(pipeline.summary, {
+							maxOutputLength: maxToolOutputLength,
+							footer,
+							rawLineCount: pipeline.rawLineCount,
+						});
+					}
+					return rendered;
+				};
+				const candidateReason: SummaryReason = fullText.length > maxToolOutputLength ? 'hard-limit' : 'verbose';
+				const makeCompatibilityOptions = (maxOutputLength: number): SummarizerOptions => ({ headLines, tailLines, maxOutputLength });
+				const unbudgetedCompatibilitySummary = summarizeTerminalOutput(fullText, makeCompatibilityOptions(0));
+				const candidateRender = renderWithFooter(candidateReason, true, unbudgetedCompatibilitySummary);
+				const compatibilityBodyBudget = Math.max(0, maxToolOutputLength - candidateRender.footer.length - 2);
+				const compatibilitySummary = compatibilityBodyBudget > 0
+					? summarizeTerminalOutput(fullText, makeCompatibilityOptions(compatibilityBodyBudget))
+					: { ...unbudgetedCompatibilitySummary, text: '', wasCharTruncated: unbudgetedCompatibilitySummary.text.length > 0 };
+				const useCompatibilityBody = candidateReason === 'hard-limit' && pipeline.summary.profile === 'generic';
+				const compatibilityCandidateRender = useCompatibilityBody
+					? renderWithFooter(candidateReason, true, compatibilitySummary)
+					: candidateRender;
+				const candidateText = useCompatibilityBody
+					? (compatibilitySummary.text ? `${compatibilitySummary.text}\n\n${compatibilityCandidateRender.footer}` : compatibilityCandidateRender.footer)
+					: candidateRender.text;
+				const candidate: TerminalOutputSummaryCandidate = {
+					summary: pipeline.summary,
+					text: candidateText,
+					mandatorySignals: pipeline.mandatorySignals,
+					verboseEvidence: pipeline.verboseEvidence,
+				};
+				const decision = shouldSummarizeTerminalOutput(fullText.length, maxToolOutputLength, candidate);
+				if (decision.kind === 'pass-through') {
+					return { result: makeLeanResult(false), content: uiText, displayContent: uiText };
+				}
 
-			await this._writeToolOutputsFileOverwrite(stablePath, fullText);
-			const finalText = summary.text ? `${summary.text}\n\n${footer}` : footer;
-			return {
-				result: makeLeanResult(true),
-				content: finalText,
-				displayContent: finalText,
-			};
+				const rawLogAvailable = await this._writeToolOutputsFileOverwrite(stablePath, fullText);
+				if (!rawLogAvailable && decision.kind === 'verbose') {
+					return { result: makeLeanResult(false), content: uiText, displayContent: uiText };
+				}
+				const rendered = rawLogAvailable
+					? renderWithFooter(decision.kind, true, compatibilitySummary)
+					: renderWithFooter('hard-limit', false, compatibilitySummary);
+				const finalText = useCompatibilityBody
+					? (compatibilitySummary.text ? `${compatibilitySummary.text}\n\n${rendered.footer}` : rendered.footer)
+					: rendered.text;
+				return {
+					result: makeLeanResult(true),
+					content: finalText,
+					displayContent: finalText,
+				};
+			}
+
+			if (fullText.length > maxToolOutputLength) {
+				const makeOptions = (maxOutputLength: number): SummarizerOptions => ({ headLines, tailLines, maxOutputLength });
+				const makeMeta = (summary: SummarizerResult, rawLogAvailable: boolean): JsonObject => ({
+					...(rawLogAvailable ? { logFilePath: stablePath } : {}),
+					originalLength: summary.originalLength,
+					originalLineCount: summary.originalLineCount,
+					linesOmitted: summary.linesOmitted,
+					preservedSemanticLines: summary.preservedSemanticLines,
+					wasCharTruncated: summary.wasCharTruncated,
+					maxChars: maxToolOutputLength,
+					summarizer: true,
+					rawLogAvailable,
+				});
+				const rawLogAvailable = await this._writeToolOutputsFileOverwrite(stablePath, fullText);
+				const unbudgetedSummary = summarizeTerminalOutput(fullText, makeOptions(0));
+				const makeFooter = (summary: SummarizerResult): string => [
+					`[VOID] TOOL OUTPUT TRUNCATED, SEE TRUNCATION_META BELOW.`,
+					`Output was summarized (deduplicated, head/tail with semantic preservation).`,
+					...(rawLogAvailable ? [`Full unsummarized output is available via read_file on logFilePath.`] : []),
+					`TRUNCATION_META: ${JSON.stringify(makeMeta(summary, rawLogAvailable))}`,
+				].join('\n');
+				const reservedFooter = makeFooter({ ...unbudgetedSummary, wasCharTruncated: false });
+				const bodyBudget = Math.max(0, maxToolOutputLength - reservedFooter.length - 2);
+				const summary = bodyBudget > 0
+					? summarizeTerminalOutput(fullText, makeOptions(bodyBudget))
+					: { ...unbudgetedSummary, text: '', wasCharTruncated: unbudgetedSummary.text.length > 0 };
+				const footer = makeFooter(summary);
+				const finalText = summary.text ? `${summary.text}\n\n${footer}` : footer;
+				return { result: makeLeanResult(true), content: finalText, displayContent: finalText };
+			}
+		}
+
+		if (fullText.length <= maxToolOutputLength) {
+			const displayContent = isRunCommand ? uiText : this._cleanContentForDisplay(uiText);
+			return { result: makeLeanResult(false), content: uiText, displayContent };
 		}
 
 		const { truncatedBody, originalLength, needsTruncation, lineAfterTruncation } =
