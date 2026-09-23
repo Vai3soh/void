@@ -8,6 +8,25 @@
 // Increase max listeners for event emitters
 require('events').EventEmitter.defaultMaxListeners = 100;
 
+// gulp 5 uses vinyl-fs 4 (streamx), whose `pipe()` calls `dest.end()` when
+// the source ends. `event-stream@3.3.4`'s `es.merge`/`es.concat` return a
+// legacy `Stream` that has no `end()` method, which crashes builds with
+// `TypeError: this.pipeTo.end is not a function` as soon as a `gulp.src()`
+// stream (streamx) is merged into it. The merged stream already emits
+// `'end'` via its internal end-count logic once all merged sources have
+// ended, so a no-op `end()` is all that is needed.
+const es = require('event-stream');
+const esMergeOriginal = es.merge;
+const esMergePatched = function (/* streams... */) {
+	const merged = esMergeOriginal.apply(es, arguments);
+	if (typeof merged.end !== 'function') {
+		merged.end = function () { /* no-op, see comment above */ };
+	}
+	return merged;
+};
+es.merge = esMergePatched;
+es.concat = esMergePatched;
+
 const gulp = require('gulp');
 const util = require('./lib/util');
 const task = require('./lib/task');
