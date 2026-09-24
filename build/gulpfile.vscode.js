@@ -14,6 +14,7 @@ const rename = require('gulp-rename');
 const replace = require('gulp-replace');
 const filter = require('gulp-filter');
 const util = require('./lib/util');
+const gulpSrcCompat = require('./lib/gulpSrcCompat');
 const { getVersion } = require('./lib/getVersion');
 const { readISODate } = require('./lib/date');
 const task = require('./lib/task');
@@ -258,7 +259,7 @@ function packageTask(platform, arch, sourceFolderName, destinationFolderName, op
 			return !set.has(platform);
 		}).map(ext => `!.build/extensions/${ext.name}/**`);
 
-		const extensions = gulp.src(['.build/extensions/**', ...platformSpecificBuiltInExtensionsExclusions], { base: '.build', dot: true });
+		const extensions = gulpSrcCompat.src(['.build/extensions/**', ...platformSpecificBuiltInExtensionsExclusions], { base: '.build', dot: true });
 
 		const sources = es.merge(src, extensions)
 			.pipe(filter(['**', '!**/*.js.map'], { dot: true }));
